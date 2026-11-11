@@ -85,7 +85,7 @@ class SignIn(Base):
     last_action_at: Mapped[datetime] = mapped_column(
         DateTime, nullable=False, default=utcnow, server_default=text("now()")
     )
-    # 'password' or 'mfa'
+    # 'password', 'mfa', 'mfa_step_down' or 'recovery_step_down'
     auth_method: Mapped[str] = mapped_column(
         String(20), nullable=False, default="password", server_default="password"
     )
@@ -373,3 +373,16 @@ class McpCredential(Base):
             "successor_id": self.successor_id,
             "status": self.status(),
         }
+
+
+class BreachedPassword(Base):
+    """A breached-list entry an administrator imported, lowercased (#4175).
+
+    Imports only add: nothing deletes a row. The shipped list stays a file."""
+
+    __tablename__ = "breached_passwords"
+
+    entry: Mapped[str] = mapped_column(Text, primary_key=True)
+    added_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, default=utcnow, server_default=text("now()")
+    )
