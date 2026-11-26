@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import api from '../../services/api'
-import type { DecisionRecord, FeedbackBody, IncidentDetail, IncidentPage, PackState, SensorList, StatusRead } from './medicTypes'
+import type { DecisionRecord, FeedbackBody, FixLevel, FixLevelName, IncidentDetail, IncidentPage, PackState, SensorList, StatusRead } from './medicTypes'
 
 export type Phase = 'loading' | 'ready' | 'error'
 
@@ -9,9 +9,21 @@ const PAGE = 100
 /** Pages followed for one read: 100 × 50 is far past what one incident or list holds. */
 const MAX_PAGES = 50
 
+interface ProblemBody {
+  code?: unknown
+  reason?: unknown
+}
+
+const problemBody = (e: unknown): ProblemBody => {
+  const data = (e as { response?: { data?: unknown } })?.response?.data
+  return typeof data === 'object' && data !== null ? (data as ProblemBody) : {}
+}
+
 /** The proxy's problem+json `{status, code}`; the code, or '' for a network failure. */
-export const problemCode = (e: unknown): string =>
-  (e as { response?: { data?: { code?: unknown } } })?.response?.data?.code?.toString() ?? ''
+export const problemCode = (e: unknown): string => problemBody(e).code?.toString() ?? ''
+
+/** `reason` on a passed-through refusal, or '' when the body has none. */
+export const problemReason = (e: unknown): string => problemBody(e).reason?.toString() ?? ''
 
 /** Calls `fn` every 30 s while the page is visible, and once more when it becomes visible again. */
 function useVisiblePoll(fn: () => void, on: boolean) {
@@ -199,6 +211,13 @@ export function useIncidentDetail(id: string, enabled: boolean) {
 export const postFeedback = (id: string, body: FeedbackBody) =>
   api.post<{ record: DecisionRecord }>(`/medic/incidents/${encodeURIComponent(id)}/feedback`, body).then((r) => r.data.record)
 
+/** The shared client gives up at 15s; the fix route waits up to `_FIX_TIMEOUT_S` (90s) for the restart. */
+const FIX_TIMEOUT_MS = 100_000
+
+/** POST /api/medic/incidents/{id}/fix: an empty object. The admin is the session's. 201 is the stored fix_run. */
+export const postFix = (id: string) =>
+  api.post<{ record: DecisionRecord }>(`/medic/incidents/${encodeURIComponent(id)}/fix`, {}, { timeout: FIX_TIMEOUT_MS }).then((r) => r.data.record)
+
 /** Medic's problem+json for a pack read or write: the code, and for a refusal the `pack_code` that says which check. */
 export const packProblem = (e: unknown): { status: number; code: string; packCode: string } => {
   const r = (e as { response?: { status?: number; data?: { code?: unknown; pack_code?: unknown } } })?.response
@@ -243,3 +262,7 @@ export const importPack = (file: File, sha256: string, override: boolean) =>
   }).then((r) => r.data)
 export const revertPack = () => api.post<PackState>('/medic/pack/revert', null, { timeout: 45_000 }).then((r) => r.data)
 export const switchToBundled = () => api.post<PackState>('/medic/pack/switch-to-bundled', null, { timeout: 45_000 }).then((r) => r.data)
+
+/** POST /api/medic/fix-level: a raise is one step and carries a reason, a lower needs none. The answer is the fix type as the pack read serves it next. */
+export const setFixLevel = (fix_type: string, level: FixLevelName, reason?: string) =>
+  api.post<FixLevel>('/medic/fix-level', { fix_type, level, ...(reason ? { reason } : {}) }).then((r) => r.data)

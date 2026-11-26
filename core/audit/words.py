@@ -22,6 +22,16 @@ def _fields(names: Any) -> str:
     return ": " + ", ".join(_word(n) for n in names)
 
 
+def _count(ids: Any, noun: str) -> str:
+    n = len(ids) if isinstance(ids, (list, tuple)) else 0
+    return f"{n} {noun}{'' if n == 1 else 's'}" if n else ""
+
+
+def _readers(ids: Any, teams: Any = None) -> str:
+    parts = [p for p in (_count(ids, "reader"), _count(teams, "team")) if p]
+    return f" ({', '.join(parts)})" if parts else ""
+
+
 def _config(p: Mapping[str, Any]) -> str:
     verb = {"create": "Added", "delete": "Removed"}.get(str(p.get("verb")), "Changed")
     key = p.get("config_key") or p.get("config_type")
@@ -58,7 +68,10 @@ _KEY_PURPOSES = {
     "reset": "reset-link",
     "setup": "first-run code",
     "mfa": "authenticator-secret",
+    "pepper": "password-hash",
     "webauthn": "security-key-challenge",
+    "sso": "single sign-on state",
+    "identifier": "erased-identifier hash",
 }
 
 
@@ -105,7 +118,70 @@ def _to(field: str) -> Callable[[Mapping[str, Any]], str]:
 
 
 def _assign(p: Mapping[str, Any]) -> str:
-    return "Unassigned the case" if p.get("unassigned") else "Assigned the case"
+    return "Handed the case back" if p.get("unassigned") else "Assigned the case"
+
+
+def _jira_intent(p: Mapping[str, Any]) -> str:
+    project = p.get("project_key")
+    if project:
+        return f"Asked to push the case to Jira project {project}"
+    return "Asked to push the case to Jira"
+
+
+def _jira_outcome(p: Mapping[str, Any]) -> str:
+    outcome = p.get(trail.OUTCOME)
+    if outcome == trail.OUTCOME_DONE and p.get("issue_key"):
+        text = f"Pushed the case to Jira as {p['issue_key']}"
+        created, failed = p.get("subtasks_created"), p.get("subtasks_failed")
+        extra = []
+        if isinstance(created, int):
+            extra.append(f"{created} subtask{'' if created == 1 else 's'} created")
+        if isinstance(failed, int) and failed:
+            extra.append(f"{failed} failed")
+        return text + (f" ({', '.join(extra)})" if extra else "")
+    if outcome == "refused remotely":
+        return "Jira refused the push"
+    if outcome == trail.OUTCOME_FAILED:
+        return "The Jira push failed"
+    return "Pushed the case to Jira"
+
+
+def _elastic_intent(p: Mapping[str, Any]) -> str:
+    status = _word(p.get("status"))
+    if status:
+        return f"Asked to set an Elastic alert to {status}"
+    return "Asked to set an Elastic alert's status"
+
+
+def _elastic_outcome(p: Mapping[str, Any]) -> str:
+    outcome = p.get(trail.OUTCOME)
+    status = _word(p.get("status"))
+    if outcome == trail.OUTCOME_DONE:
+        return (
+            f"Set an Elastic alert to {status}"
+            if status
+            else "Set an Elastic alert's status"
+        )
+    if outcome == "refused remotely":
+        return "Elastic refused the alert status"
+    if outcome == trail.OUTCOME_FAILED:
+        return "The Elastic alert status sync failed"
+    return "Set an Elastic alert's status"
+
+
+def _move(p: Mapping[str, Any]) -> str:
+    source = str(p.get("from_team_name") or "").strip()
+    dest = str(p.get("to_team_name") or "").strip()
+    if source and dest:
+        return f"Moved the case from {source} to {dest}"
+    if dest:
+        return f"Moved the case to {dest}"
+    return "Moved the case"
+
+
+def _reopen_team(p: Mapping[str, Any]) -> str:
+    dest = str(p.get("to_team_name") or "").strip() or "the default team"
+    return f"Reopened the case onto {dest}, team archived, automatic"
 
 
 def _findings(verb: str, key: str) -> Callable[[Mapping[str, Any]], str]:
@@ -183,6 +259,20 @@ def _role(verb: str) -> Callable[[Mapping[str, Any]], str]:
     )
 
 
+def _emulation(p: Mapping[str, Any]) -> str:
+    parts = [
+        f"{verb} {', '.join(p[key])}"
+        for key, verb in (
+            ("tools_added", "marked emulator"),
+            ("tools_removed", "unmarked emulator"),
+            ("hosts_added", "listed host"),
+            ("hosts_removed", "removed host"),
+        )
+        if p.get(key)
+    ]
+    return "Emulators: " + "; ".join(parts) if parts else "Changed the emulators"
+
+
 def _proof_export(p: Mapping[str, Any]) -> str:
     n = p.get("rule_count")
     if not p.get("kind"):
@@ -231,6 +321,32 @@ def _saved(p: Mapping[str, Any]) -> str:
     return f"Saved {rule}{version}{language}"
 
 
+def _signed_in(p: Mapping[str, Any]) -> str:
+    method = p.get("method")
+    if method == "sso":
+        return "Signed in through single sign-on"
+    how = {
+        "password": " with a password",
+        "mfa": " with two-step sign-in",
+        "mfa_step_down": " with an authenticator code while keys were unavailable",
+        "recovery_step_down": " with a recovery code while keys were unavailable",
+        "break_glass": " as a break-glass account",
+    }.get(method, "")
+    return "Signed in" + how
+
+
+def _confirmed(p: Mapping[str, Any]) -> str:
+    if p.get("strong"):
+        return "Confirmed it's them with a password and a second step"
+    how = {
+        "password": " with their password",
+        "code": " with a code",
+        "key": " with a security key",
+        "provider": " at their SSO provider",
+    }.get(p.get("factor"), "")
+    return "Confirmed it's them" + how
+
+
 def _ingested(p: Mapping[str, Any]) -> str:
     collapsed = p.get("collapsed")
     total = collapsed.get("count") if isinstance(collapsed, Mapping) else None
@@ -245,17 +361,19 @@ _COUNTED = frozenset({"findings.ingested"})
 
 _SAID: dict[str, str | Callable[[Mapping[str, Any]], str]] = {
     # Sign-in, account and credential (core/auth/trail_events.py and its callers)
-    "auth.sign_in": "Signed in",
+    "auth.sign_in": _signed_in,
     "auth.sign_out": "Signed out",
     "auth.sign_in_ended": _sign_in_ended,
-    "auth.confirmed": lambda p: "Confirmed it's them"
-    + (" with a password and a second step" if p.get("strong") else ""),
+    "auth.confirmed": _confirmed,
     "auth.confirmation_failed": "Failed to confirm it's them",
     "auth.everyone_signed_out": "Signed everyone out",
     "auth.sign_in_failed": lambda p: "Failed to sign in"
     + (f": {_word(p['reason'])}" if p.get("reason") else ""),
     "auth.denied": lambda p: "Was refused"
     + (f" {p['attempted']}" if p.get("attempted") else ""),
+    "sso.required_on": "Turned on Require single sign-on",
+    "sso.required_off": lambda p: "Turned off Require single sign-on"
+    + (f" from the host: {p['reason']}" if p.get("reason") else ""),
     "auth.password_changed": "Changed their password",
     "auth.password_reset": "Reset their password",
     "auth.mfa_enabled": "Turned on two-step sign-in",
@@ -268,19 +386,100 @@ _SAID: dict[str, str | Callable[[Mapping[str, Any]], str]] = {
     "auth.keys_adopted": "Adopted the signing and encryption key ring",
     "auth.key_rotated": lambda p: f"Rotated the {_key_purpose(p)} key",
     "auth.key_retired": lambda p: f"Retired the {_key_purpose(p)} key",
+    "auth.key_ring_reset": "Replaced the key ring: a restore could not open it",
+    "auth.key_ring_rewrapped": "Wrapped the key ring under this install's secret",
+    "auth.wrapping_key_rotated": "Rotated the secret that wraps the key ring",
+    "auth.wrapping_key_due": "The secret that wraps the key ring is due for rotation",
+    "auth.wrapping_key_overdue": "The secret that wraps the key ring is overdue",
+    "auth.key_rotation_failed": lambda p: f"Could not rotate the {_key_purpose(p)} key",
+    "auth.key_rotation_recovered": lambda p: f"Rotated the late {_key_purpose(p)} key",
+    "auth.mfa_reset_all": "Cleared every authenticator app",
+    "auth.mfa_reset": lambda p: "Reset someone's two-step sign-in"
+    + (" from the host" if p.get(trail.ACTOR) == trail.SYSTEM else ""),
+    "user.unlocked": "Unlocked an account",
+    "auth.locked": lambda p: "Locked an account"
+    + (f" after {p['failures']} failed sign-ins" if p.get("failures") else "")
+    + (f", until {p['until']}" if p.get("until") else ", until unlocked"),
+    "auth.password_change_failed": "Failed to change their password: wrong current password",
+    "reset.refused": lambda p: "Refused a password reset link"
+    + (f": {_word(p['reason'])}" if p.get("reason") else ""),
+    "notice.email_failed": lambda p: "A notice's email was not sent"
+    + (f" ({_word(p['kind'])})" if p.get("kind") else "")
+    + (f": {p['error']}" if p.get("error") else ""),
+    "reset.sent": lambda p: {
+        "self": "Asked for a password reset link",
+        "signin": "Was sent to change a password at sign-in",
+        "email": "Emailed someone a password reset link",
+        "copy": "Copied a password reset link for someone",
+        "host": "Issued a password reset link from the host",
+    }.get(p.get("channel"), "Issued a password reset link"),
+    "reset.revoked": lambda p: "Revoked a password reset link"
+    + (
+        {
+            "replaced": " (replaced by a new link)",
+            "password_changed": " (the password changed)",
+            "email_changed": " (the email address changed)",
+            "deactivated": " (the account was deactivated)",
+        }.get(p.get("reason"), "")
+    ),
+    "reset.expired": "A password reset link expired unused",
+    "email.sent": "Sent an email confirmation link",
+    "email.confirmed": "Confirmed their email address",
+    "email.revoked": lambda p: "Revoked an email confirmation link"
+    + (
+        {
+            "replaced": " (replaced by a new link)",
+            "email_changed": " (the email address changed)",
+            "sso": " (the identity provider set the address)",
+        }.get(p.get("reason"), "")
+    ),
+    "email.expired": "An email confirmation link expired unused",
+    "auth.emergency_rotation": "Rotated keys with no overlap, in an emergency",
     "credential.minted": "Issued an API token",
+    "oauth.client_registered": lambda p: "Registered an OAuth client"
+    + (f" ({p['client_name']})" if p.get("client_name") else ""),
+    "oauth.client_registration_refused": lambda p: "Refused an OAuth client's "
+    + f"redirect URI {p.get('redirect_uri')}; allow it in {p.get('allow_in')}",
+    "oauth.consent_granted": "Approved an app's request to connect",
+    "oauth.consent_denied": "Denied an app's request to connect",
+    "oauth.grant_issued": "Connected an app",
+    "oauth.refresh_reuse": "Ended an app's connection: an old refresh token "
+    "was presented again",
     "credential.rotated": lambda p: "Rotated an API token"
     + (" (suspected compromise)" if p.get("compromised") else ""),
-    "credential.revoked": "Revoked an API token",
+    "credential.revoked": lambda p: "Revoked an API token"
+    + (f" ({p['reason']})" if p.get("reason") else ""),
     "credential.expired": "Refused an expired API token",
     "credential.refused": "Refused a token of an inactive account",
     "credential.expiry_set": "Set an API token to expire in 90 days",
-    "user.created": "Created an account",
+    "auth.password_ended": "Ended Medic's password on its token's first use",
+    "user.created": lambda p: "Created "
+    + ("a service account" if p.get("service_account") else "an account")
+    + {"sso": " through single sign-on", "invite": " from an invite"}.get(
+        p.get("via"), ""
+    ),
+    "user.accountable_changed": "Reassigned a service account's accountable person",
     "user.updated": lambda p: "Updated an account" + _fields(p.get("changed")),
     "user.deleted": "Deleted an account",
     "user.disabled": "Disabled an account",
-    "user.enabled": "Enabled an account",
+    "user.enabled": lambda p: "Enabled an account"
+    + (" deactivated by directory sync in a window" if p.get("window_since") else ""),
+    "user.removed_unused": "Removed a directory account nobody used and freed its names",
     "user.restored": "Restored a deleted account",
+    "invite.sent": lambda p: "Invited someone"
+    + (" by email" if p.get("channel") == "email" else " with a copied link"),
+    "invite.accepted": "Accepted an invite and set up an account",
+    "invite.revoked": lambda p: "Revoked an invite"
+    + (
+        {
+            "replaced": " (replaced by a new link)",
+            "sso": " (they signed in through SSO)",
+            "erased": " (the account was erased)",
+        }.get(p.get("reason"), "")
+    ),
+    "invite.expired": "An invite expired unused",
+    "invite.failed": lambda p: "Failed to accept an invite"
+    + (f": {_word(p['reason'])}" if p.get("reason") else ""),
     "user.role_changed": lambda p: "Changed an account's role"
     + (f" to {p['role_id']}" if p.get("role_id") else ""),
     "role.created": _role("Created"),
@@ -291,16 +490,33 @@ _SAID: dict[str, str | Callable[[Mapping[str, Any]], str]] = {
     "detections.proof_key_created": _proof_key,
     "detections.skill_exported": _skill("Exported"),
     "detections.skill_imported": _skill("Imported"),
+    "skills.approved": lambda p: "Approved the skill"
+    + (f" {p['name']!r}" if p.get("name") else "")
+    + " for agents"
+    + (f" despite a {_word(p['state'])} scan" if p.get("state") else ""),
     "detections.skill_import_refused": lambda p: "Refused a Detection Skill import"
     + (f": {p['reason']}" if p.get("reason") else ""),
     "autonomy.tool_classified": lambda p: f"Classed {p.get('tool') or 'a tool'} as "
     f"{_word(p.get('class_after')) or 'unclassified'}",
     "tools.classified": "Classed outside tools on upgrade",
+    "autonomy.emulation_changed": _emulation,
+    "emulation.unlisted_host": lambda p: f"{p.get('tool') or 'An emulator'} reported steps "
+    f"on hosts not listed for emulation: {', '.join(p.get('hosts') or []) or 'unknown'}",
     "detections.rule_staged": _staged,
+    "detections.proposal_rejected": lambda p: "Dismissed detection proposal"
+    + (f" {p['proposal_id']}" if p.get("proposal_id") else "")
+    + (f" for {p['technique']}" if p.get("technique") else ""),
     "detections.rule_saved": _saved,
+    "detections.rule_approved": lambda p: "Approved"
+    + (f" rule {p['rule_id']}" if p.get("rule_id") is not None else " a rule")
+    + (f" v{p['version']}" if p.get("version") is not None else "")
+    + " as coverage"
+    + (f" ({_word(p['was'])} by the import check)" if p.get("was") else ""),
     "findings.ingested": _ingested,
     "findings.technique_confidence_cleared": lambda p: "Cleared technique confidence"
     + (f" on {p['rows_cleared']} findings" if p.get("rows_cleared") else ""),
+    "threat_indicators.normalized": lambda p: "Normalised threat-feed indicators"
+    + (f" ({p['rows_merged']} merged)" if p.get("rows_merged") else ""),
     # Config (core/storage/config_service.py)
     "config.change": _config,
     # Cases and approvals (core/cases/case_trail.py, agent_closure.py)
@@ -320,22 +536,85 @@ _SAID: dict[str, str | Callable[[Mapping[str, Any]], str]] = {
         if isinstance(p.get("count"), int)
         else "Added indicators to the case"
     ),
+    "case.ioc.false_positive": lambda p: "Marked an indicator on the case a false positive"
+    + (f" ({_word(p['ioc_type'])})" if p.get("ioc_type") else ""),
+    "case.ioc.false_positive.clear": lambda p: "Cleared the false-positive mark on an indicator"
+    + (f" ({_word(p['ioc_type'])})" if p.get("ioc_type") else ""),
     "case.watcher.add": "Added a watcher to the case",
     "case.watcher.remove": "Removed a watcher from the case",
     "case.escalate": "Escalated the case",
     "case.close": "Closed the case",
     "case.create": "Opened the case",
+    "team.created": "Created a team",
+    "team.renamed": "Renamed a team",
+    "team.archived": "Archived a team",
+    "team.unarchived": "Brought a team back",
+    "team.member_added": "Added a person to a team",
+    "team.member_removed": "Removed a person from a team",
+    "team.join_skipped": lambda p: (
+        "Skipped a team join: the person who saved the mapping can't "
+        "read every restricted case that names the team"
+        if p.get("via") == "directory"
+        else "Skipped a team join an invite named: its issuer can't "
+        "read every restricted case naming the team"
+    ),
+    "team.join_defaulted": lambda p: (
+        "Put a person on the default team: every mapped team join was skipped"
+        if p.get("via") == "directory"
+        else "Put a person on the default team: every team their invite named was skipped"
+    ),
+    "directory.mapping_saved": "Saved the directory group mapping",
+    "directory.role_skipped": lambda p: "Left a role unchanged"
+    + (
+        ": it would leave no one who can manage roles"
+        if p.get("reason") == "last_manager"
+        else (
+            ": the mapping's author can't grant it"
+            if p.get("reason") == "cannot_assign"
+            else ""
+        )
+    ),
+    "directory.group_refused": "Refused a group push with no externalId",
+    "directory.group_unknown": "Skipped a group a user push named, because that group has not been pushed",
+    "directory.member_skipped": "Skipped a group member who is not an account here",
+    "directory.collision": "Refused a pushed person whose username or email is in use or reserved",
+    "directory.linked": "Linked a waiting pushed person to an existing account",
+    "teams.placed": lambda p: (
+        "Created the default team, joined "
+        f"{p.get('people_joined', 0)} people and placed "
+        f"{p.get('cases_placed', 0)} cases"
+    ),
     "case.status": _to("status"),
     "case.priority": _to("priority"),
     "case.assign": _assign,
+    "case.move": _move,
+    "case.claim": "Claimed the case",
+    "case.reopen": _reopen_team,
     "case.edit": lambda p: "Edited the case" + _fields(p.get("changed")),
     "case.findings.link": _findings("Linked", "linked"),
     "case.findings.unlink": _findings("Unlinked", "unlinked"),
     "case.journal": "Added to the journal",
     "case.resolution_step": "Added a resolution step",
+    "case.jira.intent": _jira_intent,
+    "case.jira.outcome": _jira_outcome,
+    "elastic.alert.intent": _elastic_intent,
+    "elastic.alert.outcome": _elastic_outcome,
     "case.delete": "Deleted the case",
     "case.purge": lambda p: "Deleted every case"
-    + (f" ({p['count']})" if p.get("count") else ""),
+    + (f" ({p['count']})" if p.get("count") else "")
+    + (
+        f"; {p['kept']} restricted case{'' if p['kept'] == 1 else 's'} kept"
+        if isinstance(p.get("kept"), int) and p["kept"]
+        else ""
+    ),
+    "case.restrict": lambda p: "Restricted the case"
+    + _readers(p.get("readers"), p.get("teams")),
+    "case.readers.add": lambda p: "Added readers"
+    + _readers(p.get("added"), p.get("added_teams")),
+    "case.readers.remove": lambda p: "Removed readers"
+    + _readers(p.get("removed"), p.get("removed_teams")),
+    "case.unrestrict": lambda p: "Lifted the case's restriction"
+    + _readers(p.get("readers"), p.get("teams")),
     "case.task": "Added a task",
     "case.task.update": _task_update,
     "case.link": _link,
@@ -345,16 +624,26 @@ _SAID: dict[str, str | Callable[[Mapping[str, Any]], str]] = {
     "case.sla.resume": "Resumed the SLA",
     "approval.approve": _approve,
     "approval.reject": "Rejected an action",
+    "approval.release": "Released an action the stop was holding",
+    "approval.settle": lambda p: "Settled an unanswered "
+    + (p.get("kind") if p.get("kind") in ("recommendation", "approval") else "action")
+    + " when the case closed",
     "approval.request": lambda p: "Asked for approval"
     + (f" of {_word(p['action_type'])}" if p.get("action_type") else ""),
     trail.ACTION_FINDING_NOISE_MARK: _noise_mark,
     trail.ACTION_FINDING_NOISE_CLEAR: _noise_clear,
+    # The site proposal (core/site_proposal.py)
+    "site.proposal.save": "Saved a site proposal",
+    "site.proposal.discard": "Discarded a site proposal",
+    "site.proposal.refresh": "Started a site refresh",
     # Analyst notes on an entity (core/memory/notes.py)
     "memory.note.written": _note("Wrote"),
     "memory.note.withdrawn": _note("Withdrew"),
     # Imported history (core/memory/imported_history.py)
     "memory.import.written": _import("Imported"),
     "memory.import.deleted": _import("Deleted"),
+    "memory.ledgers.erased": lambda p: "Erased re-decision ledgers"
+    + (f" of {p['import_id']}" if p.get("import_id") else ""),
     # Old audit stores copied on upgrade (0018_legacy_audit_copy)
     "case.history": _case_history,
     "investigation.log": _investigation_log,
@@ -379,6 +668,10 @@ _SAID: dict[str, str | Callable[[Mapping[str, Any]], str]] = {
         else "Set the retention period"
     ),
     trail.ACTION_ERASURE: "Erased a principal's details",
+    "auth.identifier_reservations_dropped": lambda p: (
+        f"Dropped {p.get('count')} reserved sign-in names"
+        f" ({_word(p['reason']) if p.get('reason') else 'expired'})"
+    ),
     "audit.feed.failed": lambda p: (
         "The audit webhook failed"
         if p.get("destination") == "webhook"

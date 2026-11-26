@@ -3,10 +3,9 @@ import { useAuth } from '../../contexts/AuthContext'
 import { errorText } from '../../shared/errorText'
 import { utcDayClock } from '../../shared/utc'
 import { detectionRulesApi, type RuleStages as Stages } from '../../services/api'
-import { sampledText, stageLine, unprovenNote, waitingNote, who, type Stage, type StageFields } from './ruleStage'
+import { STAGE_NAME, sampledText, stageLine, unprovenNote, waitingNote, who, type StageFields } from './ruleStage'
 import DeployAgain from './DeployAgain'
-
-const STAGE_NAME: Record<Stage, string> = { shadow: 'Shadow', live: 'Live', off: 'Off' }
+import RuleProposals from './RuleProposals'
 
 /** An overlay rule's rollout moves, newest first, read when the panel opens, with
  * Revert to shadow (live) or Release (held by a person) where Add exception sits on
@@ -33,7 +32,11 @@ export default function RuleStages({ ruleId, row, asking: askFirst, onChanged }:
   const line = stageLine(row)
   const waiting = waitingNote(row, canWrite)
   const unproven = line?.held ? null : unprovenNote(row)
-  const action = !canWrite || !line ? null : line.live ? 'revert' : line.held ? 'release' : null
+  // The move that switched it off: a later release of an off rule writes another off row.
+  const offMove = row.stage === 'off' ? data?.stages.find((r) => r.to_stage === 'off' && r.from_stage !== 'off') : undefined
+  // A person's switch-off is final here; a hold left from an earlier Revert can still be released.
+  const switchedOff = !!offMove && offMove.actor !== 'system'
+  const action = !canWrite || !line ? null : line.live ? 'revert' : line.held && !switchedOff ? 'release' : null
   const changed = () => { load(); onChanged() }
   if (!data) {
     return (
@@ -74,14 +77,24 @@ export default function RuleStages({ ruleId, row, asking: askFirst, onChanged }:
           ? canWrite
             ? 'Revert takes it out of production: analysts stop getting its alerts, and Vigil keeps running it in shadow until a person releases it.'
             : 'Live: analysts get its alerts. A person who can edit detections can move it back to shadow.'
-          : line?.held
+          : row.stage === 'off'
+            ? offText(offMove)
+            : line?.held
             ? 'Held in shadow: it runs but alerts nobody, and stays there until a person releases it.'
             : unproven
               ? `In shadow it runs but alerts nobody. ${unproven}`
               : 'In shadow it runs but alerts nobody. Vigil moves it live after 7 quiet days with its data arriving, once it has been shown to catch the attack it was written for.'}
       </p>
+      <RuleProposals ruleId={ruleId} />
     </div>
   )
+}
+
+/** Who switched it off, when and why, read from its newest move. */
+function offText(last: Stages['stages'][number] | undefined): string {
+  if (!last || last.to_stage !== 'off') return 'Switched off: it no longer runs.'
+  const by = last.actor === 'system' ? 'Vigil' : who(last.actor)
+  return `Switched off by ${by} on ${utcDayClock(last.at)}${last.reason ? `: ${last.reason}` : ''}. It no longer runs.`
 }
 
 const plural = (v: number, one: string, many: string) => `${v.toLocaleString()} ${v === 1 ? one : many}`

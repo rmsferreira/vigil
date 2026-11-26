@@ -7,6 +7,8 @@ import { drain, grantOf, journalNote } from "./inbox.js";
 import type { Journal } from "./journal.js";
 import { boundBy, boundReason, standingOf, TOOL_FAILURE } from "./opening.js";
 import { buildReport, renderCaseFile } from "./report.js";
+import type { ToolFailure } from "../../contracts/tool.js";
+import { scrub } from "../../core/security.js";
 import { criticPayload, sanitize, sanitizeQuestion } from "./sanitize.js";
 import { evidenceStrength, isGap, OPERATOR_GAP_PROVENANCE, recordsFailedQuery, unmetPredicates, UNDECLARED_SOURCE, NULL_CHECK_PROVENANCE, CRITIC_SOURCE_SYSTEM } from "./strength.js";
 import { huntStarved, terminationVerdict, type TerminationVerdict } from "./termination.js";
@@ -36,6 +38,20 @@ export const AGENT_HYPOTHESIS_PROVENANCE = "agent";
 // budget park, which takes a different set of answers entirely.
 const AWAITING = "awaiting ";
 
+// What a failed call said, kept on its gap: enough for a region and a query id.
+const GAP_DETAIL_CAP = 400;
+
+// An MCP server's failure often arrives as its JSON body, {"error": "..."}: the sentence is the error.
+function errorOf(detail: string): string {
+  try {
+    const parsed: unknown = JSON.parse(detail);
+    const error = typeof parsed === "object" && parsed !== null ? (parsed as Record<string, unknown>)["error"] : undefined;
+    return typeof error === "string" && error !== "" ? error : detail;
+  } catch {
+    return detail;
+  }
+}
+
 // Why a hypothesis could not be settled when the cause is what the hunt could not see.
 export function couldNotFinish(gaps: number): string {
   return `Could not finish: ${gaps} source${gaps === 1 ? "" : "s"} unreachable`;
@@ -46,6 +62,8 @@ export class HuntBook {
     readonly ledger: Journal,
     // The harness's own ceiling, so an extension can widen what the pool refuses on.
     private readonly pool?: Budget,
+    // Tools answering only an optional need: a failed call to one is no blind spot.
+    readonly optional: ReadonlySet<string> = new Set(),
   ) {}
 
   get projection() {
@@ -126,12 +144,18 @@ export class HuntBook {
 
   // A blind spot: a call the estate could not answer. openGaps counts it once per tool,
   // on the hypothesis it names or every claim, so it gap-locks as a failed dispatch did.
-  appendGap(tool: string, kind: "timeout" | "unavailable" | "backend_error", hypothesisId: string | null): void {
+  // What the call said (a region, a query id) is kept as failure_reason, scrubbed and
+  // capped: it is a remote server's text, and it reaches the report and the narrator.
+  appendGap(tool: string, server: string | null, failure: ToolFailure, hypothesisId: string | null): void {
+    const { kind } = failure;
+    const said = kind === "timeout"
+      ? `${tool} did not answer within ${Math.round(failure.timeoutMs / 1000)}s`
+      : scrub(errorOf(failure.detail).replace(/\s+/g, " ").trim(), GAP_DETAIL_CAP) || `${tool} failed (${kind})`;
     this.appendEvidence([
       {
         source_system: "dispatcher",
         summary: "A query the hunt wanted could not be run",
-        payload: { tool, kind, gap_key: `${tool}:${kind}:${hypothesisId ?? "-"}`, hypothesis_id: hypothesisId },
+        payload: { tool, kind, gap_key: `${tool}:${kind}:${hypothesisId ?? "-"}`, hypothesis_id: hypothesisId, server, failure_reason: said },
         salience: "routine",
         why_notable: "a blind spot in what this run could see, not a finding",
         provenance: TOOL_FAILURE,
@@ -621,7 +645,7 @@ export class HuntBook {
 
   // The agent recommends stopping; the termination predicate decides.
   conclude(reason: string): { said: string; concluded: boolean; parked?: string } {
-    const verdict = terminationVerdict(this.projection, this.hunt.iteration, this.termination, this.verdicts, this.ledger.log);
+    const verdict = terminationVerdict(this.projection, this.hunt.iteration, this.termination, this.verdicts, this.ledger.log, this.optional);
     if (verdict.outcome === null) return { said: `refused: ${verdict.blocked_by}. Resolve it before concluding again.`, concluded: false };
     const { checkpoint, parked } = this.ask("verdict_review", `Conclude this hunt as ${verdict.outcome}?`, {
       kind: "conclude",
@@ -653,7 +677,7 @@ export class HuntBook {
     const hunt = this.hunt;
     // However it was reached -- the agent stopping, an operator's conclude -- an ending
     // that could not look is not a finished hunt.
-    if (outcome === "completed" && huntStarved(this.projection, this.ledger.log, this.verdicts)) outcome = "data_starved";
+    if (outcome === "completed" && huntStarved(this.projection, this.ledger.log, this.verdicts, this.optional)) outcome = "data_starved";
     if (hunt.outcome !== null && OUTCOME_PRECEDENCE[hunt.outcome] >= OUTCOME_PRECEDENCE[outcome]) return;
     for (const hypothesis of this.projection.hypotheses.values()) {
       if (hypothesis.status !== "active") continue;
@@ -682,7 +706,7 @@ export class HuntBook {
   // The budget's own ending, read when the harness refused: a hunt that has
   // nothing left to do concludes; otherwise it parks.
   atCeiling(reason: string): "concluded" | "parked" {
-    const verdict = terminationVerdict(this.projection, this.hunt.iteration, this.termination, this.verdicts, this.ledger.log);
+    const verdict = terminationVerdict(this.projection, this.hunt.iteration, this.termination, this.verdicts, this.ledger.log, this.optional);
     if (verdict.outcome !== null) {
       this.concludeWith(verdict, `the termination predicate passed as the budget ran out: ${reason}`);
       return "concluded";

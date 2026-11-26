@@ -8,7 +8,14 @@ the only link that exists; there is no ``finding_ids`` column.
 
 from typing import Annotated, Any, Optional
 
-from pydantic import BeforeValidator, Field
+from pydantic import (
+    AliasChoices,
+    BaseModel,
+    BeforeValidator,
+    ConfigDict,
+    Field,
+    computed_field,
+)
 
 from core.storage.schemas.base import JsonList, OptDateTime, ORMSchema, StrList
 from core.storage.schemas.finding import FindingSchema
@@ -39,6 +46,16 @@ def _to_finding_ids(value: Any) -> Any:
 FindingIds = Annotated[list[str], BeforeValidator(_to_finding_ids)]
 
 
+class CaseTeam(BaseModel):
+    """The case's owning team, on reads."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    name: str
+    is_default: bool
+
+
 class CaseBaseSchema(ORMSchema):
     """Case fields common to both rendering modes."""
 
@@ -48,6 +65,7 @@ class CaseBaseSchema(ORMSchema):
     status: Optional[str] = None
     priority: Optional[str] = None
     assignee: Optional[str] = None
+    team: Optional[CaseTeam] = None
     tags: StrList = []
     notes: JsonList = []
     timeline: JsonList = []
@@ -56,6 +74,21 @@ class CaseBaseSchema(ORMSchema):
     mitre_techniques: StrList = []
     created_at: OptDateTime = None
     updated_at: OptDateTime = None
+    # Restricted cases (#4354). Only a reader is served a restricted case, so
+    # only readers see who else is on the list. Empty lists are open.
+    readers: StrList = Field(
+        default_factory=list,
+        validation_alias=AliasChoices("readers", "reader_principal_ids"),
+    )
+    reader_teams: StrList = Field(
+        default_factory=list,
+        validation_alias=AliasChoices("reader_teams", "reader_team_ids"),
+    )
+
+    @computed_field
+    @property
+    def restricted(self) -> bool:
+        return bool(self.readers or self.reader_teams)
 
 
 class CaseSchema(CaseBaseSchema):

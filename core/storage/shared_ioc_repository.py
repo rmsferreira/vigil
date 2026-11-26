@@ -1,25 +1,33 @@
-"""Repository for ``shared_iocs`` — the cross-investigation IOC index.
+"""Repository for ``shared_iocs`` — the index intake joins alerts to Cases by.
 
-An indicator is keyed as ``"<ioc_type>:<value>"``, stripped, defanged and
-lower-cased — the rule memory's Entity Keys use, so the two agree.
+A Case is the subject: its rows are kept in step with what it holds by
+``reconcile_case``. An indicator is keyed as ``"<ioc_type>:<value>"``, stripped,
+defanged and lower-cased — the rule memory's Entity Keys use, so the two agree.
 Operates on a caller-provided ``Session``; it never opens or closes one.
 """
 
 import logging
 from typing import Any, Dict, Iterable, List, NamedTuple, Optional, Set, Tuple
 
-from sqlalchemy import ColumnElement, and_, func, or_, select
+from sqlalchemy import ColumnElement, and_, delete, func, or_, select, tuple_, update
+from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import Session
 
-from core.storage.defang import defang
+from core.storage.case_indicators import (
+    LINK_ONLY_TYPES,
+    case_indicators,
+    context_indicators,
+    intake_use,
+)
+from core.storage.defang import defang, trim_edges
 from core.storage.models import (
     Case,
     CaseIOC,
     Finding,
-    Investigation,
     SharedIOC,
     case_findings,
 )
+from core.time import utcnow
 
 logger = logging.getLogger(__name__)
 
@@ -48,14 +56,18 @@ TYPE_ALIASES = {
     "username": "user",
 }
 
+# An IP's role rides in its ioc_type (no new column). A key with no role -- ``ip``,
+# written before roles or from an IOC typed plain ``ip`` -- never attaches an alert.
+ROLE_TYPES = {"src_ip": "src_ip", "dst_ip": "dst_ip", "dest_ip": "dst_ip"}
+
 _MAX_TYPE_LEN = 30
 _MAX_VALUE_LEN = 500
 
 
 def make_key(ioc_type: Optional[str], value: Optional[str]) -> Optional[str]:
     ioc_type = (ioc_type or "").strip().lower()
-    ioc_type = TYPE_ALIASES.get(ioc_type, ioc_type)
-    value = defang((value or "").strip()).lower()
+    ioc_type = ROLE_TYPES.get(ioc_type) or TYPE_ALIASES.get(ioc_type, ioc_type)
+    value = defang(trim_edges(value or "")).lower()
     if not ioc_type or not value:
         return None
     # Dropped rather than truncated: a truncated indicator joins against
@@ -66,6 +78,19 @@ def make_key(ioc_type: Optional[str], value: Optional[str]) -> Optional[str]:
     return f"{ioc_type}:{value}"
 
 
+def fold_key(key: Optional[str]) -> Optional[str]:
+    """An IP key with its role folded to ``ip``; any other key unchanged."""
+    for role in ("src_ip:", "dst_ip:"):
+        if key and key.startswith(role):
+            return "ip:" + key[len(role) :]
+    return key
+
+
+def mark_key(ioc_type: Optional[str], value: Optional[str]) -> Optional[str]:
+    """``make_key`` with the IP role folded: what a false-positive mark is compared by."""
+    return fold_key(make_key(ioc_type, value))
+
+
 def split_key(key: str) -> Optional[Tuple[str, str]]:
     # First colon only — an IPv6 address is all colons after that.
     ioc_type, sep, value = (key or "").partition(":")
@@ -74,60 +99,96 @@ def split_key(key: str) -> Optional[Tuple[str, str]]:
     return ioc_type, value
 
 
-def index_case_iocs_on_close(session: Session, case_id: str) -> int:
-    """Index a closing case's IOCs without letting a failure fail the close."""
-    # Flush first so the SAVEPOINT covers only our inserts and rolling it back
-    # cannot undo the close; a failure here is the close failing. Without the
-    # SAVEPOINT, catching on a shared session poisons the transaction and the
-    # caller's commit raises anyway.
+def marked_keys(session: Session, case_ids: Iterable[str]) -> Dict[str, Set[str]]:
+    """Each Case's keys a person marked a false positive, by ``mark_key``.
+
+    A mark covers every role of an IP (``src_ip``, ``dst_ip``, ``ip``), so the
+    sets hold role-folded keys; compare with ``mark_key``/``fold_key``. The one reading of the mark: matching honours it here, and recording a
+    value again looks it up here, so the two cannot drift.
+    """
+    ids = set(case_ids)
+    out: Dict[str, Set[str]] = {}
+    if not ids:
+        return out
+    rows = session.execute(
+        select(CaseIOC.case_id, CaseIOC.ioc_type, CaseIOC.value).where(
+            CaseIOC.case_id.in_(ids), CaseIOC.is_false_positive.is_(True)
+        )
+    )
+    for case_id, ioc_type, value in rows:
+        if key := mark_key(ioc_type, value):
+            out.setdefault(case_id, set()).add(key)
+    return out
+
+
+def reconcile_case_safely(
+    session: Session, case_id: str, changed: Optional[Iterable[str]] = None
+) -> bool:
+    """Reconcile a Case's rows without letting a failure fail the caller.
+
+    ``changed`` is the ``ioc_type`` of what the caller changed, when it knows;
+    unset means anything. A failure is logged and the Case marked stale, only if
+    what changed has a type intake can use.
+    """
+    # Flush first so the SAVEPOINT covers only our writes and rolling it back
+    # cannot undo the caller's change; a failure here is the caller failing.
+    # Without the SAVEPOINT, catching on a shared session poisons the transaction
+    # and the caller's commit raises anyway.
     session.flush()
     try:
         with session.begin_nested():
-            return SharedIOCRepository(session).record_case(case_id)
+            return SharedIOCRepository(session).reconcile_case(case_id)
     except Exception as e:
-        logger.error(
-            "Failed to index shared IOCs for %s: %s", case_id, e, exc_info=True
-        )
-        return 0
+        logger.error("Failed to index IOCs for %s: %s", case_id, e, exc_info=True)
+    if changed is None or any(
+        intake_use((make_key(t, "x") or ":").partition(":")[0]) for t in changed
+    ):
+        try:
+            with session.begin_nested():
+                session.execute(
+                    update(Case).where(
+                        Case.case_id == case_id, Case.indicators_stale_since.is_(None)
+                    )
+                    # Not an edit of the Case: leave updated_at alone.
+                    .values(indicators_stale_since=utcnow(), updated_at=Case.updated_at)
+                )
+        except Exception as e:
+            logger.error("Failed to mark %s stale: %s", case_id, e)
+    return False
 
 
 class CaseMatch(NamedTuple):
     """A Case a finding belongs with, and the key that says so."""
 
     case_id: str
-    key: str  # ``ip:…``, ``hash:…`` or ``hostname:…``
+    key: str  # ``src_ip:…``, ``dst_ip:…``, ``ip:…``, ``hash:…`` or ``hostname:…``
     same_alert: bool = False  # a hostname match, backed by the same data_source + title
 
+    @property
+    def attaches(self) -> bool:
+        return self.key.partition(":")[0] not in LINK_ONLY_TYPES
 
-# Listed in the order a match is preferred when one Case matches several ways.
-_KEY_RANK = {"ip": 0, "hash": 1, "hostname": 2}
+
+# Listed in the order a match is preferred when one Case matches several ways:
+# the ways that attach first, so a Case matching both ways attaches.
+_KEY_RANK = {"src_ip": 0, "hash": 1, "hostname": 2, "dst_ip": 3, "ip": 4}
 
 
 def finding_match_keys(finding: Dict[str, Any]) -> Tuple[Set[str], Set[str]]:
     """The keys a finding can join a Case on: ``(ip and hash keys, hostname keys)``.
 
-    Read straight off ``entity_context``, spelled as ``core.memory.entity_keys``
-    maps it (storage may not import memory). Source IPs are ``src_ip``/``src_ips``
-    alone: an attacker is the source, and memory's map yields destinations as
-    ``ip`` too.
+    An attacker is the source, so only source IPs are looked up, under every type
+    an IP is stored as: ``src_ip`` attaches, ``dst_ip`` and role-less ``ip`` link.
     """
-    context = finding.get("entity_context")
-    context = context if isinstance(context, dict) else {}
-
-    def values(*names: str) -> List[str]:
-        out: List[str] = []
-        for name in names:
-            value = context.get(name)
-            out += (
-                [str(v) for v in value]
-                if isinstance(value, (list, tuple))
-                else ([str(value)] if value else [])
-            )
-        return out
-
-    entity = {make_key("ip", v) for v in values("src_ips", "src_ip")}
-    entity |= {make_key("hash", v) for v in values("file_hashes")}
-    hosts = {make_key("hostname", v) for v in values("hostnames", "hostname")}
+    entity: Set[Optional[str]] = set()
+    hosts: Set[Optional[str]] = set()
+    for ioc_type, value in context_indicators(finding.get("entity_context")):
+        if ioc_type == "src_ip":
+            entity |= {make_key(t, value) for t in ("src_ip", *LINK_ONLY_TYPES)}
+        elif ioc_type == "hash":
+            entity.add(make_key(ioc_type, value))
+        elif ioc_type == "host":
+            hosts.add(make_key("hostname", value))
     return entity - {None}, hosts - {None}
 
 
@@ -139,56 +200,78 @@ class SharedIOCRepository:
 
     # ---- writes --------------------------------------------------------
 
-    def record(self, investigation_id: str, keys: Iterable[str]) -> int:
-        """Index ``keys``, skipping ones already there. Returns rows added."""
-        pairs = {p for p in (split_key(k) for k in keys) if p is not None}
-        if not pairs:
-            return 0
+    def reconcile_case(self, case_id: str) -> bool:
+        """Make a Case's rows exactly what it holds now. False if there is no such Case.
 
-        new = pairs - self._pairs_for(investigation_id)
-        for ioc_type, value in sorted(new):
-            self.session.add(
-                SharedIOC(
-                    investigation_id=investigation_id,
-                    ioc_type=ioc_type,
-                    value=value,
-                )
-            )
-        return len(new)
-
-    def record_case(self, case_id: str) -> int:
-        """Index a case's IOCs against every investigation that belongs to it.
-
-        A case with no investigation contributes nothing — ``investigation_id``
-        is the table's only subject. Attribution is at case granularity.
+        Locks the Case row. Keys a person marked a false positive (by the mark
+        fold) are left out, and only the types intake reads are written. Stamps
+        the Case synced and clears its stale mark.
         """
-        keys = self._case_keys(case_id)
-        if not keys:
-            return 0
+        if (
+            self.session.scalar(
+                select(Case.case_id).where(Case.case_id == case_id).with_for_update()
+            )
+            is None
+        ):
+            return False
 
-        investigation_ids = (
-            self.session.execute(
-                select(Investigation.investigation_id).where(
-                    Investigation.case_id == case_id
+        marked = marked_keys(self.session, [case_id]).get(case_id, set())
+        wanted: Set[Tuple[str, str]] = set()
+        for ioc_type, value in case_indicators(self.session, case_id):
+            key = make_key(ioc_type, value)
+            pair = split_key(key) if key else None
+            if pair and intake_use(pair[0]) and fold_key(key) not in marked:
+                wanted.add(pair)
+
+        have = {
+            (t, v)
+            for t, v in self.session.execute(
+                select(SharedIOC.ioc_type, SharedIOC.value).where(
+                    SharedIOC.case_id == case_id
                 )
             )
-            .scalars()
-            .all()
+        }
+        if wanted - have:
+            self.session.execute(
+                insert(SharedIOC)
+                .values(
+                    [
+                        {"case_id": case_id, "ioc_type": t, "value": v}
+                        for t, v in sorted(wanted - have)
+                    ]
+                )
+                .on_conflict_do_nothing(index_elements=["case_id", "ioc_type", "value"])
+            )
+        if have - wanted:
+            self.session.execute(
+                delete(SharedIOC).where(
+                    SharedIOC.case_id == case_id,
+                    tuple_(SharedIOC.ioc_type, SharedIOC.value).in_(have - wanted),
+                )
+            )
+        self.session.execute(
+            update(Case)
+            .where(Case.case_id == case_id)
+            # Not an edit of the Case: leave updated_at alone.
+            .values(
+                indicators_synced_at=utcnow(),
+                indicators_stale_since=None,
+                updated_at=Case.updated_at,
+            )
+            .execution_options(synchronize_session=False)
         )
-        return sum(self.record(inv_id, keys) for inv_id in investigation_ids)
-
-    def record_case_for(self, case_id: str, investigation_id: str) -> int:
-        return self.record(investigation_id, self._case_keys(case_id))
+        return True
 
     # ---- reads ---------------------------------------------------------
 
     def matching_cases(self, finding: Dict[str, Any], *, open: bool) -> List[CaseMatch]:
         """Open (or closed) Cases this finding belongs with, newest ``updated_at`` first.
 
-        A Case matches on a source IP or file hash shared with one of its
-        investigations, or on a hostname shared with one of them while the Case
-        holds a finding with the same ``data_source`` and trimmed, case-insensitive
-        ``title``. Raises on a failed read: the caller decides what that means.
+        A Case matches on a source IP or file hash it holds (an IP that was only a
+        destination, or whose role was never recorded, matches too but doesn't
+        ``attach``), or on a hostname it holds while the Case has a finding with
+        the same ``data_source`` and trimmed, case-insensitive ``title``.
+        Raises on a failed read: the caller decides what that means.
         """
         entity_keys, host_keys = finding_match_keys(finding)
         title = (finding.get("title") or "").strip().lower()
@@ -203,12 +286,10 @@ class SharedIOCRepository:
             return []
 
         status = Case.status != "closed" if open else Case.status == "closed"
+        columns = (Case.case_id, SharedIOC.ioc_type, SharedIOC.value, Case.updated_at)
         base = (
-            select(Case.case_id, SharedIOC.ioc_type, SharedIOC.value, Case.updated_at)
-            .join(Investigation, Investigation.case_id == Case.case_id)
-            .join(
-                SharedIOC, SharedIOC.investigation_id == Investigation.investigation_id
-            )
+            select(*columns)
+            .join(SharedIOC, SharedIOC.case_id == Case.case_id)
             .where(status)
         )
         rows: List[Tuple[str, str, str, Any, bool]] = []
@@ -228,6 +309,13 @@ class SharedIOCRepository:
             )
             rows += [(*r, True) for r in self.session.execute(same_title)]
 
+        # A key marked false positive on a Case no longer matches it; its other
+        # keys still do. Read here, not at index write, so it holds at once.
+        marked = marked_keys(self.session, {r[0] for r in rows})
+        rows = [
+            r for r in rows if fold_key(f"{r[1]}:{r[2]}") not in marked.get(r[0], ())
+        ]
+
         rows.sort(key=lambda r: (-r[3].timestamp(), _KEY_RANK.get(r[1], 9)))
         seen: Set[str] = set()
         matches: List[CaseMatch] = []
@@ -237,31 +325,7 @@ class SharedIOCRepository:
                 matches.append(CaseMatch(case_id, f"{ioc_type}:{value}", same_alert))
         return matches
 
-    def record_on_case(self, case_id: str, keys: Iterable[str]) -> int:
-        """Index ``keys`` against the Case's newest investigation. 0 if it has none."""
-        investigation_id = self.session.execute(
-            select(Investigation.investigation_id)
-            .where(Investigation.case_id == case_id)
-            .order_by(Investigation.created_at.desc())
-            .limit(1)
-        ).scalar_one_or_none()
-        return self.record(investigation_id, keys) if investigation_id else 0
-
     # ---- internals -----------------------------------------------------
-
-    def _pairs_for(self, investigation_id: str) -> Set[Tuple[str, str]]:
-        rows = self.session.execute(
-            select(SharedIOC.ioc_type, SharedIOC.value).where(
-                SharedIOC.investigation_id == investigation_id
-            )
-        ).all()
-        return {(t, v) for t, v in rows}
-
-    def _case_keys(self, case_id: str) -> Set[str]:
-        values = self.session.execute(
-            select(CaseIOC.ioc_type, CaseIOC.value).where(CaseIOC.case_id == case_id)
-        ).all()
-        return {k for k in (make_key(t, v) for t, v in values) if k}
 
     @staticmethod
     def _key_clauses(keys: Iterable[str]) -> List[ColumnElement[bool]]:

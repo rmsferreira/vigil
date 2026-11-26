@@ -11,6 +11,8 @@ from typing import Dict, List, Optional
 from sqlalchemy import Text, cast, or_, select
 from sqlalchemy.orm import Session
 
+from core.auth.permissions import case_read_clause
+from core.cases.assignee import with_owner_state
 from core.storage.case_repository import CaseRepository
 from core.storage.models import (
     Case,
@@ -38,6 +40,7 @@ class CaseSearchService:
         status: Optional[List[str]] = None,
         priority: Optional[List[str]] = None,
         assignee: Optional[List[str]] = None,
+        unassigned: bool = False,
         tags: Optional[List[str]] = None,
         mitre_techniques: Optional[List[str]] = None,
         created_after: Optional[datetime] = None,
@@ -77,6 +80,7 @@ class CaseSearchService:
                 status=status,
                 priority=priority,
                 assignee=assignee,
+                unassigned=unassigned,
                 tags=tags,
                 mitre_techniques=mitre_techniques,
                 created_after=created_after,
@@ -89,11 +93,12 @@ class CaseSearchService:
             )
 
             return {
-                "results": CaseSchema.dump_many(cases),
+                "results": with_owner_state(session, CaseSchema.dump_many(cases)),
                 "total": total_count,
                 "limit": limit,
                 "offset": offset,
                 "has_more": (offset + len(cases)) < total_count,
+                "restricted_not_counted": CaseRepository(session).hidden_count(),
             }
 
     def search_full_text(
@@ -115,21 +120,30 @@ class CaseSearchService:
             session: Database session (optional)
 
         Returns:
-            Dictionary with search results
+            Dictionary with search results, and ``restricted_not_counted``: the restricted cases
+            the reader may not read, never filtered by the query (#4356)
         """
         with unit_of_work(session) as session:
             search_pattern = f"%{query_text}%"
-            results = {"cases": [], "comments": [], "evidence": []}
+            # A comment or evidence hit counts only inside a case the reader reads.
+            readable = select(Case.case_id).where(case_read_clause())
+            results = {
+                "cases": [],
+                "comments": [],
+                "evidence": [],
+                "restricted_not_counted": CaseRepository(session).hidden_count(),
+            }
 
             # Search cases
             cases = (
                 session.query(Case)
                 .filter(
+                    case_read_clause(),
                     or_(
                         Case.title.ilike(search_pattern),
                         Case.description.ilike(search_pattern),
                         Case.case_id.ilike(search_pattern),
-                    )
+                    ),
                 )
                 .limit(limit)
                 .all()
@@ -149,7 +163,10 @@ class CaseSearchService:
             if search_comments:
                 comments = (
                     session.query(CaseComment)
-                    .filter(CaseComment.content.ilike(search_pattern))
+                    .filter(
+                        CaseComment.content.ilike(search_pattern),
+                        CaseComment.case_id.in_(readable),
+                    )
                     .limit(limit)
                     .all()
                 )
@@ -173,7 +190,8 @@ class CaseSearchService:
                         or_(
                             CaseEvidence.name.ilike(search_pattern),
                             CaseEvidence.description.ilike(search_pattern),
-                        )
+                        ),
+                        CaseEvidence.case_id.in_(readable),
                     )
                     .limit(limit)
                     .all()
@@ -207,7 +225,8 @@ class CaseSearchService:
             session: Database session (optional)
 
         Returns:
-            List of cases containing the IOC, each once
+            List of cases containing the IOC, each once; restricted cases the
+            reader may not read are left out
         """
         pattern = f"%{ioc_value}%"
         with unit_of_work(session) as session:
@@ -230,7 +249,11 @@ class CaseSearchService:
                 )
                 case_ids.update(linked.scalars())
 
-            cases = session.query(Case).filter(Case.case_id.in_(case_ids)).all()
+            cases = (
+                session.query(Case)
+                .filter(Case.case_id.in_(case_ids), case_read_clause())
+                .all()
+            )
 
             results = CaseSchema.dump_many(cases)
             for row in results:

@@ -11,6 +11,7 @@ import { useAutoOpsOff } from '../../shared/useAutoOpsOff'
 import { LevelBadge } from '../../shared/LevelBadge'
 import { useSourceBadge } from '../../shared/useSourceBadge'
 import { SEND_TO_TRIAGE_FAILED, sendFindingToTriage } from '../../shared/sendToTriage'
+import { CauseSelect } from '../../shared/falsePositiveCause'
 import { EmptyState, Popup } from '../../shared/ui'
 import { useCountRange, withRange } from '../../shared/countRange'
 import { stateWord } from '../../shared/findingState'
@@ -28,6 +29,7 @@ import {
 } from '../../services/api'
 import { errorText } from '../../shared/errorText'
 import FindingDetails from '../../shared/FindingDetails'
+import { caseLabel } from '../../shared/caseLabel'
 
 const NOISE_INFO =
   'The alert reads Dropped and leaves this feed and any read of open findings. Triage does not learn from the mark yet. Undo clears it.'
@@ -107,6 +109,7 @@ export default function OverviewScreen({ go, goSettings, openCase, setViewFull, 
   const [attempt, setAttempt] = useState(0)
   const [marked, setMarked] = useState(false)
   const [marking, setMarking] = useState(false)
+  const [cause, setCause] = useState('')
   const [launchNote, setLaunchNote] = useState<string | null>(null)
   const [ticketNote, setTicketNote] = useState<string | null>(null)
   const [actionError, setActionError] = useState<string | null>(null)
@@ -197,6 +200,7 @@ export default function OverviewScreen({ go, goSettings, openCase, setViewFull, 
 
   useEffect(() => {
     setMarked(open?.noise_marked ?? false)
+    setCause('')
     setLaunchNote(null)
     setTicketNote(null)
     setActionError(null)
@@ -239,7 +243,7 @@ export default function OverviewScreen({ go, goSettings, openCase, setViewFull, 
     setMarking(true)
     try {
       if (wasMarked) await findingsApi.clearNoise(findingId)
-      else await findingsApi.markNoise(findingId)
+      else await findingsApi.markNoise(findingId, cause || undefined)
       // Read the alert back so the Status row shows the state it landed in, in or out of the feed.
       const after = await overviewApi.alert(findingId).then((res) => res.data, () => null)
       if (stillOpen(findingId)) {
@@ -346,13 +350,13 @@ export default function OverviewScreen({ go, goSettings, openCase, setViewFull, 
           <>
             <dl className="ov-facts">
               <div><dt>Source</dt><dd>{sourceLabel}</dd></div>
-              <div><dt>Status</dt><dd>{stateWord(marked ? 'dismissed' : open.terminal_state, open.case_id)}</dd></div>
+              <div><dt>Status</dt><dd>{stateWord(marked ? 'dismissed' : open.terminal_state, open.case_id, open.case_restricted)}</dd></div>
               <div>
                 <dt>Case</dt>
                 <dd>
                   {open.case_id ? (
                     <button type="button" className="ov-case-link" onClick={() => openCaseFromPopup(open.case_id!)}>
-                      Case {open.case_id}
+                      {caseLabel(open.case_id)}
                     </button>
                   ) : (
                     'Not in a case yet'
@@ -364,6 +368,7 @@ export default function OverviewScreen({ go, goSettings, openCase, setViewFull, 
             <EvidenceBody item={open} />
             <FindingDetails findingId={open.finding_id} />
             <div className="flex items-center gap-2 flex-wrap">
+              {!marked && <CauseSelect value={cause} onSelect={setCause} />}
               <button type="button" className="btn ghost" onClick={markNoise} disabled={marking}>
                 {marked ? 'Undo' : 'Mark as noise'}
               </button>

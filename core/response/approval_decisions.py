@@ -4,7 +4,12 @@ import asyncio
 import logging
 from typing import Any, Dict, Optional, Tuple
 
-from core.response.approval_service import ApprovalService, PendingAction, case_ids_for
+from core.response.approval_service import (  # noqa: F401 (ActionNotFound re-exported)
+    ActionNotFound,
+    ApprovalService,
+    PendingAction,
+    case_ids_for,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +49,44 @@ def record_decision(
             )
 
 
+# A containment's act and what the vendor answered, on each case it is on (#5059).
+# ``by`` is who ran it; None when a read found the state changed. Best effort.
+def record_execution(action: PendingAction, by: Optional[str]) -> None:
+    result = action.execution_result or {}
+    state = result.get("state") or action.status
+    tool = result.get("tool") or "the vendor"
+    summary = f"{action.title}: {state} ({tool}"
+    summary += f", run by {by})" if by else ")"
+    if state == "failed" and result.get("error"):
+        summary += f": {str(result['error'])[:300]}"
+    try:
+        from core.workflows.run_bridge_router import _add_activity
+
+        case_ids = case_ids_for(action)
+    except Exception:  # noqa: BLE001
+        logger.exception("could not resolve the cases of %s", action.action_id)
+        return
+    for case_id in case_ids:
+        try:
+            _add_activity(
+                case_id,
+                f"containment_{state}",
+                summary,
+                {
+                    "action_id": action.action_id,
+                    "tool": result.get("tool"),
+                    "vendor": result.get("vendor"),
+                    "vendor_id": result.get("vendor_id"),
+                    "state": state,
+                    **({"run_by": by} if by else {}),
+                },
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "could not record %s on case %s", action.action_id, case_id
+            )
+
+
 # A rule promotion or deploy PR (#4068): audit the answer; an approval does the
 # move. The decision stands if that fails: the sweep retries an approved one.
 async def rollout_decided(
@@ -61,13 +104,9 @@ async def rollout_decided(
         logger.exception("rollout answer on %s not carried out", action.action_id)
 
 
-class ActionNotFound(LookupError):
-    pass
-
-
 # The whole of a rejection, for the route and the chat/MCP tool alike: the row,
 # the case trail, a rollout's answer, and the paused run it was holding.
-# ActionNotFound for no such action; AlreadyDecided passes through; None when the
+# ActionNotFound for no such action, or one on a case the caller can't read; AlreadyDecided passes through; None when the
 # row would not update. Returns (action, resume_result).
 async def decide_reject(
     service: ApprovalService,

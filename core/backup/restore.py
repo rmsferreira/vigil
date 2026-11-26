@@ -18,9 +18,11 @@ Bifrost starts a fresh, empty log. Copy it back from there to keep the history.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import getpass
 import json
+import logging
 import os
 import re
 import secrets
@@ -32,18 +34,26 @@ from pathlib import Path
 from urllib.parse import quote
 
 import psycopg2
+import redis
+import redis.asyncio
+from bullmq import Queue
 from cryptography.fernet import Fernet, InvalidToken
 from psycopg2 import sql
 from sqlalchemy import create_engine
 from sqlalchemy import text as sa_text
 from sqlalchemy.pool import NullPool
 
+from core.agents.queue import RUN_QUEUE
 from core.audit import feed, retention, trail
-from core.auth import key_ring
+from core.auth import dormancy, key_ring, sign_in_runs, sign_ins
+from core.auth.mfa_coverage import SETTINGS_LINK
 from core.backup.connection import backup_database_config
 from core.backup.create import (
+    PAIR_PREFIX,
     PRE_RESTORE_PREFIX,
     STAGE_PREFIX,
+    WRAPPING_FILE,
+    WRAPPING_TAG,
     BackupError,
     _checked,
     _child_env,
@@ -56,6 +66,7 @@ from core.backup.create import (
 )
 from core.config import REPO_ROOT, get_settings, vigil_path
 from core.intent import intent_file
+from core.redis_client import effective_redis_url, redact_logged_text
 from core.response.approval_service import ActionStatus
 from core.secrets_manager import EncryptedFileBackend
 from core.skills.skill_library import operator_skills_root
@@ -65,6 +76,8 @@ from core.storage.models import ApprovalAction, User
 from core.storage.unit_of_work import unit_of_work
 from core.time import utcnow
 from core.version import __version__
+
+logger = logging.getLogger(__name__)
 
 # The FIRST_BREAK query from services/agent/ledger/verify.ts. The hash stays
 # the database's agent_event_hash; $1 is the whole ledger (NULL run id).
@@ -118,7 +131,7 @@ def restore_snapshot(
     test: bool,
     actor: str | None = None,
     bifrost_data: str | None = None,
-    discarded: list[str] | None = None,
+    reason: str | None = None,
 ) -> str:
     passphrase = Path(passphrase_file)
     if not passphrase.is_file():
@@ -134,6 +147,7 @@ def restore_snapshot(
         _assert_no_other_clients(cfg)
 
     restic = _restic(repo, test)
+    snapshot = _resolve_snapshot(restic, passphrase, snapshot, priority)
     manifest, dump_in_snapshot, snapshot_id = _load_manifest(
         restic, passphrase, snapshot, priority
     )
@@ -187,10 +201,22 @@ def restore_snapshot(
             # with nothing moved, rather than failing after the swap.
             restoring_user = _actor(actor)
             _check_erasure_list(root, dump_in_snapshot)
-            swap_lines, abandoned = _swap(cfg, staged_name, pre_name, placed, stamp)
+            _check_redis()
+            paired_key = _paired_wrapping_key(restic, passphrase, snapshot_id, priority)
+            swap_lines, abandoned, live_ring = _swap(
+                cfg, staged_name, pre_name, placed, stamp
+            )
             lines.extend(swap_lines)
             swapped = True
             created = False
+            # Right after the swap, so a failed settle still empties the queue;
+            # a failed discard still lets the settle run, then is raised.
+            discarded: list[str] | None = None
+            try:
+                discarded = _discard_queued_runs()
+                lines.append(f"queued jobs discarded: {len(discarded)}")
+            except BackupError as exc:
+                lines.append(str(exc))
             # The swap stays even when this fails. --test returned above. The
             # lines naming what it moved aside go out with the error. History
             # is recorded after settle so a missing history file does not skip
@@ -199,13 +225,35 @@ def restore_snapshot(
                 # The restored database is the live name. Point this process at
                 # it before blanking, or the erasure list is applied nowhere.
                 _point_at_live(cfg)
-                _reapply_erased(root, dump_in_snapshot)
-                lines.extend(
-                    _settle_restored(
-                        cfg, manifest, snapshot_id, restoring_user, abandoned
+                settle_error: BackupError | None = None
+                try:
+                    lines.extend(
+                        _settle_restored(
+                            cfg,
+                            manifest,
+                            snapshot_id,
+                            restoring_user,
+                            abandoned,
+                            paired_key,
+                            live_ring,
+                        )
                     )
-                )
-                _record_restored(manifest, snapshot_id, discarded)
+                except BackupError as exc:
+                    settle_error = exc
+                # After the settle, which leaves the ring the reservations are
+                # keyed under. It runs even when the settle failed, so an erased
+                # person is never left active; the settle error is still raised.
+                try:
+                    _reapply_erased(root, dump_in_snapshot)
+                except BackupError as exc:
+                    raise BackupError(
+                        f"{settle_error}\n{exc}" if settle_error else str(exc)
+                    ) from exc
+                if settle_error is not None:
+                    raise settle_error
+                if discarded is None:
+                    raise BackupError("queued agent runs were not discarded")
+                _record_restored(manifest, snapshot_id, reason, discarded)
             except BackupError as exc:
                 raise BackupError("\n".join([*lines, str(exc)])) from exc
             return "\n".join(lines)
@@ -288,6 +336,65 @@ def _other_clients(
 def _restic(repo: str, test: bool) -> list[str]:
     # --test only reads, so it takes no lock and a read-only repository works.
     return ["restic", "-r", repo, *(["--no-lock"] if test else [])]
+
+
+def _snapshots(restic: list[str], passphrase: Path, priority: list[str]) -> list[dict]:
+    raw = _checked(
+        priority + [*restic, "snapshots", "--json"],
+        env=_restic_env(passphrase),
+        what="restic snapshots",
+    )
+    try:
+        listed = json.loads(raw.stdout)
+    except json.JSONDecodeError as exc:
+        raise BackupError(f"snapshots could not be read: {exc}") from exc
+    if not isinstance(listed, list):
+        return []
+    return [s for s in listed if isinstance(s, dict)]
+
+
+def _resolve_snapshot(
+    restic: list[str], passphrase: Path, snapshot: str, priority: list[str]
+) -> str:
+    """``latest`` is the newest backup, not the newest snapshot: the wrapping-key
+    snapshot written after each backup is never what a restore wants."""
+    if snapshot != "latest":
+        return snapshot
+    mains = [
+        s
+        for s in _snapshots(restic, passphrase, priority)
+        if WRAPPING_TAG not in (s.get("tags") or [])
+    ]
+    if not mains:
+        raise BackupError("the repository has no backup to restore")
+    return max(mains, key=lambda s: str(s.get("time")))["id"]
+
+
+def _paired_wrapping_key(
+    restic: list[str], passphrase: Path, snapshot_id: str, priority: list[str]
+) -> str | None:
+    """The JWT_SECRET_KEY backed up with ``snapshot_id``, or None for a backup
+    taken before they were paired (or whose pairing could not be read)."""
+    try:
+        for snap in _snapshots(restic, passphrase, priority):
+            tags = snap.get("tags") or []
+            if WRAPPING_TAG not in tags:
+                continue
+            paired = [t[len(PAIR_PREFIX) :] for t in tags if t.startswith(PAIR_PREFIX)]
+            # A short id and a full one name one snapshot when one starts the other.
+            if not any(
+                snapshot_id.startswith(p) or p.startswith(snapshot_id) for p in paired
+            ):
+                continue
+            raw = _checked(
+                priority + [*restic, "dump", snap["id"], f"/{WRAPPING_FILE}"],
+                env=_restic_env(passphrase),
+                what="wrapping-key snapshot",
+            )
+            return raw.stdout.strip() or None
+    except BackupError as exc:
+        logger.warning("could not read the paired wrapping key: %s", exc)
+    return None
 
 
 def _load_manifest(
@@ -529,6 +636,8 @@ def _stage_locations(
             dest.parent.mkdir(parents=True, exist_ok=True)
             shutil.move(str(src), str(dest))
             continue
+        if name == "env":
+            _keep_live_jwt(src, target)
         if not is_dir:
             # Copied from the restic target, which outlives the swap.
             _remember_created(target.parent, created_dirs)
@@ -541,6 +650,25 @@ def _stage_locations(
             raise BackupError(f"staging path already exists: {dest}")
         shutil.move(str(src), str(dest))
         placed.append(_Placed(name, dest, target, is_dir=True))
+
+
+def _keep_live_jwt(staged: Path, live: Path) -> None:
+    """A snapshot's .env from #4181 on has no JWT_SECRET_KEY line, and must not
+    take the install's secret away: carry the live file's line over. An older
+    snapshot's .env still has its own, as before."""
+    if not live.is_file() or _env_jwt(staged) is not None:
+        return
+    mine = [
+        line
+        for line in live.read_text(encoding="utf-8").splitlines(keepends=True)
+        if _JWT_ENV_LINE.match(line.rstrip("\r\n"))
+    ]
+    if not mine:
+        return
+    body = staged.read_text(encoding="utf-8")
+    if body and not body.endswith("\n"):
+        body += "\n"
+    staged.write_text(body + "".join(mine), encoding="utf-8")
 
 
 def _enclosing(placed: list[_Placed], target: Path) -> _Placed | None:
@@ -632,25 +760,99 @@ def _check_erasure_list(root: Path, dump_in_snapshot: str) -> None:
     path = _under_target(root, str(Path(dump_in_snapshot).parent / retention.LIST_NAME))
     if path.is_file() and retention.read_ids(path) and retention.outside_path() is None:
         raise BackupError(
-            "the snapshot erases principals and VIGIL_UPGRADE_DIR is unset; "
+            f"the snapshot erases principals, but {retention.UNSET_MESSAGE}; "
             "set it, then restore again"
         )
 
 
 def _reapply_erased(root: Path, dump_in_snapshot: str) -> None:
-    """Union the snapshot's erasure list with the outside file and blank each id."""
+    """Union the snapshot's erasure list with the outside file, then blank each
+    id and reserve its username and email."""
     path = _under_target(root, str(Path(dump_in_snapshot).parent / retention.LIST_NAME))
     try:
         with unit_of_work() as session:
+            ringed = _ring_present(session)
+        if ringed:
+            # A backup from before the identifier key has none: add it, committed
+            # first so the re-apply reads it. A restored ring with no rows is left
+            # to the API's first adopt, so no reservation is written for it.
+            key_ring.adopt()
+        with unit_of_work() as session:
             retention.reapply(
-                session, retention.read_ids(path) if path.is_file() else []
+                session,
+                retention.read_ids(path) if path.is_file() else [],
+                reserve=ringed,
             )
     except Exception as exc:
         raise BackupError(f"could not reapply erased principals: {exc}") from exc
 
 
+def _check_redis() -> None:
+    """Refuse before the swap when the agent-run queue can't be reached."""
+    client = redis.Redis.from_url(
+        effective_redis_url(), socket_connect_timeout=5, socket_timeout=5
+    )
+    try:
+        client.ping()
+    except Exception as exc:
+        raise BackupError(
+            "Redis is not answering, so queued agent runs can't be discarded; "
+            f"start Redis and restore again ({redact_logged_text(str(exc))})"
+        ) from exc
+    finally:
+        client.close()
+
+
+# Waiting (and paused), delayed, prioritized, and active jobs a stopped worker left.
+_QUEUED_STATES = ["waiting", "delayed", "prioritized", "active"]
+
+
+def _discard_queued_runs() -> list[str]:
+    """Empty ``agent-runs`` and return the ids of the queued jobs it held.
+
+    The restored database stopped every run it knows of, so any job left
+    would only start or resume a run that is gone or cancelled. The queue has
+    no repeatable jobs. Obliterating also drops its finished and failed jobs,
+    which name runs the restored database no longer has.
+    """
+
+    async def discard() -> list[str]:
+        # Timeouts and no long retry: Redis answered before the swap.
+        client = redis.asyncio.from_url(
+            effective_redis_url(),
+            decode_responses=True,
+            socket_connect_timeout=5,
+            socket_timeout=30,
+        )
+        queue = Queue(RUN_QUEUE, {"connection": client})
+        try:
+            # Ids only: getJobs fails on an id whose job hash is gone.
+            ids = await queue.scripts.getRanges(
+                queue.sanitizeJobTypes(_QUEUED_STATES), 0, -1, False
+            )
+            try:
+                # force: a stopped worker's lock on an active job may linger.
+                # A string: bullmq 2.15 hands the flag to Redis as-is, and
+                # redis-py refuses a bool.
+                await queue.obliterate(force="1")
+            except Exception:
+                # obliterate pauses first; don't leave the queue stuck paused.
+                await queue.resume()
+                raise
+            return sorted(set(map(str, ids)))
+        finally:
+            await queue.close()
+
+    try:
+        return asyncio.run(discard())
+    except Exception as exc:
+        raise BackupError(
+            f"could not discard queued agent runs: {redact_logged_text(str(exc))}"
+        ) from exc
+
+
 def _record_restored(
-    manifest: dict, snapshot_id: str, discarded: list[str] | None
+    manifest: dict, snapshot_id: str, reason: str | None, discarded: list[str]
 ) -> None:
     """One history line, same keys as ``core.upgrade.command._record``.
 
@@ -667,8 +869,8 @@ def _record_restored(
         "to": version if isinstance(version, str) else None,
         "outcome": "restored",
         "restore_point": snapshot_id,
-        "reason": "",
-        "discarded": list(discarded or []),
+        "reason": reason or "",
+        "discarded": discarded,
     }
     path = Path(raw)
     try:
@@ -701,11 +903,12 @@ def _swap(
     pre_name: str,
     placed: list[_Placed],
     stamp: str,
-) -> tuple[list[str], dict | None]:
+) -> tuple[list[str], dict | None, dict]:
     _close_our_backends(cfg, [cfg.database, staged_name])
     # Read and release before the rename. A connection left on the live
     # database makes _other_clients refuse the swap.
     abandoned = _abandoned_tip(cfg)
+    live_ring = _live_ring(cfg)
     admin = _connect_as(cfg, database="postgres", autocommit=True)
     renamed = False
     try:
@@ -727,7 +930,7 @@ def _swap(
     finally:
         admin.close()
     try:
-        return _swap_files(placed, stamp), abandoned
+        return _swap_files(placed, stamp), abandoned, live_ring
     except Exception:
         try:
             _rollback_database(cfg, staged_name, pre_name)
@@ -966,14 +1169,58 @@ def _abandoned_tip(cfg: DatabaseConfig) -> dict | None:
     return {"seq": int(tip.seq), "hash": str(tip.entry_hash)}
 
 
+def _live_ring(cfg: DatabaseConfig) -> dict:
+    """What the live key ring knows, read before the swap: the retired (purpose,
+    version) pairs, which a restore must keep retired, and the highest version of
+    each purpose, which it must not reuse. Disposed before return, as above."""
+    engine = create_engine(
+        _config_for(cfg, cfg.database).get_database_url(), poolclass=NullPool
+    )
+    try:
+        with engine.connect() as conn:
+            if not conn.execute(
+                sa_text("SELECT to_regclass('public.auth_keys') IS NOT NULL")
+            ).scalar_one():
+                return {"retired": [], "highest": {}}
+            retired = conn.execute(
+                sa_text(
+                    "SELECT purpose, version FROM public.auth_keys "
+                    "WHERE state = 'retired'"
+                )
+            ).all()
+            highest = conn.execute(
+                sa_text(
+                    "SELECT purpose, max(version) FROM public.auth_keys "
+                    "GROUP BY purpose"
+                )
+            ).all()
+    finally:
+        engine.dispose()
+    return {
+        "retired": [(p, v) for p, v in retired],
+        "highest": {p: v for p, v in highest},
+    }
+
+
 def _restore_values(
-    snapshot_id: str, created_at: str, expired: int, rotated: bool
+    snapshot_id: str,
+    created_at: str,
+    expired: int,
+    rotated: bool,
+    ended: int,
+    stopped: int,
+    apps_cleared: int,
+    resets_needed: int,
 ) -> dict:
     return {
         "snapshot_id": snapshot_id,
         "created_at": created_at,
         "expired_count": expired,
         "jwt_rotated": rotated,
+        "sign_ins_ended": ended,
+        "runs_stopped": stopped,
+        "apps_cleared": apps_cleared,
+        "passwords_to_reset": resets_needed,
     }
 
 
@@ -982,6 +1229,10 @@ def _record_restore(
     created_at: str,
     expired: int,
     rotated: bool,
+    ended: int,
+    stopped: int,
+    apps_cleared: int,
+    resets_needed: int,
     actor: str,
     abandoned: dict | None,
     failure: BackupError | None,
@@ -994,7 +1245,16 @@ def _record_restore(
     A failure is part of this entry; it is not a later update. The entry is
     flagged unconfirmed, and a feed-on restore pauses later writes (decision 11).
     """
-    values = _restore_values(snapshot_id, created_at, expired, rotated)
+    values = _restore_values(
+        snapshot_id,
+        created_at,
+        expired,
+        rotated,
+        ended,
+        stopped,
+        apps_cleared,
+        resets_needed,
+    )
     with get_db_manager().session_scope() as session:
         if _trail_ready(session):
             payload = {
@@ -1028,10 +1288,13 @@ def _settle_restored(
     snapshot_id: str,
     actor: str,
     abandoned: dict | None,
+    paired_key: str | None,
+    live_ring: dict,
 ) -> list[str]:
     created_at: str = manifest["created_at"]
     failure: BackupError | None = None
     expired = 0
+    ended = stopped = apps_cleared = resets_needed = 0
     rotated = False
     new_secret = False
     from_env = False
@@ -1048,8 +1311,8 @@ def _settle_restored(
         if from_env:
             old_key = env_key
         new_key = secrets.token_urlsafe(48)
-        expired, new_secret = _reencrypt_and_expire(
-            old_key, new_key, snapshot_id, created_at, actor
+        expired, new_secret, apps_cleared, resets_needed = _reencrypt_and_expire(
+            old_key, new_key, snapshot_id, created_at, actor, paired_key, live_ring
         )
         # With no key anywhere, a deployment outside this install sets it. A
         # jwt_secret written here would never be read.
@@ -1069,12 +1332,23 @@ def _settle_restored(
         # Any settle failure after the swap still records one entry. A
         # pre-trail snapshot only keeps today's row when settle reached it.
         failure = exc if isinstance(exc, BackupError) else BackupError(str(exc))
+    # Apart from the key step: a failed key step still ends the sign-ins, and a
+    # failed ending is still reported and recorded.
+    try:
+        ended, stopped = _end_restored_sessions(created_at, apps_cleared, resets_needed)
+    except Exception as exc:
+        ending = BackupError(f"could not end the restored sign-ins: {exc}")
+        failure = BackupError(f"{failure}\n{ending}") if failure else ending
     try:
         _record_restore(
             snapshot_id,
             created_at,
             expired,
             rotated,
+            ended,
+            stopped,
+            apps_cleared,
+            resets_needed,
             actor,
             abandoned,
             failure,
@@ -1092,8 +1366,16 @@ def _settle_restored(
     lines = [
         f"backup date: {created_at}",
         f"approvals expired: {expired}",
+        f"sign-ins ended: {ended}",
+        f"runs stopped: {stopped}",
         "integration credentials and user accounts date from the backup",
     ]
+    if apps_cleared:
+        lines.insert(
+            4, f"people who must set up their authenticator app: {apps_cleared}"
+        )
+    if resets_needed:
+        lines.insert(4, f"people who must reset their password: {resets_needed}")
     if from_env and new_secret:
         lines.append(
             "the new JWT_SECRET_KEY is in "
@@ -1102,6 +1384,96 @@ def _settle_restored(
             "because an environment value outranks secrets.enc"
         )
     return lines
+
+
+def _end_restored_sessions(
+    created_at: str,
+    apps_cleared: int = 0,
+    resets_needed: int = 0,
+) -> tuple[int, int]:
+    """End every open sign-in, stop every in-flight run, open the dormancy grace
+    and tell the holders of ``sessions.manage`` once; returns (sign-ins ended,
+    runs stopped).
+
+    The runs stop through ``sign_in_runs._stop`` (the abort directive, the
+    cancelled row, "stopped: sign-in ended"). This host process may have no
+    workers or Redis, and ``stop_run``'s escalation timer dies with it, so each
+    stopped run also gets its terminal in the ledger now.
+    """
+    from core.workflows.run_cancel import force_terminal
+
+    try:
+        runs = sign_in_runs.in_flight_runs()
+        with unit_of_work() as session:
+            ended = sign_ins.end_every_open(session, sign_ins.RESTORE)
+            dormancy.start_grace(session)
+    except Exception as exc:
+        # The marker is what voids a reminder sent before the restore.
+        raise RuntimeError(
+            f"{exc}; API token reminders were not paused after the restore, so "
+            "they may count a reminder sent before it"
+        ) from exc
+    stopped = sign_in_runs._stop(runs)
+    for run_id in stopped:
+        force_terminal(run_id, sign_in_runs.STOP_REASON)
+    _tell_session_holders(created_at, ended, len(stopped), apps_cleared, resets_needed)
+    return ended, len(stopped)
+
+
+def _tell_session_holders(
+    created_at: str,
+    ended: int,
+    stopped: int,
+    apps_cleared: int = 0,
+    resets_needed: int = 0,
+) -> None:
+    """One notice to each active person who holds ``sessions.manage``. No names,
+    no tokens."""
+    from core.auth import permissions
+    from core.platform.notices import notify
+
+    until = dormancy.grace_until()
+    # Prose, not a list: the bell shows a notice as one paragraph.
+    message = (
+        f"A restore from the backup of {created_at[:10]} has settled. "
+        f"{ended} sign-in{'s' if ended != 1 else ''} ended, so everyone signs in "
+        f"again, and {stopped} agent run{'s' if stopped != 1 else ''} stopped. "
+        "Last-sign-in dates and failed-sign-in counts are as they were in the "
+        "backup, so dormancy deactivates nobody and warns nobody until "
+        f"{until:%Y-%m-%d} UTC. Locks set after the backup are gone."
+    )
+    if apps_cleared:
+        message += (
+            f" The backup's key ring could not be opened, so {apps_cleared} "
+            f"{'person' if apps_cleared == 1 else 'people'} must set up the "
+            "authenticator app again."
+        )
+    if resets_needed:
+        message += (
+            f" {resets_needed} {'person' if resets_needed == 1 else 'people'}"
+            " must reset the password, because the key that protected it is gone; "
+            "their recovery codes are removed until they make new ones."
+        )
+    message += (
+        " API token reminders resume now, and no token is revoked for disuse sooner "
+        "than 7 days after a fresh reminder."
+    )
+    # The re-apply runs after this: a person erased since the backup is still
+    # active here, and must not be told (or mailed) at a retired address.
+    erased = set(retention.read_ids(retention.outside_path()))
+    holders = [p for p in permissions.holders("sessions.manage") if p not in erased]
+    for principal in holders:
+        try:
+            notify(
+                principal,
+                "restore_settled",
+                "A restore ended every sign-in",
+                message,
+                link=SETTINGS_LINK,
+                priority="high",
+            )
+        except Exception:  # noqa: BLE001 - the restore has already settled
+            logger.exception("could not tell a session manager about the restore")
 
 
 def _point_at_live(cfg: DatabaseConfig) -> None:
@@ -1149,36 +1521,43 @@ def _reencrypt_and_expire(
     snapshot_id: str,
     created_at: str,
     actor: str,
-) -> tuple[int, bool]:
-    """Expire pending approvals and sign everyone out; returns the count and
-    whether JWT_SECRET_KEY must change (a database from before the key ring).
+    paired_key: str | None,
+    live_ring: dict,
+) -> tuple[int, bool, int, int]:
+    """Expire pending approvals and sign everyone out; returns the count, whether
+    JWT_SECRET_KEY must change (a database from before the key ring), and how many
+    people must set up their authenticator app again and reset their password
+    (a hash naming a pepper version no live key holds).
 
-    With a ring, the wrapping secret stays: new sign-in and run-token keys are
-    written with no overlap, so old sessions and run tokens stop verifying, and
-    MFA secrets stay under their key. Without one, as before the ring: the
-    secret rotates and MFA secrets move to a key derived from the new one.
+    With a ring, the wrapping secret stays. The ring opens under it, or under the
+    backup's paired wrapping key and is re-wrapped, or it is replaced (no old token
+    verifies, and secrets no live MFA key opens are cleared). Versions retired
+    before the restore stay retired. New sign-in and run-token keys are written
+    with no overlap, so old sessions and run tokens stop verifying. Without a
+    ring, as before it: the secret rotates and MFA secrets move to a key derived
+    from the new one.
     """
     reason = f"expired: restored from backup {snapshot_id} taken {created_at}"
     decided_at = utcnow()
     legacy = False
+    apps_cleared = resets_needed = 0
     try:
         with get_db_manager().session_scope() as session:
             if old_key and _ring_present(session):
-                try:
-                    key_ring._read(session, old_key)  # the ring must open first
-                except key_ring.KeyRingError as exc:
-                    raise BackupError(
-                        f"cannot sign people out: {exc}; the restored key ring "
-                        "was wrapped under a different secret"
-                    ) from exc
-                for purpose in ("signin", "run"):
-                    key_ring.rotate(
-                        purpose,
-                        session=session,
-                        secret=old_key,
-                        overlap=timedelta(0),
-                        operator=actor,
-                    )
+                kept = key_ring.restore_ring(
+                    session, old_key, paired_key, live_ring, operator=actor
+                )
+                if kept:  # a replaced ring has no old key left to rotate
+                    for purpose in ("signin", "run"):
+                        key_ring.rotate(
+                            purpose,
+                            session=session,
+                            secret=old_key,
+                            overlap=timedelta(0),
+                            operator=actor,
+                        )
+                apps_cleared = key_ring.clear_unreadable_apps(session, old_key)
+                resets_needed = key_ring.people_with_unreadable_hash(session)
             elif old_key:
                 legacy = True
                 _rewrap_mfa(session, old_key, new_key)
@@ -1192,7 +1571,7 @@ def _reencrypt_and_expire(
                 row.rejection_reason = reason
                 row.approved_by = actor
                 row.approved_at = decided_at
-            return len(pending), legacy
+            return len(pending), legacy, apps_cleared, resets_needed
     except BackupError:
         raise
     except Exception as exc:

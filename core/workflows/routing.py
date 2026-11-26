@@ -16,6 +16,10 @@ ROUTED_WORKFLOWS = frozenset(
 # The scheduler's hunt. The threat-feed poller queues the same workflow for
 # uncovered indicators, so it shows ``schedule`` rather than a trigger of its own.
 SCHEDULED_WORKFLOW = "threat-hunt"
+# Once a day, mitre_analyst drafts and checks rules for the listed detection gaps.
+DETECTION_GAPS_WORKFLOW = "agent-run-mitre_analyst"
+# A person's Emulate (rule, gap or technique) runs the same analyst, with no Case.
+EMULATE_WORKFLOW = DETECTION_GAPS_WORKFLOW
 # Run beside every admitted finding, executing nothing.
 SHADOW_WORKFLOW_ID = "shadow-adjudication"
 

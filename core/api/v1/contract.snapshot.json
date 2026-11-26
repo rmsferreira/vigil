@@ -153,6 +153,18 @@
             ],
             "description": "Identity of the approving analyst. Defaults to 'analyst'.",
             "title": "Approved By"
+          },
+          "candidate": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "An isolation or account disable: the id of the stored candidate (parameters.containment.candidates) to act on. May be omitted when there is one.",
+            "title": "Candidate"
           }
         },
         "title": "ApproveRequest",
@@ -186,6 +198,17 @@
           },
           "payload": {
             "$ref": "#/components/schemas/AuditPayload"
+          },
+          "restricted": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Restricted"
           },
           "seq": {
             "title": "Seq",
@@ -226,6 +249,28 @@
               }
             ],
             "title": "Enabled"
+          },
+          "held": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Held"
+          },
+          "held_since": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Held Since"
           },
           "last_delivered_at": {
             "anyOf": [
@@ -533,6 +578,11 @@
             },
             "title": "Breached Cases",
             "type": "array"
+          },
+          "restricted_not_counted": {
+            "default": 0,
+            "title": "Restricted Not Counted",
+            "type": "integer"
           }
         },
         "title": "BreachedCasesResponse",
@@ -546,6 +596,11 @@
             },
             "title": "Priority Breakdown",
             "type": "array"
+          },
+          "restricted_not_counted": {
+            "default": 0,
+            "title": "Restricted Not Counted",
+            "type": "integer"
           }
         },
         "title": "ByPriorityResponse",
@@ -553,6 +608,11 @@
       },
       "ByStatusResponse": {
         "properties": {
+          "restricted_not_counted": {
+            "default": 0,
+            "title": "Restricted Not Counted",
+            "type": "integer"
+          },
           "status_breakdown": {
             "items": {
               "$ref": "#/components/schemas/StatusBreakdownRow"
@@ -646,6 +706,17 @@
             "title": "Contributing Factors",
             "type": "array"
           },
+          "evidence_opened": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Evidence Opened"
+          },
           "executive_summary": {
             "anyOf": [
               {
@@ -656,6 +727,17 @@
               }
             ],
             "title": "Executive Summary"
+          },
+          "false_positive_cause": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "False Positive Cause"
           },
           "false_positive_reason": {
             "anyOf": [
@@ -711,6 +793,17 @@
               }
             ],
             "title": "Root Cause"
+          },
+          "sampled_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sampled At"
           }
         },
         "title": "CaseClosureInfoSchema",
@@ -741,6 +834,17 @@
           "closure_category": {
             "title": "Closure Category",
             "type": "string"
+          },
+          "false_positive_cause": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "False Positive Cause"
           },
           "verdict": {
             "default": "",
@@ -779,7 +883,7 @@
         "type": "object"
       },
       "CaseCreate": {
-        "description": "Case creation request.",
+        "description": "Case creation request.\n\n``restricted`` (or a ``readers`` or ``reader_teams`` list) creates the case\nrestricted in the same insert, so its content is never open. ``readers`` are\nprincipal ids; left out, the list is the defaults (you, when you are a person\nor service account). ``reader_teams`` are team ids whose members read it:\nnaming one is a person's own act and needs users.read; never the default team.",
         "properties": {
           "description": {
             "default": "",
@@ -797,6 +901,45 @@
             "default": "medium",
             "title": "Priority",
             "type": "string"
+          },
+          "reader_teams": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reader Teams"
+          },
+          "readers": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Readers"
+          },
+          "restricted": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Restricted"
           },
           "status": {
             "default": "open",
@@ -930,6 +1073,65 @@
             "title": "Notes",
             "type": "array"
           },
+          "opened_from": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Opened From"
+          },
+          "owner_cannot_read": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Owner Cannot Read"
+          },
+          "owner_on_team": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Owner On Team"
+          },
+          "owner_state": {
+            "anyOf": [
+              {
+                "enum": [
+                  "current",
+                  "not_current"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Owner State"
+          },
+          "primary_basis": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Primary Basis"
+          },
           "priority": {
             "anyOf": [
               {
@@ -941,11 +1143,45 @@
             ],
             "title": "Priority"
           },
+          "reader_teams": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Reader Teams",
+            "type": "array"
+          },
+          "readers": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Readers",
+            "type": "array"
+          },
+          "recheck": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/RecheckMarkView"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "resolution_steps": {
             "default": [],
             "items": {},
             "title": "Resolution Steps",
             "type": "array"
+          },
+          "restricted": {
+            "readOnly": true,
+            "title": "Restricted",
+            "type": "boolean"
+          },
+          "reviewers_differ": {
+            "default": false,
+            "title": "Reviewers Differ",
+            "type": "boolean"
           },
           "status": {
             "anyOf": [
@@ -965,6 +1201,16 @@
             },
             "title": "Tags",
             "type": "array"
+          },
+          "team": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/CaseTeam"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "timeline": {
             "default": [],
@@ -996,7 +1242,9 @@
           }
         },
         "required": [
-          "combined_state"
+          "combined_state",
+          "owner_state",
+          "restricted"
         ],
         "title": "CaseDetailResponse",
         "type": "object"
@@ -1418,6 +1666,17 @@
             ],
             "title": "First Seen"
           },
+          "intake": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Intake"
+          },
           "ioc_id": {
             "anyOf": [
               {
@@ -1472,6 +1731,17 @@
               }
             ],
             "title": "Last Seen"
+          },
+          "linked": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Linked"
           },
           "reputation_score": {
             "anyOf": [
@@ -1547,6 +1817,28 @@
             "title": "Budget Health",
             "type": "string"
           },
+          "capped": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Capped"
+          },
+          "citation_count": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Citation Count"
+          },
           "cost_usd": {
             "default": 0,
             "title": "Cost Usd",
@@ -1562,6 +1854,17 @@
               }
             ],
             "title": "Created At"
+          },
+          "grounded": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Grounded"
           },
           "investigation_id": {
             "anyOf": [
@@ -1588,6 +1891,17 @@
             "default": 0,
             "title": "Max Cost Usd",
             "type": "number"
+          },
+          "outcome": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Outcome"
           },
           "primary": {
             "default": false,
@@ -1710,6 +2024,11 @@
             "title": "Offset",
             "type": "integer"
           },
+          "restricted_not_counted": {
+            "default": 0,
+            "title": "Restricted Not Counted",
+            "type": "integer"
+          },
           "strip": {
             "$ref": "#/components/schemas/CaseQueueStrip"
           },
@@ -1794,6 +2113,11 @@
             "title": "Resolved Cases",
             "type": "integer"
           },
+          "restricted_not_counted": {
+            "default": 0,
+            "title": "Restricted Not Counted",
+            "type": "integer"
+          },
           "status_breakdown": {
             "additionalProperties": {
               "type": "integer"
@@ -1813,6 +2137,46 @@
           "critical_cases"
         ],
         "title": "CaseMetricsSummaryResponse",
+        "type": "object"
+      },
+      "CaseOwner": {
+        "description": "One stored owner on a readable case: the value as stored, and its state.",
+        "properties": {
+          "owner": {
+            "title": "Owner",
+            "type": "string"
+          },
+          "owner_state": {
+            "enum": [
+              "current",
+              "not_current"
+            ],
+            "title": "Owner State",
+            "type": "string"
+          }
+        },
+        "required": [
+          "owner",
+          "owner_state"
+        ],
+        "title": "CaseOwner",
+        "type": "object"
+      },
+      "CaseOwnersResponse": {
+        "description": "Distinct non-blank owners on cases the reader can list, closed included.",
+        "properties": {
+          "owners": {
+            "items": {
+              "$ref": "#/components/schemas/CaseOwner"
+            },
+            "title": "Owners",
+            "type": "array"
+          }
+        },
+        "required": [
+          "owners"
+        ],
+        "title": "CaseOwnersResponse",
         "type": "object"
       },
       "CaseQueueItem": {
@@ -1909,7 +2273,6 @@
           "last_activity": {
             "anyOf": [
               {
-                "format": "date-time",
                 "type": "string"
               },
               {
@@ -1934,6 +2297,43 @@
             "title": "Needs You",
             "type": "boolean"
           },
+          "owner_cannot_read": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Owner Cannot Read"
+          },
+          "owner_on_team": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Owner On Team"
+          },
+          "owner_state": {
+            "anyOf": [
+              {
+                "enum": [
+                  "current",
+                  "not_current"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Owner State"
+          },
           "priority": {
             "anyOf": [
               {
@@ -1944,6 +2344,27 @@
               }
             ],
             "title": "Priority"
+          },
+          "reader_teams": {
+            "default": [],
+            "items": {
+              "type": "string"
+            },
+            "title": "Reader Teams",
+            "type": "array"
+          },
+          "readers": {
+            "default": [],
+            "items": {
+              "type": "string"
+            },
+            "title": "Readers",
+            "type": "array"
+          },
+          "restricted": {
+            "default": false,
+            "title": "Restricted",
+            "type": "boolean"
           },
           "sla_paused": {
             "default": false,
@@ -1960,6 +2381,16 @@
               }
             ],
             "title": "Sla Seconds Left"
+          },
+          "team": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/CaseTeam"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "title": {
             "title": "Title",
@@ -1981,7 +2412,8 @@
           "case_id",
           "title",
           "combined_state",
-          "age_seconds"
+          "age_seconds",
+          "owner_state"
         ],
         "title": "CaseQueueItem",
         "type": "object"
@@ -2011,6 +2443,10 @@
           "sla_at_risk": {
             "title": "Sla At Risk",
             "type": "integer"
+          },
+          "waiting": {
+            "title": "Waiting",
+            "type": "integer"
           }
         },
         "required": [
@@ -2018,9 +2454,149 @@
           "sla_at_risk",
           "closed_today",
           "agent_closure_share",
-          "needs_you"
+          "needs_you",
+          "waiting"
         ],
         "title": "CaseQueueStrip",
+        "type": "object"
+      },
+      "CaseRuleCard": {
+        "description": "One rule version behind a case's alerts, and its stored checks.",
+        "properties": {
+          "by_name": {
+            "default": 0,
+            "title": "By Name",
+            "type": "integer"
+          },
+          "caught": {
+            "default": false,
+            "title": "Caught",
+            "type": "boolean"
+          },
+          "checks": {
+            "additionalProperties": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "default": {},
+            "title": "Checks",
+            "type": "object"
+          },
+          "findings": {
+            "default": [],
+            "items": {
+              "type": "string"
+            },
+            "title": "Findings",
+            "type": "array"
+          },
+          "flags": {
+            "default": [],
+            "items": {
+              "type": "string"
+            },
+            "title": "Flags",
+            "type": "array"
+          },
+          "health": {
+            "title": "Health",
+            "type": "string"
+          },
+          "latest_version": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Latest Version"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "native_key": {
+            "title": "Native Key",
+            "type": "string"
+          },
+          "rule_id": {
+            "title": "Rule Id",
+            "type": "integer"
+          },
+          "source": {
+            "title": "Source",
+            "type": "string"
+          },
+          "stage": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Stage"
+          },
+          "status": {
+            "title": "Status",
+            "type": "string"
+          },
+          "tool": {
+            "title": "Tool",
+            "type": "string"
+          },
+          "version": {
+            "title": "Version",
+            "type": "integer"
+          },
+          "worst": {
+            "title": "Worst",
+            "type": "string"
+          }
+        },
+        "required": [
+          "rule_id",
+          "version",
+          "name",
+          "source",
+          "tool",
+          "native_key",
+          "status",
+          "health",
+          "worst"
+        ],
+        "title": "CaseRuleCard",
+        "type": "object"
+      },
+      "CaseRulesResponse": {
+        "description": "``GET /cases/{id}/rules`` \u2014 worst first; alerts traced to no rule apart.",
+        "properties": {
+          "rules": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/CaseRuleCard"
+            },
+            "title": "Rules",
+            "type": "array"
+          },
+          "unresolved": {
+            "default": 0,
+            "title": "Unresolved",
+            "type": "integer"
+          },
+          "unresolved_findings": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/CaseUnresolvedFinding"
+            },
+            "title": "Unresolved Findings",
+            "type": "array"
+          }
+        },
+        "title": "CaseRulesResponse",
         "type": "object"
       },
       "CaseSchema": {
@@ -2108,11 +2684,30 @@
             ],
             "title": "Priority"
           },
+          "reader_teams": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Reader Teams",
+            "type": "array"
+          },
+          "readers": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Readers",
+            "type": "array"
+          },
           "resolution_steps": {
             "default": [],
             "items": {},
             "title": "Resolution Steps",
             "type": "array"
+          },
+          "restricted": {
+            "readOnly": true,
+            "title": "Restricted",
+            "type": "boolean"
           },
           "status": {
             "anyOf": [
@@ -2132,6 +2727,16 @@
             },
             "title": "Tags",
             "type": "array"
+          },
+          "team": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/CaseTeam"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "timeline": {
             "default": [],
@@ -2162,6 +2767,9 @@
             "title": "Updated At"
           }
         },
+        "required": [
+          "restricted"
+        ],
         "title": "CaseSchema",
         "type": "object"
       },
@@ -2179,9 +2787,14 @@
             "title": "Offset",
             "type": "integer"
           },
+          "restricted_not_counted": {
+            "default": 0,
+            "title": "Restricted Not Counted",
+            "type": "integer"
+          },
           "results": {
             "items": {
-              "$ref": "#/components/schemas/CaseSchema"
+              "$ref": "#/components/schemas/CaseSearchResult"
             },
             "title": "Results",
             "type": "array"
@@ -2199,6 +2812,195 @@
           "has_more"
         ],
         "title": "CaseSearchResponse",
+        "type": "object"
+      },
+      "CaseSearchResult": {
+        "properties": {
+          "activities": {
+            "default": [],
+            "items": {},
+            "title": "Activities",
+            "type": "array"
+          },
+          "assignee": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Assignee"
+          },
+          "case_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Case Id"
+          },
+          "created_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Created At"
+          },
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description"
+          },
+          "finding_ids": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Finding Ids",
+            "type": "array"
+          },
+          "mitre_techniques": {
+            "default": [],
+            "items": {
+              "type": "string"
+            },
+            "title": "Mitre Techniques",
+            "type": "array"
+          },
+          "notes": {
+            "default": [],
+            "items": {},
+            "title": "Notes",
+            "type": "array"
+          },
+          "owner_state": {
+            "anyOf": [
+              {
+                "enum": [
+                  "current",
+                  "not_current"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Owner State"
+          },
+          "priority": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Priority"
+          },
+          "reader_teams": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Reader Teams",
+            "type": "array"
+          },
+          "readers": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Readers",
+            "type": "array"
+          },
+          "resolution_steps": {
+            "default": [],
+            "items": {},
+            "title": "Resolution Steps",
+            "type": "array"
+          },
+          "restricted": {
+            "readOnly": true,
+            "title": "Restricted",
+            "type": "boolean"
+          },
+          "status": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Status"
+          },
+          "tags": {
+            "default": [],
+            "items": {
+              "type": "string"
+            },
+            "title": "Tags",
+            "type": "array"
+          },
+          "team": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/CaseTeam"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "timeline": {
+            "default": [],
+            "items": {},
+            "title": "Timeline",
+            "type": "array"
+          },
+          "title": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Title"
+          },
+          "updated_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Updated At"
+          }
+        },
+        "required": [
+          "owner_state",
+          "restricted"
+        ],
+        "title": "CaseSearchResult",
         "type": "object"
       },
       "CaseSuccessResponse": {
@@ -2231,6 +3033,11 @@
             "title": "By Status",
             "type": "object"
           },
+          "restricted_not_counted": {
+            "default": 0,
+            "title": "Restricted Not Counted",
+            "type": "integer"
+          },
           "total": {
             "title": "Total",
             "type": "integer"
@@ -2242,6 +3049,48 @@
           "by_priority"
         ],
         "title": "CaseSummaryResponse",
+        "type": "object"
+      },
+      "CaseTeam": {
+        "description": "The case's owning team, on reads.",
+        "properties": {
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "is_default": {
+            "title": "Is Default",
+            "type": "boolean"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "is_default"
+        ],
+        "title": "CaseTeam",
+        "type": "object"
+      },
+      "CaseUnresolvedFinding": {
+        "properties": {
+          "finding_id": {
+            "title": "Finding Id",
+            "type": "string"
+          },
+          "reason": {
+            "title": "Reason",
+            "type": "string"
+          }
+        },
+        "required": [
+          "finding_id",
+          "reason"
+        ],
+        "title": "CaseUnresolvedFinding",
         "type": "object"
       },
       "CaseUpdate": {
@@ -2368,6 +3217,30 @@
               }
             ],
             "title": "Four Eyes"
+          },
+          "hold_crown_jewels": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Hold Crown Jewels"
+          },
+          "released_per_hour": {
+            "anyOf": [
+              {
+                "maximum": 1000.0,
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Released Per Hour"
           }
         },
         "title": "CeilingBody",
@@ -2383,12 +3256,28 @@
             "title": "Act Reversible",
             "type": "boolean"
           },
+          "crown_jewels": {
+            "title": "Crown Jewels",
+            "type": "integer"
+          },
           "environment_locked": {
             "title": "Environment Locked",
             "type": "boolean"
           },
           "four_eyes": {
             "title": "Four Eyes",
+            "type": "boolean"
+          },
+          "held": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/HeldAction"
+            },
+            "title": "Held",
+            "type": "array"
+          },
+          "hold_crown_jewels": {
+            "title": "Hold Crown Jewels",
             "type": "boolean"
           },
           "propose": {
@@ -2399,9 +3288,46 @@
             "title": "Read",
             "type": "boolean"
           },
+          "released_per_hour": {
+            "title": "Released Per Hour",
+            "type": "integer"
+          },
           "stopped": {
             "title": "Stopped",
             "type": "boolean"
+          },
+          "stopped_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Stopped At"
+          },
+          "stopped_by": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Stopped By"
+          },
+          "stopped_by_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Stopped By Label"
           },
           "workflows": {
             "additionalProperties": {
@@ -2425,7 +3351,10 @@
           "write",
           "propose",
           "environment_locked",
-          "four_eyes"
+          "four_eyes",
+          "hold_crown_jewels",
+          "crown_jewels",
+          "released_per_hour"
         ],
         "title": "CeilingResponse",
         "type": "object"
@@ -2459,6 +3388,17 @@
             ],
             "title": "Closure Notes"
           },
+          "evidence_opened": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Evidence Opened"
+          },
           "executive_summary": {
             "anyOf": [
               {
@@ -2474,6 +3414,16 @@
             "anyOf": [
               {
                 "$ref": "#/components/schemas/CaseExpected"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "false_positive_cause": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/FalsePositiveCause"
               },
               {
                 "type": "null"
@@ -2523,6 +3473,11 @@
               }
             ],
             "title": "Root Cause"
+          },
+          "take_ownership": {
+            "default": true,
+            "title": "Take Ownership",
+            "type": "boolean"
           }
         },
         "required": [
@@ -2618,6 +3573,215 @@
         "title": "EntityContext",
         "type": "object"
       },
+      "EntityFactFailure": {
+        "properties": {
+          "at": {
+            "format": "date-time",
+            "title": "At",
+            "type": "string"
+          },
+          "reason": {
+            "title": "Reason",
+            "type": "string"
+          }
+        },
+        "required": [
+          "at",
+          "reason"
+        ],
+        "title": "EntityFactFailure",
+        "type": "object"
+      },
+      "EntityFactRow": {
+        "properties": {
+          "case_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Case Id"
+          },
+          "entity_key": {
+            "title": "Entity Key",
+            "type": "string"
+          },
+          "expires_at": {
+            "format": "date-time",
+            "title": "Expires At",
+            "type": "string"
+          },
+          "fetched_at": {
+            "format": "date-time",
+            "title": "Fetched At",
+            "type": "string"
+          },
+          "fields": {
+            "additionalProperties": true,
+            "title": "Fields",
+            "type": "object"
+          },
+          "hit_count": {
+            "title": "Hit Count",
+            "type": "integer"
+          },
+          "source": {
+            "title": "Source",
+            "type": "string"
+          }
+        },
+        "required": [
+          "entity_key",
+          "source",
+          "fetched_at",
+          "expires_at",
+          "hit_count"
+        ],
+        "title": "EntityFactRow",
+        "type": "object"
+      },
+      "EntityFactSource": {
+        "properties": {
+          "fetched": {
+            "title": "Fetched",
+            "type": "integer"
+          },
+          "hit_rate": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Hit Rate"
+          },
+          "label": {
+            "title": "Label",
+            "type": "string"
+          },
+          "last_failure": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/EntityFactFailure"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "newest_fetched_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Newest Fetched At"
+          },
+          "oldest_fetched_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Oldest Fetched At"
+          },
+          "rows": {
+            "title": "Rows",
+            "type": "integer"
+          },
+          "served": {
+            "title": "Served",
+            "type": "integer"
+          },
+          "source": {
+            "title": "Source",
+            "type": "string"
+          },
+          "unavailable": {
+            "title": "Unavailable",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "source",
+          "label",
+          "rows",
+          "served",
+          "fetched",
+          "unavailable"
+        ],
+        "title": "EntityFactSource",
+        "type": "object"
+      },
+      "EntityFactsResponse": {
+        "properties": {
+          "defaults": {
+            "additionalProperties": {
+              "type": "integer"
+            },
+            "title": "Defaults",
+            "type": "object"
+          },
+          "limits": {
+            "additionalProperties": {
+              "type": "integer"
+            },
+            "title": "Limits",
+            "type": "object"
+          },
+          "now": {
+            "format": "date-time",
+            "title": "Now",
+            "type": "string"
+          },
+          "rows": {
+            "items": {
+              "$ref": "#/components/schemas/EntityFactRow"
+            },
+            "title": "Rows",
+            "type": "array"
+          },
+          "rows_total": {
+            "title": "Rows Total",
+            "type": "integer"
+          },
+          "sources": {
+            "items": {
+              "$ref": "#/components/schemas/EntityFactSource"
+            },
+            "title": "Sources",
+            "type": "array"
+          },
+          "window_hours": {
+            "title": "Window Hours",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "now",
+          "window_hours",
+          "limits",
+          "defaults",
+          "sources",
+          "rows_total",
+          "rows"
+        ],
+        "title": "EntityFactsResponse",
+        "type": "object"
+      },
       "EvidenceAdd": {
         "description": "Add evidence to case.",
         "properties": {
@@ -2696,6 +3860,17 @@
         "title": "EvidenceAdd",
         "type": "object"
       },
+      "FalsePositiveCause": {
+        "description": "Which kind of fix a false-positive determination is.\n\nIt refines a ``false_positive`` close and a noise mark. Absence is a null\ncolumn, not a member: ``not_given`` is not stored.",
+        "enum": [
+          "expected",
+          "too_broad",
+          "data",
+          "other"
+        ],
+        "title": "FalsePositiveCause",
+        "type": "string"
+      },
       "FindingListResponse": {
         "properties": {
           "findings": {
@@ -2764,6 +3939,11 @@
               }
             ],
             "title": "Case Id"
+          },
+          "case_restricted": {
+            "default": false,
+            "title": "Case Restricted",
+            "type": "boolean"
           },
           "cluster_id": {
             "anyOf": [
@@ -2868,6 +4048,17 @@
               }
             ],
             "title": "Finding Id"
+          },
+          "first_verdict_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "First Verdict At"
           },
           "mitre_predictions": {
             "anyOf": [
@@ -3123,6 +4314,62 @@
         "title": "HTTPValidationError",
         "type": "object"
       },
+      "HeldAction": {
+        "description": "One approved outside action a stop is still holding.",
+        "properties": {
+          "action_id": {
+            "title": "Action Id",
+            "type": "string"
+          },
+          "action_type": {
+            "default": "",
+            "title": "Action Type",
+            "type": "string"
+          },
+          "approved_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Approved At"
+          },
+          "approved_by": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Approved By"
+          },
+          "restricted": {
+            "default": false,
+            "title": "Restricted",
+            "type": "boolean"
+          },
+          "target": {
+            "default": "",
+            "title": "Target",
+            "type": "string"
+          },
+          "title": {
+            "default": "",
+            "title": "Title",
+            "type": "string"
+          }
+        },
+        "required": [
+          "action_id"
+        ],
+        "title": "HeldAction",
+        "type": "object"
+      },
       "IOCAdd": {
         "description": "Add IOC to case.",
         "properties": {
@@ -3218,6 +4465,30 @@
         "title": "IOCBulkAdd",
         "type": "object"
       },
+      "IOCMark": {
+        "description": "Mark or clear an indicator as a false positive on this case.\n\nNamed by type and value, not id: an indicator a linked alert names has none.",
+        "properties": {
+          "ioc_type": {
+            "title": "Ioc Type",
+            "type": "string"
+          },
+          "is_false_positive": {
+            "default": true,
+            "title": "Is False Positive",
+            "type": "boolean"
+          },
+          "value": {
+            "title": "Value",
+            "type": "string"
+          }
+        },
+        "required": [
+          "ioc_type",
+          "value"
+        ],
+        "title": "IOCMark",
+        "type": "object"
+      },
       "MergeRequest": {
         "description": "Merge another case into this one.",
         "properties": {
@@ -3275,6 +4546,11 @@
             "title": "Mttd By Priority",
             "type": "object"
           },
+          "restricted_not_counted": {
+            "default": 0,
+            "title": "Restricted Not Counted",
+            "type": "integer"
+          },
           "total_cases": {
             "title": "Total Cases",
             "type": "integer"
@@ -3324,6 +4600,11 @@
             "title": "Mttr By Priority",
             "type": "object"
           },
+          "restricted_not_counted": {
+            "default": 0,
+            "title": "Restricted Not Counted",
+            "type": "integer"
+          },
           "total_cases": {
             "title": "Total Cases",
             "type": "integer"
@@ -3368,6 +4649,18 @@
       },
       "NeedsYouItem": {
         "properties": {
+          "args": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "That call's arguments, verbatim: approving releases exactly these.",
+            "title": "Args"
+          },
           "case_id": {
             "anyOf": [
               {
@@ -3411,6 +4704,19 @@
             "description": "The run's own checkpoint this item answers, so a page reading the run can tell it was answered.",
             "title": "Checkpoint Id"
           },
+          "containment": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "An isolation or account disable: the vendor IDs its target resolved to (candidates), or which tool is missing (missing).",
+            "title": "Containment"
+          },
           "created_at": {
             "description": "'' when nothing recorded when it started waiting.",
             "title": "Created At",
@@ -3452,6 +4758,12 @@
             "title": "Reason",
             "type": "string"
           },
+          "restricted": {
+            "default": false,
+            "description": "An item on a restricted case the caller can't read: no case, run or content.",
+            "title": "Restricted",
+            "type": "boolean"
+          },
           "reversibility": {
             "enum": [
               "reversible",
@@ -3478,6 +4790,30 @@
           "title": {
             "title": "Title",
             "type": "string"
+          },
+          "tool": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The gated tool call this approval releases.",
+            "title": "Tool"
+          },
+          "waiting": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Why it waits: no reader of its restricted case can approve it.",
+            "title": "Waiting"
           }
         },
         "required": [
@@ -3631,6 +4967,12 @@
             ],
             "title": "Execution Result"
           },
+          "held": {
+            "default": false,
+            "description": "An approved action a stop is holding: releasing the hold runs it.",
+            "title": "Held",
+            "type": "boolean"
+          },
           "idempotency_key": {
             "anyOf": [
               {
@@ -3684,6 +5026,12 @@
             ],
             "title": "Requires Approval"
           },
+          "restricted": {
+            "default": false,
+            "description": "An action on a restricted case the caller can't read: only its id, state and times are shown.",
+            "title": "Restricted",
+            "type": "boolean"
+          },
           "reversibility": {
             "anyOf": [
               {
@@ -3725,6 +5073,18 @@
               }
             ],
             "title": "Title"
+          },
+          "waiting": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Why a pending action waits: no reader of its restricted case can approve it.",
+            "title": "Waiting"
           },
           "workflow_phase_id": {
             "anyOf": [
@@ -3773,6 +5133,30 @@
           "closed_count"
         ],
         "title": "PriorityBreakdownRow",
+        "type": "object"
+      },
+      "RecheckMarkView": {
+        "description": "The one mark on a Case opened from a re-check.",
+        "properties": {
+          "closed_at": {
+            "title": "Closed At",
+            "type": "string"
+          },
+          "run_id": {
+            "title": "Run Id",
+            "type": "string"
+          },
+          "source": {
+            "title": "Source",
+            "type": "string"
+          }
+        },
+        "required": [
+          "source",
+          "closed_at",
+          "run_id"
+        ],
+        "title": "RecheckMarkView",
         "type": "object"
       },
       "RejectRequest": {
@@ -3879,6 +5263,12 @@
           "count": {
             "description": "Number of runs in this page.",
             "title": "Count",
+            "type": "integer"
+          },
+          "hidden": {
+            "default": 0,
+            "description": "Runs that matched but are on a restricted case the caller can't read, left out.",
+            "title": "Hidden",
             "type": "integer"
           },
           "runs": {
@@ -4060,6 +5450,11 @@
               }
             ],
             "title": "Tags"
+          },
+          "unassigned": {
+            "default": false,
+            "title": "Unassigned",
+            "type": "boolean"
           }
         },
         "title": "SearchRequest",
@@ -4209,6 +5604,7 @@
                 "type": "null"
               }
             ],
+            "description": "Per-run budgets and runtime limits. The dollar ceiling (budgets.max_cost_usd) is checked before each model call, so a run can end above it by the cost of the call it was making (which can include retries). Calls that couldn't be priced (up to 3), calls whose usage had to be estimated, and requests a provider billed but Vigil recorded as nothing aren't fully counted. The allowance starts again when a run resumes.",
             "title": "Overrides"
           },
           "playbook": {
@@ -4355,6 +5751,25 @@
           "name"
         ],
         "title": "ToolClassEntry",
+        "type": "object"
+      },
+      "UndoRequest": {
+        "properties": {
+          "reason": {
+            "anyOf": [
+              {
+                "maxLength": 2000,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Why the containment is being undone; the next run reads it.",
+            "title": "Reason"
+          }
+        },
+        "title": "UndoRequest",
         "type": "object"
       },
       "ValidationError": {
@@ -5084,6 +6499,24 @@
             }
           },
           {
+            "description": "Only actions on this case, among the newest ``limit``. Requested containments are read from the vendor again first.",
+            "in": "query",
+            "name": "case_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Only actions on this case, among the newest ``limit``. Requested containments are read from the vendor again first.",
+              "title": "Case Id"
+            }
+          },
+          {
             "in": "query",
             "name": "limit",
             "required": false,
@@ -5458,6 +6891,81 @@
         ]
       }
     },
+    "/api/v1/approvals/{action_id}/undo": {
+      "post": {
+        "operationId": "post_api_v1_approvals_action_id_undo",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "action_id",
+            "required": true,
+            "schema": {
+              "title": "Action Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "anyOf": [
+                  {
+                    "$ref": "#/components/schemas/UndoRequest"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "title": "Request"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApprovalActionResult"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Undo Action",
+        "tags": [
+          "approvals"
+        ]
+      }
+    },
     "/api/v1/audit/entries": {
       "get": {
         "operationId": "get_api_v1_audit_entries",
@@ -5635,6 +7143,22 @@
                 }
               ],
               "title": "After"
+            }
+          },
+          {
+            "in": "query",
+            "name": "sign_in",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Sign In"
             }
           },
           {
@@ -5847,6 +7371,22 @@
                 }
               ],
               "title": "After"
+            }
+          },
+          {
+            "in": "query",
+            "name": "sign_in",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Sign In"
             }
           },
           {
@@ -6067,6 +7607,22 @@
                 }
               ],
               "title": "After"
+            }
+          },
+          {
+            "in": "query",
+            "name": "sign_in",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Sign In"
             }
           },
           {
@@ -6298,6 +7854,113 @@
           }
         },
         "summary": "Put Ceiling",
+        "tags": [
+          "autonomy"
+        ]
+      }
+    },
+    "/api/v1/autonomy/held/release": {
+      "post": {
+        "operationId": "post_api_v1_autonomy_held_release",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CeilingResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Post Release Held",
+        "tags": [
+          "autonomy"
+        ]
+      }
+    },
+    "/api/v1/autonomy/held/{action_id}/release": {
+      "post": {
+        "operationId": "post_api_v1_autonomy_held_action_id_release",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "action_id",
+            "required": true,
+            "schema": {
+              "title": "Action Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CeilingResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Post Release Action",
         "tags": [
           "autonomy"
         ]
@@ -6569,6 +8232,35 @@
           },
           {
             "in": "query",
+            "name": "team",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Team"
+            }
+          },
+          {
+            "in": "query",
+            "name": "unassigned",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "Unassigned",
+              "type": "boolean"
+            }
+          },
+          {
+            "in": "query",
             "name": "closed",
             "required": false,
             "schema": {
@@ -6628,7 +8320,8 @@
                 {
                   "enum": [
                     "agent",
-                    "person"
+                    "person",
+                    "draw"
                   ],
                   "type": "string"
                 },
@@ -7293,6 +8986,55 @@
         "summary": "Get Summary",
         "tags": [
           "case-metrics"
+        ]
+      }
+    },
+    "/api/v1/cases/owners": {
+      "get": {
+        "operationId": "get_api_v1_cases_owners",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CaseOwnersResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Case Owners",
+        "tags": [
+          "cases"
         ]
       }
     },
@@ -8164,6 +9906,74 @@
         ]
       }
     },
+    "/api/v1/cases/{case_id}/iocs/false-positive": {
+      "put": {
+        "operationId": "put_api_v1_cases_case_id_iocs_false-positive",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "case_id",
+            "required": true,
+            "schema": {
+              "title": "Case Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/IOCMark"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CaseIOCListResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Mark Ioc False Positive",
+        "tags": [
+          "cases"
+        ]
+      }
+    },
     "/api/v1/cases/{case_id}/merge": {
       "post": {
         "operationId": "post_api_v1_cases_case_id_merge",
@@ -8229,6 +10039,125 @@
         "summary": "Merge Cases",
         "tags": [
           "cases"
+        ]
+      }
+    },
+    "/api/v1/cases/{case_id}/rules": {
+      "get": {
+        "operationId": "get_api_v1_cases_case_id_rules",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "case_id",
+            "required": true,
+            "schema": {
+              "title": "Case Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CaseRulesResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Case Rules",
+        "tags": [
+          "cases"
+        ]
+      }
+    },
+    "/api/v1/entity-facts": {
+      "get": {
+        "operationId": "get_api_v1_entity-facts",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 100,
+              "maximum": 500,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EntityFactsResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Entity Facts",
+        "tags": [
+          "entity-facts"
         ]
       }
     },

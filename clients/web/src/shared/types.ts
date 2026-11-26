@@ -23,12 +23,25 @@ export interface SeedDocument {
   text: string
   pages: number
   condensed: boolean
+  /** The original, so a run the dock starts with it can keep it on the case. */
+  file?: File
+  pasted?: boolean
 }
 
 /** What opens a chat turn: the question, and the file that goes with it. Empty text with a file only attaches it. */
 export interface ChatSeed {
   text: string
   document?: SeedDocument
+  /** A run started on this case: the dock opens a conversation on it, so the run shows there. */
+  caseId?: string
+  /** The agent a new conversation runs under, sent on its every turn. */
+  agent?: ChatAgent
+}
+
+/** An agent a conversation runs under: its id, sent as `agent_id`, and the name the dock shows. */
+export interface ChatAgent {
+  id: string
+  name: string
 }
 
 export interface ConsoleScreenGoOptions {
@@ -37,8 +50,8 @@ export interface ConsoleScreenGoOptions {
 }
 
 export interface ConsoleScreenProps {
-  /** a prompt is auto-sent on open */
-  openChat: (prompt?: string) => void
+  /** a prompt is auto-sent on open; an agent opens a new conversation under it */
+  openChat: (prompt?: string, options?: { agent?: ChatAgent }) => void
   go: (screen: ConsoleScreenKey, options?: ConsoleScreenGoOptions) => void
   goSettings: (section: SettingsSectionKey) => void
   /** Opens a case in the drawer, over whatever screen is showing. */

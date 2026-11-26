@@ -4,6 +4,14 @@ New hashes are PBKDF2-HMAC-SHA-256 (``cryptography``), self-describing:
 ``pbkdf2-sha256$<iterations>$<salt b64>$<hash b64>``. bcrypt (``$2``) hashes
 from earlier installs verify only; ``needs_rewrite`` tells the caller to
 replace one after a good sign-in. Input is NFKC-normalised, never truncated.
+
+A PBKDF2 hash is stored encrypted under the key ring's ``pepper`` key (#4298):
+``pepper-<version>$<Fernet token>``, the token wrapping the string above. A
+database copy without the ring can check no password. bcrypt entries stay bare.
+A ring that cannot be read raises ``KeyRingError`` (never a "no match"); a
+wrapped entry no key opens simply never matches. An entry naming a pepper version
+no live key holds (an emergency rotation, a restore under a new ring) is
+``unreadable``: the person must reset the password.
 """
 
 import base64
@@ -11,18 +19,27 @@ import hmac
 import os
 import unicodedata
 from concurrent.futures import ThreadPoolExecutor
+from typing import Optional
 
 import bcrypt
+from cryptography.fernet import InvalidToken
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+
+from core.auth import key_ring
 
 SCHEME = "pbkdf2-sha256"
 # OWASP Password Storage Cheat Sheet: 600,000 for PBKDF2-HMAC-SHA256.
 ITERATIONS = 600_000
 # Any Unicode, counted in code points (len(str)), never cut short.
-MAX_PASSWORD_LENGTH = 128
+# The session policy's minimum length stays inside these two, and the
+# breached-list import keeps entries down to the shortest.
+MIN_PASSWORD_LENGTH = 3
+MAX_PASSWORD_LENGTH = 255
 _SALT_BYTES = 16
 _KEY_BYTES = 32
+PEPPER = "pepper"
+_PEPPER_PREFIX = PEPPER + "-"
 
 
 def _normalise(secret: str) -> bytes:
@@ -45,8 +62,46 @@ def _format(secret: str, salt: bytes) -> str:
     return f"{SCHEME}${ITERATIONS}${b64(salt)}${b64(key)}"
 
 
+def seal(plain: str, key: key_ring.Key | None = None) -> str:
+    """Encrypt a PBKDF2 string under ``key`` (the current pepper by default)."""
+    key = key or key_ring.current(PEPPER)
+    token = key_ring.encryptor_from([key]).encrypt(plain.encode()).decode()
+    return f"{key.kid}${token}"
+
+
+def is_plain_pbkdf2(entry: str) -> bool:
+    return isinstance(entry, str) and entry.startswith(SCHEME + "$")
+
+
+def unreadable(entry: Optional[str]) -> bool:
+    """True for a wrapped entry whose pepper version no live key holds: it can
+    never match, and only a password reset replaces it. Not a wrong password."""
+    if not entry or not entry.startswith(_PEPPER_PREFIX):
+        return False
+    try:
+        version = int(entry.partition("$")[0][len(_PEPPER_PREFIX) :])
+    except ValueError:
+        return True
+    return key_ring.find(PEPPER, version) is None
+
+
+def _open(entry: str) -> str:
+    """The bare hash behind a stored entry; "" when it is wrapped and no key
+    opens it (so it never matches)."""
+    if not entry or not entry.startswith(_PEPPER_PREFIX):
+        return entry
+    kid, _, token = entry.partition("$")
+    try:
+        key = key_ring.find(PEPPER, int(kid[len(_PEPPER_PREFIX) :]))
+        if key is None:
+            return ""
+        return key_ring.encryptor_from([key]).decrypt(token.encode()).decode()
+    except (ValueError, InvalidToken):
+        return ""
+
+
 def hash(secret: str) -> str:
-    return _format(secret, os.urandom(_SALT_BYTES))
+    return seal(_format(secret, os.urandom(_SALT_BYTES)))
 
 
 def hash_set(secrets: list[str]) -> list[str]:
@@ -54,7 +109,7 @@ def hash_set(secrets: list[str]) -> list[str]:
     once (``find``) however many are stored. Fine for 64-bit random values;
     never for anything a person chose."""
     salt = os.urandom(_SALT_BYTES)
-    return [_format(s, salt) for s in secrets]
+    return [seal(_format(s, salt)) for s in secrets]
 
 
 def _is_bcrypt(stored: str) -> bool:
@@ -101,6 +156,8 @@ def find(secret: str, stored: list[str]) -> int | None:
     if len(secret) > MAX_PASSWORD_LENGTH:
         return None
     normal = _normalise(secret)
+    # Open every wrapped entry first, then derive once per (salt, count).
+    stored = [_open(entry) for entry in stored]
     derived = _derive_all(normal, stored)
     for i, entry in enumerate(stored):
         try:
@@ -137,6 +194,7 @@ def verify(secret: str, stored: str) -> bool:
 
 def needs_rewrite(stored: str) -> bool:
     """True for a bcrypt hash or a PBKDF2 one below the current iteration count."""
+    stored = _open(stored)
     if not stored:
         return False
     if _is_bcrypt(stored):

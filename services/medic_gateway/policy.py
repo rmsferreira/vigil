@@ -16,6 +16,8 @@ MAX_IMPORT_BODY = 4 * 1024 * 1024  # a pack file: pack_check.MAX_PACK_BYTES
 # A pack write waits for Medic's main loop (up to its 20 s snapshot age), so it
 # outlasts the default upstream timeout.
 PACK_WRITE_TIMEOUT = 25.0
+# A soc-daemon restart waits out its stop drain before the container is back.
+FIX_TIMEOUT = 90.0
 # No '%', '+', ';', '#', '\\', '.', ' ' or non-ASCII in a path; no '%', '+', ';',
 # '/', '?' in a query. '.' is allowed in a query only for timestamps.
 PATH_RE = re.compile(r"/[A-Za-z0-9_\-/]*")
@@ -58,6 +60,7 @@ OUTBOUND = [
     Route("GET", "/api/health/ready", auth=False),
     Route("GET", "/api/federation/sources"),
     Route("GET", "/api/federation/health"),
+    Route("GET", "/api/integration-health"),  # OpenCTI facts (#5072)
     Route("GET", "/api/triage"),
     Route("GET", "/api/orchestrator/status"),
     Route(
@@ -94,7 +97,7 @@ CURSOR = ("[A-Za-z0-9_-]{1,256}", 1)
 BOOL = ("true|false", 1)
 TYPES = (
     "incident_opened|incident_updated|incident_resolved|feedback|anchor"
-    "|store_reset|pack_event|gap"
+    "|store_reset|pack_event|gap|fix_run|fix_verified|level_changed"
 )
 INBOUND = [
     Route("GET", "/v1/status"),
@@ -116,6 +119,12 @@ INBOUND = [
     Route("GET", "/v1/incidents/{incident_id}", segs={"incident_id": INC}),
     Route("POST", "/v1/incidents/{incident_id}/feedback", segs={"incident_id": INC}),
     Route(
+        "POST",
+        "/v1/incidents/{incident_id}/fix",
+        segs={"incident_id": INC},
+        timeout=FIX_TIMEOUT,
+    ),
+    Route(
         "GET",
         "/v1/decisions",
         {
@@ -129,6 +138,7 @@ INBOUND = [
     Route("GET", "/v1/decisions/{seq}", segs={"seq": SEQ}),
     Route("GET", "/v1/sensors"),
     Route("GET", "/v1/pack"),
+    Route("POST", "/v1/fix-level"),
     Route(
         "POST",
         "/v1/pack/import",

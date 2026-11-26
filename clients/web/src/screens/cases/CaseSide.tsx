@@ -7,7 +7,8 @@ import { StatePill } from '../../shared/StatePill'
 import { useNoSideways } from '../../shared/useNoSideways'
 import { utcDay } from '../../shared/utc'
 import { commentCount, CommentsView, inputCls, SectionCard, TasksView, useComments, useResource, useTasks, type Resource } from './CaseSections'
-import { errorDetail, timeLeft, when } from './caseFormat'
+import { errorDetail, STALE_OWNER_NOTE, timeLeft, when } from './caseFormat'
+import FindingPopup from '../dashboard/FindingPopup'
 import { entityShown, type RunFold } from './caseFold'
 import { cardsByFinding, ruleLine, type CaseRuleCard } from './caseRuleLine'
 import type { CaseInvestigationRef, CaseLinkedFinding } from './useCases'
@@ -23,9 +24,10 @@ function Block({ title, children, anchor }: { title: string; children: ReactNode
   )
 }
 
-function Details({ linked, latest, workflowNames, sla, closed, fold, anchor }: {
+function Details({ linked, openedFrom, latest, workflowNames, sla, closed, fold, anchor }: {
   anchor: RefObject<HTMLElement | null>
   linked: CaseLinkedFinding[]
+  openedFrom: string | null
   latest: CaseInvestigationRef | null
   workflowNames: Record<string, string>
   sla: Sla
@@ -39,6 +41,12 @@ function Details({ linked, latest, workflowNames, sla, closed, fold, anchor }: {
   return (
     <Block title="Details" anchor={anchor}>
       <dl className="side-kv">
+        {openedFrom && (
+          <>
+            <dt>Opened from</dt>
+            <dd><OpenedFrom id={openedFrom} finding={linked.find((f) => f.finding_id === openedFrom)} /></dd>
+          </>
+        )}
         <dt>Workflow</dt>
         <dd>{latest ? workflowNames[latest.workflow_id] || latest.workflow_name || latest.workflow_id : '—'}</dd>
         <dt>Resolve by</dt>
@@ -55,6 +63,18 @@ function Details({ linked, latest, workflowNames, sla, closed, fold, anchor }: {
         <dd>{entities.length ? <Entities values={entities} /> : '—'}</dd>
       </dl>
     </Block>
+  )
+}
+
+/** The finding that opened the case, by id, its title on hover; it opens in the finding popup. */
+function OpenedFrom({ id, finding }: { id: string; finding?: CaseLinkedFinding }) {
+  const [viewing, setViewing] = useState(false)
+  const title = finding?.title || finding?.description || id
+  return (
+    <>
+      <button type="button" className="side-more side-opened" title={title} onClick={() => setViewing(true)}>{id}</button>
+      {viewing && <FindingPopup id={id} onClose={() => setViewing(false)} />}
+    </>
   )
 }
 
@@ -173,34 +193,41 @@ function Alerts({ caseId, items }: { caseId: string; items: CaseLinkedFinding[] 
 
 type Related = { id: number; caseId: string; title: string; status: string; notes: string }
 
-/** Other Cases linked to this one, of any link type; hidden while loading, on a failed read, or when there are none. */
+/** Other Cases linked to this one, of any link type; hidden while loading, on a failed read, or when there are none.
+ *  Links to restricted cases the reader can't see are a count only: never which ones. */
 function RelatedCases({ caseId }: { caseId: string }) {
-  const { data, phase } = useResource<Related[]>(caseId, () =>
-    casesApi.getRelationships(caseId).then((res) =>
-      (res.data.relationships || []).map((row) => ({
+  const { data, phase } = useResource<{ rows: Related[]; hidden: number }>(caseId, () =>
+    casesApi.getRelationships(caseId).then((res) => ({
+      hidden: res.data.hidden ?? 0,
+      rows: (res.data.relationships || []).map((row) => ({
         id: row.relationship_id ?? 0,
         caseId: row.related_case_id ?? '',
         title: row.related_title || '',
         status: row.related_status || '',
         notes: row.notes || '',
       })),
-    ),
+    })),
   )
-  if (phase !== 'ready' || !data?.length) return null
+  if (phase !== 'ready' || !data || (!data.rows.length && !data.hidden)) return null
   return (
     <Block title="Related cases">
-      <ul className="case-linked case-related">
-        {data.map((row) => (
-          <li key={row.id}>
-            <span className="case-related-head">
-              {row.title && <span className="side-clamp" title={row.title}>{row.title}</span>}
-              {row.status && <StatePill state={row.status} />}
-            </span>
-            <Link className="mono case-related-id" to={`/cases?case=${encodeURIComponent(row.caseId)}`}>{row.caseId}</Link>
-            {row.notes && <span className="side-meta side-clamp" title={row.notes}>{row.notes}</span>}
-          </li>
-        ))}
-      </ul>
+      {data.rows.length > 0 && (
+        <ul className="case-linked case-related">
+          {data.rows.map((row) => (
+            <li key={row.id}>
+              <span className="case-related-head">
+                {row.title && <span className="side-clamp" title={row.title}>{row.title}</span>}
+                {row.status && <StatePill state={row.status} />}
+              </span>
+              <Link className="mono case-related-id" to={`/cases?case=${encodeURIComponent(row.caseId)}`}>{row.caseId}</Link>
+              {row.notes && <span className="side-meta side-clamp" title={row.notes}>{row.notes}</span>}
+            </li>
+          ))}
+        </ul>
+      )}
+      {data.hidden > 0 && (
+        <span className="side-meta" title="Restricted cases you can't read">{data.hidden} hidden</span>
+      )}
     </Block>
   )
 }
@@ -400,7 +427,7 @@ function initialsOf(name: string): string {
 }
 
 /** Comments, tasks and tickets load once here (open or not) and feed the collapsed line, the summary and the cards. */
-function People({ caseId, owner, onWritten }: { caseId: string; owner: string; onWritten?: () => void }) {
+function People({ caseId, owner, ownerStale, onWritten }: { caseId: string; owner: string; ownerStale: boolean; onWritten?: () => void }) {
   const [open, setOpen] = useState(false)
   const comments = useComments(caseId)
   const tasks = useTasks(caseId)
@@ -408,12 +435,13 @@ function People({ caseId, owner, onWritten }: { caseId: string; owner: string; o
   // Never a made-up count: the number appears only once that list has loaded.
   const count = (r: Resource<unknown[]>) => (r.phase === 'ready' ? String(r.data?.length ?? 0) : '—')
   const n = commentCount(comments.data)
+  const who = ownerStale ? `${owner} (${STALE_OWNER_NOTE})` : owner
   const line =
     comments.phase === 'ready'
-      ? `${owner}, ${n} ${n === 1 ? 'comment' : 'comments'}`
+      ? `${who}, ${n} ${n === 1 ? 'comment' : 'comments'}`
       : comments.phase === 'error'
-        ? `${owner}, comments unavailable`
-        : owner
+        ? `${who}, comments unavailable`
+        : who
   return (
     <section className="side-block">
       <button type="button" className="side-people-toggle" aria-expanded={open} onClick={() => setOpen((v) => !v)}>
@@ -425,6 +453,7 @@ function People({ caseId, owner, onWritten }: { caseId: string; owner: string; o
           <div className="side-owner">
             <span className="avatar">{owner === '—' ? '—' : initialsOf(owner)}</span>
             <span>{owner}</span>
+            {ownerStale && <span className="owner-note">{STALE_OWNER_NOTE}</span>}
           </div>
           <div className="side-meta">
             Comments {comments.phase === 'ready' ? n : '—'} · Tasks {count(tasks as Resource<unknown[]>)} · Tickets {count(tickets as Resource<unknown[]>)}
@@ -439,10 +468,14 @@ function People({ caseId, owner, onWritten }: { caseId: string; owner: string; o
 }
 
 /** The Details, Alerts, Related cases, Known and People blocks of the case side panel. */
-export function CaseSide({ caseId, linked, owner, latest, workflowNames, sla, closed, fold, onWritten }: {
+export function CaseSide({ caseId, linked, openedFrom = null, owner, ownerStale, latest, workflowNames, sla, closed, fold, onWritten }: {
   caseId: string
   linked: CaseLinkedFinding[]
+  /** The finding the case was opened from (the first linked). */
+  openedFrom?: string | null
   owner: string
+  /** The stored owner is not a current account. */
+  ownerStale: boolean
   latest: CaseInvestigationRef | null
   workflowNames: Record<string, string>
   sla: Sla
@@ -458,11 +491,11 @@ export function CaseSide({ caseId, linked, owner, latest, workflowNames, sla, cl
   const keys = [...new Set([...recalled, ...linked.flatMap((f) => f.entity_keys)])]
   return (
     <>
-      <Details anchor={anchor} linked={linked} latest={latest} workflowNames={workflowNames} sla={sla} closed={closed} fold={fold} />
+      <Details anchor={anchor} linked={linked} openedFrom={openedFrom} latest={latest} workflowNames={workflowNames} sla={sla} closed={closed} fold={fold} />
       <Alerts caseId={caseId} items={linked} />
       <RelatedCases caseId={caseId} />
       <Known fold={fold} hasRun={latest !== null} keys={keys} onWritten={onWritten} />
-      <People caseId={caseId} owner={owner} onWritten={onWritten} />
+      <People caseId={caseId} owner={owner} ownerStale={ownerStale} onWritten={onWritten} />
     </>
   )
 }

@@ -21,9 +21,8 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict
 
-from core.audit import feed, retention, trail
+from core.audit import narrow, reads, retention, trail
 from core.auth import current_user as current_user_module
-from core.auth import principals
 from core.auth.auth_service import _is_service_account
 from core.auth.current_user import get_current_user
 from core.auth.permissions import deny_unless, require_permission
@@ -41,14 +40,6 @@ ROUTER_META = RouterMeta(
 
 _READ = require_permission("audit.read")
 _SIGN_IN_REQUIRED = "A person sign-in is required"
-_KINDS = frozenset(
-    {
-        principals.PERSON,
-        principals.SERVICE_ACCOUNT,
-        principals.AGENT,
-        principals.SYSTEM,
-    }
-)
 
 
 # ---------------------------------------------------------------------------
@@ -96,8 +87,11 @@ class AuditEntry(BaseModel):
     entry_hash: str
     actor: Optional[AuditPrincipal] = None
     payload: AuditPayload
+    # About a case the caller may not read: who and when only (#4362).
+    restricted: Optional[bool] = None
 
 
+# The same keys as ``core.audit.reads.FEED_FIELDS``.
 class AuditFeedHealth(BaseModel):
     """The feed as the Audit section sees it: no host, no certificates."""
 
@@ -108,6 +102,9 @@ class AuditFeedHealth(BaseModel):
     last_error: Optional[str] = None
     unconfirmed: Optional[int] = None
     paused: Optional[bool] = None
+    # Waiting to be recorded late, and the oldest one's time. Open windows are not counted.
+    held: Optional[int] = None
+    held_since: Optional[str] = None
 
 
 class AuditPage(BaseModel):
@@ -153,18 +150,15 @@ def _filters(
     after: Optional[int] = Query(None, ge=0),
     sign_in: Optional[str] = None,
 ) -> trail.TrailQuery:
-    kind_c = (kind or "").strip()
-    if kind_c and kind_c not in _KINDS:
-        raise HTTPException(status_code=422, detail=f"unknown principal kind: {kind_c}")
     try:
-        return trail.make_query(
+        return reads.query(
             since=since,
             until=until,
             actor=actor,
             person=person,
             kind=kind,
             area=area,
-            object_ref=object_,
+            object_=object_,
             outcome=outcome,
             attribution=attribution,
             after=after,
@@ -216,19 +210,6 @@ def _ndjson(rows: list[dict], tip: trail.Tip):
     yield json.dumps({"checkpoint": tip.public()}, separators=(",", ":")) + "\n"
 
 
-# What the Audit section shows of the feed. Not the host or the certificates,
-# which stay on ``audit.forward``.
-_FEED_FIELDS = tuple(AuditFeedHealth.model_fields)
-
-
-def _feed(session) -> dict:
-    try:
-        health = feed.health(session)
-    except feed.FeedUnavailable:
-        health = {"enabled": False, "behind": 0, "paused": False}
-    return {key: health.get(key) for key in _FEED_FIELDS}
-
-
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
@@ -243,11 +224,7 @@ def list_entries(
     _: User = Depends(_READ),
 ):
     """The trail, oldest sequence first, under the shared filter."""
-    return {
-        "entries": trail.read(session, query, limit),
-        "tip": trail.current_tip(session).public(),
-        "feed": _feed(session),
-    }
+    return reads.page(session, query, limit)
 
 
 @router.get(
@@ -270,6 +247,7 @@ def export_entries(
     if not user.principal_id:
         raise HTTPException(status_code=403, detail="A principal is required")
     rows, tip = retention.carry_export(session, query, user.principal_id)
+    rows = narrow.entries(session, rows)
     return StreamingResponse(
         _ndjson(rows, tip),
         media_type="application/x-ndjson",
@@ -290,10 +268,11 @@ def poll_entries(
         raise HTTPException(status_code=422, detail="poll needs after")
     page = trail.poll(session, query, limit)
     if page.reset:
-        return {"reset": True, "tip": page.tip.public(), "restore": page.restore}
+        restore = narrow.entry(session, page.restore)
+        return {"reset": True, "tip": page.tip.public(), "restore": restore}
     rows = list(page.entries)
     _carried(session, rows)
-    return {"entries": rows, "tip": page.tip.public()}
+    return {"entries": narrow.entries(session, rows), "tip": page.tip.public()}
 
 
 @router.get("/verify", response_model=AuditVerification)

@@ -29,6 +29,10 @@ chart-templated).
 State Directory. VIGIL_DIR is deliberately NOT in vigil.env: it must only be set
 where the volume is actually mounted, or a workload advertises a path it cannot
 write. Include all three together, or none.
+
+VIGIL_ERASURE_DIR is set only off an emptyDir: the erasure list must outlive a
+pod, or a restore would bring an erased person's data back. The apply upgrade
+Job mounts the volume and sets it too (templates/upgrade.yaml).
 */}}
 {{- define "vigil.stateEnv" -}}
 - name: VIGIL_DIR
@@ -37,6 +41,9 @@ write. Include all three together, or none.
 {{- if hasKey .Values.stateDirectory.volume "emptyDir" }}
 - name: VIGIL_DIR_EPHEMERAL
   value: "true"
+{{- else }}
+- name: VIGIL_ERASURE_DIR
+  value: {{ .Values.stateDirectory.mountPath | quote }}
 {{- end }}
 {{- end -}}
 
@@ -136,6 +143,63 @@ helper. Prefer the Secret when both are set.
     secretKeyRef:
       name: {{ .Values.redis.external.existingSecret }}
       key: {{ .Values.redis.external.existingSecretKey | default "REDIS_URL" }}
+{{- end }}
+{{- end -}}
+
+{{/*
+vigil.env for agent-serve and agent-worker: the same, but logging in as
+vigil_agent, which holds only the agent tables (0081_agent_role), and without
+Bifrost's admin password: the agent calls only /v1, and /api/* reconfigures the
+gateway for every component.
+*/}}
+{{- define "vigil.agentEnv" -}}
+{{- $env := include "vigil.env" . -}}
+{{- $agent := replace "- name: POSTGRES_USER\n  value: \"vigil_app\"" "- name: POSTGRES_USER\n  value: \"vigil_agent\"" $env -}}
+{{- if eq $env $agent }}{{ fail "vigil.env no longer sets POSTGRES_USER to vigil_app; update vigil.agentEnv" }}{{ end -}}
+{{- if .Values.bifrost.enabled }}
+{{- $auth := printf "\n%s" (include "vigil.bifrost.auth.env" .) -}}
+{{- if not (contains $auth $agent) }}{{ fail "vigil.env no longer carries vigil.bifrost.auth.env; update vigil.agentEnv" }}{{ end -}}
+{{- $agent = replace $auth "" $agent -}}
+{{- end -}}
+{{- $agent -}}
+{{- end -}}
+
+{{/*
+The agent pods' database password. POSTGRES_PASSWORD is vigil_agent's, read
+from the app Secret by name. These pods do not load that Secret whole.
+*/}}
+{{- define "vigil.agentPostgresEnv" -}}
+- name: POSTGRES_PASSWORD
+  valueFrom:
+    secretKeyRef:
+      name: {{ include "vigil.postgres.appPasswordSecret" . }}
+      key: {{ include "vigil.postgres.agentPasswordSecretKey" . }}
+{{- end -}}
+
+{{/*
+The other app-Secret keys the agent layer reads. Each ref is optional: a
+missing key leaves the variable unset, and the chart's defaults render none of
+the three. An empty string is not the same — the harness sends BIFROST_API_KEY
+as given and substitutes a placeholder only when the variable is absent.
+extraEnv is the caller's list; a name it already sets is left to that entry.
+*/}}
+{{- define "vigil.agentSecretEnv" -}}
+{{- $ctx := .context -}}
+{{- $names := list -}}
+{{- range .extraEnv | default list }}
+{{- if and (kindIs "map" .) (kindIs "string" .name) }}
+{{- $names = append $names .name -}}
+{{- end }}
+{{- end }}
+{{- $secret := include "vigil.secret.fullname" $ctx -}}
+{{- range $key := list "AGENT_INTERNAL_TOKEN" "AGENT_INTERNAL_TOKEN_PREVIOUS" "BIFROST_API_KEY" }}
+{{- if not (has $key $names) }}- name: {{ $key }}
+  valueFrom:
+    secretKeyRef:
+      name: {{ $secret }}
+      key: {{ $key }}
+      optional: true
+{{ end }}{{/* The newline above stays: trimming this end glues the next entry on. */}}
 {{- end }}
 {{- end -}}
 

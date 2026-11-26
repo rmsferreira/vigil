@@ -1,4 +1,4 @@
-"""STIX/TAXII threat-feed ingestion (Cloudforce One et al).
+"""STIX/TAXII threat-feed ingestion for every integration that declares a feed.
 
 The poller in `services/daemon/threat_feed_poller.py` calls into this module
 on its configured interval. A TAXII fetch that fails raises, so the poller
@@ -12,12 +12,13 @@ import logging
 import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 import requests.auth
 
 from core.memory.entity_keys import entity_key, text_entity_keys
 from core.memory.recall_contract import ENTITY_KEY_TYPES
+from core.storage.defang import defang, trim_edges
 from core.time import utcnow
 
 logger = logging.getLogger(__name__)
@@ -34,6 +35,20 @@ _STIX_TO_VIGIL_TYPE: Dict[str, str] = {
     "file:hashes.'SHA-256'": "hash_sha256",
     "email-addr:value": "email",
 }
+
+
+# Types matched without regard to case or defanging. URL paths and email local
+# parts are case-significant, so those stay as the feed wrote them.
+FOLDED_INDICATOR_TYPES = frozenset(
+    {"ip", "domain", "hash_md5", "hash_sha1", "hash_sha256"}
+)
+
+
+def normalize_indicator_value(indicator_type: str, value: str) -> str:
+    """The stored and looked-up form: Vigil's defang rule, then case-folded."""
+    if indicator_type not in FOLDED_INDICATOR_TYPES:
+        return value
+    return defang(trim_edges(value)).lower()
 
 
 _STIX_TOKEN = re.compile(
@@ -81,8 +96,18 @@ def parse_stix_indicator(
     labels = list(obj.get("labels") or [])
     valid_from = _parse_dt(obj.get("valid_from"))
     valid_until = _parse_dt(obj.get("valid_until"))
+    if obj.get("revoked"):
+        # Stored as expired so it stops matching; upsert overwrites
+        # valid_until, so a republished revocation expires an existing row.
+        revoked_at = min(
+            t for t in (utcnow(), _parse_dt(obj.get("modified"))) if t is not None
+        )
+        valid_until = min(valid_until, revoked_at) if valid_until else revoked_at
 
     for vigil_type, value in _extract_observables(pattern):
+        value = normalize_indicator_value(vigil_type, value)
+        if not value:
+            continue
         out.append(
             NormalizedIndicator(
                 indicator_type=vigil_type,
@@ -264,14 +289,50 @@ class _BearerAuth(requests.auth.AuthBase):
         return r
 
 
+def pin_taxii_session(
+    session: Any,
+    verify: Union[bool, str] = True,
+    proxies: Optional[Dict[str, str]] = None,
+    timeout: Optional[float] = None,
+) -> None:
+    """Send verify, proxies and timeout with every request on a taxii2client session.
+
+    Per request, not on the session: ``requests`` lets ``REQUESTS_CA_BUNDLE``
+    and ``HTTPS_PROXY`` override a session's own verify and proxies. Defaults
+    leave the session as it was.
+    """
+    pinned: Dict[str, Any] = {}
+    if verify is not True:
+        pinned["verify"] = verify
+    if proxies:
+        pinned["proxies"] = proxies
+    if timeout:
+        pinned["timeout"] = timeout
+    if not pinned:
+        return
+    request = session.request
+
+    def pinned_request(method: str, url: str, **kwargs: Any) -> Any:
+        for name, value in pinned.items():
+            kwargs.setdefault(name, value)
+        return request(method, url, **kwargs)
+
+    session.request = pinned_request
+
+
 def fetch_taxii_collection(
     server_url: str,
     collection_id: str,
     api_token: str,
     source: str,
     since: Optional[datetime] = None,
+    verify: Union[bool, str] = True,
+    proxies: Optional[Dict[str, str]] = None,
 ) -> List[NormalizedIndicator]:
     """Pull a single TAXII 2.1 collection and return normalized indicators.
+
+    ``verify`` (True, False or a CA bundle path) and ``proxies`` go to
+    ``requests`` as they are; the defaults change nothing.
 
     A transport, auth, discovery, or missing-collection failure raises. The
     poller already isolates each collection, and a raised error leaves that
@@ -282,8 +343,11 @@ def fetch_taxii_collection(
     from taxii2client.v21 import Server  # type: ignore[import-untyped]
 
     server = Server(server_url, auth=_BearerAuth(api_token))
+    pin_taxii_session(server._conn.session, verify=verify, proxies=proxies)
     collection = None
     for api_root in server.api_roots:
+        # Each API root opens its own session; its collections share it.
+        pin_taxii_session(api_root._conn.session, verify=verify, proxies=proxies)
         for c in api_root.collections:
             if c.id == collection_id:
                 collection = c
@@ -357,6 +421,10 @@ def upsert_indicators(indicators: List[NormalizedIndicator]) -> Dict[str, int]:
     with db.session_scope() as session:
         for ind in indicators:
             try:
+                # Normalised here too, so any re-published spelling finds its row.
+                value = normalize_indicator_value(
+                    ind.indicator_type, ind.indicator_value
+                )
                 # A savepoint per row, flushed inside it: a flush-time error
                 # (constraint, oversized value) rolls back only this row instead
                 # of poisoning the session and failing the whole commit.
@@ -366,7 +434,7 @@ def upsert_indicators(indicators: List[NormalizedIndicator]) -> Dict[str, int]:
                         .filter_by(
                             source=ind.source,
                             indicator_type=ind.indicator_type,
-                            indicator_value=ind.indicator_value,
+                            indicator_value=value,
                         )
                         .one_or_none()
                     )
@@ -374,7 +442,7 @@ def upsert_indicators(indicators: List[NormalizedIndicator]) -> Dict[str, int]:
                         session.add(
                             ThreatIndicator(
                                 indicator_type=ind.indicator_type,
-                                indicator_value=ind.indicator_value,
+                                indicator_value=value,
                                 source=ind.source,
                                 collection_id=ind.collection_id,
                                 confidence=ind.confidence,
@@ -437,19 +505,24 @@ def _unexpired_clause(now: datetime):
 def lookup_indicators(
     indicator_type: str, values: List[str]
 ) -> Dict[str, Dict[str, Any]]:
-    """Look up a batch of currently-valid indicator values; keyed by value.
+    """Look up a batch of currently-valid indicator values.
 
-    Expired rows (``valid_until`` in the past) are omitted. A NULL expiry is live.
+    Matches on the normalised form, but keys the answer by each value exactly as
+    the caller passed it. Expired rows (``valid_until`` in the past) are
+    omitted. A NULL expiry is live. Raises when storage is unavailable: a
+    lookup that could not run is not an answer that nothing matched (#4612).
     """
     if not values:
         return {}
-    try:
-        from core.storage.connection import get_db_manager
-        from core.storage.models import ThreatIndicator
-        from core.storage.schemas import ThreatIndicatorSchema
-    except Exception as e:  # noqa: BLE001
-        logger.debug("ThreatIndicator lookup unavailable: %s", e)
-        return {}
+    from core.storage.connection import get_db_manager
+    from core.storage.models import ThreatIndicator
+    from core.storage.schemas import ThreatIndicatorSchema
+
+    asked: Dict[str, List[str]] = {}
+    for value in values:
+        asked.setdefault(normalize_indicator_value(indicator_type, value), []).append(
+            value
+        )
     db = get_db_manager()
     out: Dict[str, Dict[str, Any]] = {}
     now = utcnow()
@@ -457,12 +530,13 @@ def lookup_indicators(
         rows = (
             session.query(ThreatIndicator)
             .filter(ThreatIndicator.indicator_type == indicator_type)
-            .filter(ThreatIndicator.indicator_value.in_(values))
+            .filter(ThreatIndicator.indicator_value.in_(list(asked)))
             .filter(_unexpired_clause(now))
             .all()
         )
         for row in rows:
-            out.setdefault(row.indicator_value, ThreatIndicatorSchema.dump(row))
+            for value in asked.get(row.indicator_value, ()):
+                out.setdefault(value, ThreatIndicatorSchema.dump(row))
     return out
 
 

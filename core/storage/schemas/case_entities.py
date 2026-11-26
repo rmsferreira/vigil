@@ -145,6 +145,10 @@ class CaseIOCSchema(ORMSchema):
     context: Optional[str] = None
     is_active: Optional[bool] = None
     is_false_positive: Optional[bool] = None
+    # What intake does with it (attach, link, same_title, none) and, for one it
+    # can use, whether the index holds it yet; set by CaseIOCService.list_iocs.
+    intake: Optional[str] = None
+    linked: Optional[bool] = None
     created_at: OptDateTime = None
     updated_at: OptDateTime = None
 
@@ -252,10 +256,13 @@ class CaseClosureInfoSchema(ORMSchema):
     recommendations: Optional[str] = None
     recurrence_prevention: Optional[str] = None
     false_positive_reason: Optional[str] = None
+    false_positive_cause: Optional[str] = None
     executive_summary: Optional[str] = None
     closed_by: Optional[str] = None
     closure_notes: Optional[str] = None
     closed_at: OptDateTime = None
+    sampled_at: OptDateTime = None
+    evidence_opened: Optional[bool] = None
 
 
 class CaseEscalationSchema(ORMSchema):

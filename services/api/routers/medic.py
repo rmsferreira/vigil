@@ -6,8 +6,9 @@ feedback POST and the three pack writes. Not a generic proxy: a path or query pa
 the contract does not declare never reaches Medic, and no client header is forwarded.
 Medic gets only ``X-Medic-Key``, plus ``X-Medic-Admin`` (the signed-in user) on writes.
 
-Records, incidents and decisions are hash-covered, so Medic's body bytes pass through
-untouched. Only the status snapshot is parsed and cached (15 s, per process).
+Records, the incident list and decisions are hash-covered, so those body bytes
+pass through untouched. The incident detail is parsed to add ``told``. Only the
+status snapshot is cached (15 s, per process).
 """
 
 from __future__ import annotations
@@ -29,6 +30,7 @@ from core.auth.permissions import (
     require_person_permission,
 )
 from core.config import get_settings
+from core.platform.medic_incidents import incident_told
 from core.platform.medic_last_seen import read_key
 from core.platform.medic_status import MedicStatus, medic_enabled
 from core.routing import Auth, RouterMeta
@@ -45,6 +47,8 @@ ROUTER_META = RouterMeta(
 )
 
 _TIMEOUT_S = 5.0
+# A restart waits out soc-daemon's stop drain before Medic answers.
+_FIX_TIMEOUT_S = 90.0
 # A pack write waits for Medic's next cycle (up to SNAPSHOT_MAX_AGE_S, 20 s): wait past it
 _PACK_TIMEOUT_S = 30.0
 _MAX_BODY = 4 * 1024 * 1024  # a page of 100 records of up to 16 KB, with room
@@ -77,6 +81,7 @@ _CODES = frozenset(
         "invalid_body",
         "missing_admin_identity",
         "not_rateable",
+        "fix_refused",
         "payload_too_large",
         "unsupported_media_type",
         "busy",
@@ -156,6 +161,7 @@ async def _call(
     extra_headers: Optional[dict[str, str]] = None,
     content: Optional[bytes] = None,
     pack: bool = False,
+    timeout: Optional[float] = None,
 ) -> tuple[Optional[httpx.Response], Optional[Response]]:
     """One request to Medic: (its response, None) or (None, the error to return).
 
@@ -169,7 +175,8 @@ async def _call(
     headers = {"X-Medic-Key": key, **(extra_headers or {})}
     try:
         async with httpx.AsyncClient(
-            timeout=_PACK_TIMEOUT_S if pack and method == "POST" else _TIMEOUT_S,
+            timeout=timeout
+            or (_PACK_TIMEOUT_S if pack and method == "POST" else _TIMEOUT_S),
             follow_redirects=False,
             trust_env=False,
         ) as client:
@@ -184,6 +191,8 @@ async def _call(
         code = _medic_code(r) if r.status_code >= 500 else None
         return None, _problem(503, code or "medic_unavailable")
     if pack and r.status_code in (409, 422) and _pack_refusal(r):
+        return None, _passthrough(r)
+    if r.status_code == 409 and _medic_code(r) == "fix_refused":
         return None, _passthrough(r)
     if r.status_code >= 400:
         return None, _problem(r.status_code, _medic_code(r) or "internal")
@@ -291,7 +300,23 @@ async def list_incidents(request: Request) -> Response:
 
 @router.get("/incidents/{incident_id}", dependencies=[_read])
 async def get_incident(incident_id: str = Path(pattern=_INCIDENT_ID)) -> Response:
-    return await _get(f"/v1/incidents/{incident_id}")
+    """Medic's incident, plus ``told`` for its current reopen (``none``, ``opened`` or ``summary``)."""
+    r, err = await _call("GET", f"/v1/incidents/{incident_id}")
+    if err is not None or r is None:
+        return err or _problem(503, "medic_unavailable")
+    try:
+        body = r.json()
+    except ValueError:
+        return _passthrough(r)
+    if not isinstance(body, dict):
+        return _passthrough(r)
+    summary = body.get("summary")
+    reopen = summary.get("reopen_count") if isinstance(summary, dict) else None
+    if type(reopen) is not int or isinstance(reopen, bool):
+        body["told"] = "none"
+    else:
+        body["told"] = await asyncio.to_thread(incident_told, incident_id, reopen)
+    return JSONResponse(body, headers={"Cache-Control": "no-store"})
 
 
 @router.post("/incidents/{incident_id}/feedback")
@@ -322,6 +347,53 @@ async def post_feedback(
     r, err = await _call(
         "POST",
         f"/v1/incidents/{incident_id}/feedback",
+        extra_headers={"X-Medic-Admin": admin, "Content-Type": "application/json"},
+        content=body,
+    )
+    return err or _passthrough(r)
+
+
+@router.post("/incidents/{incident_id}/fix")
+async def post_fix(
+    incident_id: str = Path(pattern=_INCIDENT_ID),
+    user: User = Depends(require_person_permission(MEDIC_ADMIN_PERMISSION)),
+) -> Response:
+    """Restart soc-daemon for this incident. The admin is the session."""
+    admin = f"user:{user.user_id}"
+    if not _ADMIN_LABEL.fullmatch(admin):
+        return _problem(422, "missing_admin_identity")
+    body = b"{}"
+    r, err = await _call(
+        "POST",
+        f"/v1/incidents/{incident_id}/fix",
+        extra_headers={"X-Medic-Admin": admin, "Content-Type": "application/json"},
+        content=body,
+        timeout=_FIX_TIMEOUT_S,
+    )
+    return err or _passthrough(r)
+
+
+@router.post("/fix-level")
+async def post_fix_level(
+    request: Request,
+    user: User = Depends(require_person_permission(MEDIC_ADMIN_PERMISSION)),
+) -> Response:
+    """Raise one step (with a reason) or lower a fix type's level. The admin is the session."""
+    admin = f"user:{user.user_id}"
+    if not _ADMIN_LABEL.fullmatch(admin):
+        return _problem(422, "missing_admin_identity")
+    if request.headers.get("content-type", "").split(";")[0].strip().lower() != (
+        "application/json"
+    ):
+        return _problem(415, "unsupported_media_type")
+    body = b""
+    async for chunk in request.stream():
+        body += chunk
+        if len(body) > _MAX_FEEDBACK:
+            return _problem(413, "payload_too_large")
+    r, err = await _call(
+        "POST",
+        "/v1/fix-level",
         extra_headers={"X-Medic-Admin": admin, "Content-Type": "application/json"},
         content=body,
     )

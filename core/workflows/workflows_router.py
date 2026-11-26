@@ -15,11 +15,15 @@ from fastapi import (
     Request,
     UploadFile,
 )
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from core.agents.projections import read_call, read_projection, read_replay, read_verify
-from core.agents.run_limits import MAX_COST_USD, MAX_ITERATIONS
-from core.audit import trail
+from core.agents.run_limits import (
+    MAX_COST_USD,
+    MAX_ITERATIONS,
+    OverrideRefused,
+    check_wall_minutes,
+)
 from core.auth import tool_principal
 from core.auth.current_user import get_current_user
 from core.auth.permissions import permission_gate
@@ -45,6 +49,7 @@ from core.workflows import catalog, hunt_preflight
 from core.workflows.custom_workflow_service import CustomWorkflowService
 from core.workflows.enablement import set_workflow_enabled
 from core.workflows.handoff_cases import stamp_handoff_cases
+from core.workflows.start_case import StartRefused, start_on_case
 from core.workflows.workflow_ai_generator import WorkflowAIGenerator
 from core.workflows.workflow_run_service import (
     IN_FLIGHT_STATUSES,
@@ -99,6 +104,20 @@ class WorkflowExecuteRequest(BaseModel):
     # What the caller will spend on this question, which is not a property of the
     # definition. Bounded because a mistyped ceiling is money.
     max_cost_usd: Optional[float] = Field(default=None, gt=0, le=MAX_COST_USD)
+    # Working time, in whole minutes. Waits on a person do not count. Bounded by
+    # the same wall ceiling as overrides.budgets.max_wall_ms.
+    max_wall_minutes: Optional[int] = None
+
+    @field_validator("max_wall_minutes", mode="before")
+    @classmethod
+    def _wall_minutes(cls, value: Any) -> Optional[int]:
+        if value is None:
+            return None
+        try:
+            return check_wall_minutes(value)
+        except OverrideRefused as exc:
+            raise ValueError(str(exc)) from None
+
     # Whether the hunt stops and asks before it spends. The policy defaults to auto,
     # so a headless run advances with nobody at a terminal.
     approve_hypotheses: Optional[bool] = None
@@ -106,6 +125,12 @@ class WorkflowExecuteRequest(BaseModel):
     # Longer text is condensed by POST /workflows/threat-hunt/document first. It
     # is no target: a hunt still needs a hypothesis.
     document: Optional[str] = Field(default=None, max_length=MAX_DOCUMENT_CHARS)
+    # Run on a restricted case: the named one, which must be restricted, or a new
+    # one restricted to the starter -- never the open case holding the finding.
+    restricted: Optional[bool] = None
+    # A zone the applied site revision declares (#5212): the hunt's scope is its
+    # selectors. Resolved by execute_workflow, which refuses one not declared.
+    zone: Optional[str] = Field(default=None, max_length=200)
 
 
 class HuntCoverageRequest(BaseModel):
@@ -196,6 +221,50 @@ async def set_enabled(
     return {"id": workflow_id, "enabled": body.enabled}
 
 
+class InsiderLeadsBody(BaseModel):
+    sources: List[str] = Field(default_factory=list, max_length=200)
+    rule_names: List[str] = Field(default_factory=list, max_length=200)
+    readers: List[str] = Field(default_factory=list, max_length=200)
+    teams: List[str] = Field(default_factory=list, max_length=200)
+
+
+@router.get("/workflows/threat-hunt/insider-leads")
+async def get_insider_leads():
+    """Which findings are insider leads and who reads the cases they open:
+    ``{sources, rule_names, readers, teams}``. With no source or rule name,
+    automatic start is off."""
+    from core.workflows.insider_lead import leads
+
+    return leads()
+
+
+@router.put("/workflows/threat-hunt/insider-leads", dependencies=_SETTINGS_WRITE)
+async def set_insider_leads(
+    body: InsiderLeadsBody, current_user: User = Depends(get_current_user)
+):
+    """Replace the lead list. Adding anything is a person's own act, not a token's;
+    a list left on needs a reader or team, each checked as for a restricted case."""
+    from core.cases.case_readers import ReadersRefused, http_restricter
+    from core.storage.unit_of_work import unit_of_work
+    from core.workflows.insider_lead import LeadRefused, save_leads
+
+    try:
+        with unit_of_work() as session:
+            return save_leads(
+                session,
+                http_restricter(session, current_user),
+                str(current_user.user_id),
+                body.sources,
+                body.rule_names,
+                body.readers,
+                body.teams,
+            )
+    except ReadersRefused as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.message) from None
+    except LeadRefused as refused:
+        raise HTTPException(status_code=refused.status, detail=refused.detail) from None
+
+
 # -----------------------------------------------------------------------------
 # Custom workflow CRUD (database-backed)
 # -----------------------------------------------------------------------------
@@ -209,7 +278,11 @@ async def create_custom_workflow(
 ):
     """Create a new custom workflow."""
     try:
-        created = service.create(payload.model_dump(), created_by=current_user.username)
+        created = service.create(
+            payload.model_dump(),
+            created_by=current_user.username,
+            changed_by=str(current_user.user_id),
+        )
         return created
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -220,11 +293,14 @@ async def update_custom_workflow(
     workflow_id: str,
     payload: CustomWorkflowUpdate,
     service: CustomWorkflowService = Depends(provide_custom_workflows),
+    current_user: User = Depends(get_current_user),
 ):
     """Update an existing custom workflow. Increments version only when its definition changes."""
     try:
         updates = {k: v for k, v in payload.model_dump().items() if v is not None}
-        updated = service.update(workflow_id, updates)
+        updated = service.update(
+            workflow_id, updates, changed_by=str(current_user.user_id)
+        )
         if not updated:
             raise HTTPException(
                 status_code=404,
@@ -241,9 +317,10 @@ async def update_custom_workflow(
 async def delete_custom_workflow(
     workflow_id: str,
     service: CustomWorkflowService = Depends(provide_custom_workflows),
+    current_user: User = Depends(get_current_user),
 ):
     """Soft-delete a custom workflow (sets is_active=False)."""
-    ok = service.delete(workflow_id)
+    ok = service.delete(workflow_id, changed_by=str(current_user.user_id))
     if not ok:
         raise HTTPException(
             status_code=404,
@@ -342,6 +419,19 @@ async def propose_feed_hunts(limit: int = 200):
     return propose_hunts_from_recent_indicators(limit=limit)
 
 
+@router.get("/workflows/threat-hunt/lead-proposal", dependencies=_CHAT)
+async def propose_lead_hunt(finding_id: str):
+    """An execute body hunting the data movement of each account a finding
+    names, on a restricted case. Read-only; 404 for an unknown finding, 400 for
+    one that names no account."""
+    from core.workflows.insider_lead import LeadRefused, lead_proposal
+
+    try:
+        return lead_proposal(finding_id)
+    except LeadRefused as refused:
+        raise HTTPException(status_code=refused.status, detail=refused.detail) from None
+
+
 # -----------------------------------------------------------------------------
 # Parameterized discovery/execution routes
 # -----------------------------------------------------------------------------
@@ -410,6 +500,8 @@ async def execute_workflow(
         )
 
     parameters = {k: v for k, v in request.model_dump().items() if v is not None}
+    # Not a run parameter: execute_workflow resolves it and journals the zone itself.
+    zone = parameters.pop("zone", None)
 
     if not TARGET_PARAMS & parameters.keys():
         raise HTTPException(
@@ -421,16 +513,12 @@ async def execute_workflow(
         )
 
     # Every run starts on a case, so a run that stops at a limit has one to answer on.
-    opened = None
-    if not parameters.get("case_id"):
-        parameters["case_id"], opened = _case_for_start(workflow_id, parameters)
-
-    try:
+    async def execute(params: Dict[str, Any]) -> Dict[str, Any]:
         # The row names the person. Daemon and handoff starts call the service
         # directly and pass their own marker; this door always has a session.
-        result = await service.execute_workflow(
+        return await service.execute_workflow(
             workflow_id,
-            parameters,
+            params,
             triggered_by=user.username,
             principal=tool_principal.mint(
                 user.username,
@@ -440,76 +528,29 @@ async def execute_workflow(
                 ttl=tool_principal.RUN_TTL,
                 sid=tool_principal.sid_of(http_request),
             ),
+            zone=zone,
         )
-    except Exception:
-        _drop_case(opened)
-        raise
 
-    # Once a run row exists the case stays: the failed run lives on it.
-    if not result.get("run_id"):
-        _drop_case(opened)
+    def restricter(session: Any) -> Any:
+        from core.cases.case_readers import http_restricter
+
+        return http_restricter(session, user)
+
+    try:
+        result = await start_on_case(workflow_id, parameters, restricter, execute)
+    except StartRefused as refused:
+        raise HTTPException(status_code=refused.status, detail=refused.detail) from None
     if not result.get("success"):
         error = result.get("error", "Unknown error during workflow execution")
-        raise HTTPException(
-            status_code=409 if result.get("disabled") else 500, detail=error
-        )
+        if result.get("disabled"):
+            status = 409
+        elif result.get("refused"):
+            status = 422
+        else:
+            status = 500
+        raise HTTPException(status_code=status, detail=error)
 
-    return {**result, "case_id": parameters["case_id"]}
-
-
-def _case_for_start(
-    workflow_id: str, parameters: Dict[str, Any]
-) -> Tuple[str, Optional[str]]:
-    """The case a start with none runs on, and the id of it if opened for this start.
-
-    The newest not-closed case holding the named alert, else a new one.
-    """
-    from core.cases.case_sla_service import case_title, open_case, open_case_holding
-    from core.storage.database_data_service import DatabaseDataService
-
-    finding_id = parameters.get("finding_id")
-    try:
-        if finding_id and (holding := open_case_holding(finding_id)):
-            return holding, None
-        data = DatabaseDataService()
-        finding = (data.get_finding(finding_id) if finding_id else None) or {}
-        text = (
-            parameters.get("hypothesis")
-            or parameters.get("context")
-            or finding.get("description")
-        )
-        opened = open_case(
-            data,
-            title=case_title(text or finding.get("title") or workflow_id, 60),
-            finding_ids=[finding_id] if finding_id else [],
-            priority="medium",
-            description=parameters.get("hypothesis") or parameters.get("context") or "",
-        )
-    except trail.Paused:
-        raise  # a 503 with Retry-After, as a comment is
-    except Exception:
-        logger.exception("could not open a case for a %s start", workflow_id)
-        opened = None
-    if not opened:
-        raise HTTPException(
-            status_code=500, detail="Could not open a case for this run"
-        )
-    return opened["case_id"], opened["case_id"]
-
-
-def _drop_case(case_id: Optional[str]) -> None:
-    """Delete the case opened for a start that never made a run."""
-    if not case_id:
-        return
-    from core.storage.database_data_service import DatabaseDataService
-
-    # A refused or paused trail append raises; the caller's own error stands.
-    try:
-        dropped = DatabaseDataService().delete_case(case_id)
-    except Exception:  # noqa: BLE001
-        dropped = False
-    if not dropped:
-        logger.error("could not delete case %s opened for a refused start", case_id)
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -678,7 +719,7 @@ async def get_workflow_run(
     (#128). For one-shot runs with no phase rows, ``phases`` is just
     an empty list.
     """
-    row = run_service.get_run(run_id)
+    row = run_service.get_run(run_id, readable=True)
     if not row:
         raise HTTPException(status_code=404, detail=f"Run not found: {run_id}")
     row["phases"] = run_service.list_phases(run_id)
@@ -708,11 +749,11 @@ async def cancel_workflow_run(
     Rejects any pending approval action on the run and finalises it
     as ``cancelled`` with the supplied reason.
     """
-    from core.response.approval_service import ActionStatus
+    from core.response.approval_service import ActionNotFound, ActionStatus
     from core.workflows.run_cancel import stop_run
     from core.workflows.run_resume import resume_run
 
-    run = run_service.get_run(run_id)
+    run = run_service.get_run(run_id, readable=True)
     if not run:
         raise HTTPException(status_code=404, detail=f"Run not found: {run_id}")
     if run.get("status") not in IN_FLIGHT_STATUSES:
@@ -726,7 +767,8 @@ async def cancel_workflow_run(
         status=ActionStatus.PENDING, workflow_run_id=run_id
     )
     for action in pending:
-        with suppress(AlreadyDecided):
+        # One also on a case the caller can't read stays for its readers.
+        with suppress(AlreadyDecided, ActionNotFound):
             approval_service.reject_action(
                 action.action_id,
                 reason=request.reason,
@@ -771,7 +813,7 @@ async def narrate_workflow_run(
     """
     from core.agents.projections import write_narrative
 
-    if not run_service.get_run(run_id):
+    if not run_service.get_run(run_id, readable=True):
         raise HTTPException(status_code=404, detail=f"Run not found: {run_id}")
     if run_id in _narrating:
         raise HTTPException(
@@ -803,7 +845,7 @@ async def replay_workflow_run(
     side, so it is answered only when an operator asks. Serve decides what is
     hunt-like; a run with nothing to replay is a 404 here too.
     """
-    if not run_service.get_run(run_id):
+    if not run_service.get_run(run_id, readable=True):
         raise HTTPException(status_code=404, detail=f"Run not found: {run_id}")
     try:
         report = await read_replay(run_id, decision_id)
@@ -828,7 +870,7 @@ async def read_workflow_run_call(
     What a reader opens from the Checked tab, or from an evidence row's source,
     to check a record against the query it came from.
     """
-    if not run_service.get_run(run_id):
+    if not run_service.get_run(run_id, readable=True):
         raise HTTPException(status_code=404, detail=f"Run not found: {run_id}")
     try:
         call = await read_call(run_id, ref)
@@ -851,7 +893,7 @@ async def verify_workflow_run(
 
     Python forwards the result and does not re-check the chain.
     """
-    if not run_service.get_run(run_id):
+    if not run_service.get_run(run_id, readable=True):
         raise HTTPException(status_code=404, detail=f"Run not found: {run_id}")
     try:
         result = await read_verify(run_id)
@@ -886,6 +928,7 @@ async def _restate_summary(run_id: str, run_service: WorkflowRunService) -> None
 async def delete_workflow_run(
     run_id: str,
     run_service: WorkflowRunService = Depends(provide_workflow_runs),
+    current_user: User = Depends(get_current_user),
 ):
     """Remove a finished run from the listings.
 
@@ -894,7 +937,7 @@ async def delete_workflow_run(
     the agents did. A run still in flight is refused — cancel it first,
     so nothing is hidden while a worker is still writing to it.
     """
-    run = run_service.get_run(run_id)
+    run = run_service.get_run(run_id, readable=True)
     if not run:
         raise HTTPException(status_code=404, detail=f"Run not found: {run_id}")
     if run.get("status") in IN_FLIGHT_STATUSES:
@@ -902,7 +945,7 @@ async def delete_workflow_run(
             status_code=409,
             detail="This run has not finished. Cancel it before removing it.",
         )
-    if not run_service.delete_run(run_id):
+    if not run_service.delete_run(run_id, changed_by=str(current_user.user_id)):
         raise HTTPException(status_code=404, detail=f"Run not found: {run_id}")
     return {"success": True, "run_id": run_id}
 
@@ -924,11 +967,19 @@ async def list_workflow_runs(
     limit = max(1, min(limit, 200))
     offset = max(0, offset)
 
+    hidden: List[int] = []
     runs = run_service.list_runs(
         workflow_id=workflow_id,
         status=status,
         limit=limit,
         offset=offset,
+        readable=True,
+        hidden=hidden,
     )
     _stamp_rated_status(run_service, runs)
-    return {"workflow_id": workflow_id, "runs": runs}
+    # Runs on a restricted case the caller can't read: left out, and counted.
+    return {
+        "workflow_id": workflow_id,
+        "runs": runs,
+        "hidden": hidden[0] if hidden else 0,
+    }

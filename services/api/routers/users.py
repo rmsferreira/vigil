@@ -6,51 +6,96 @@ Handles user CRUD operations, role assignment, and user administration.
 
 import asyncio
 import logging
-import re
 import uuid
 from contextlib import asynccontextmanager, contextmanager
+from datetime import datetime, timezone
 from typing import Annotated, Literal, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
 from pydantic import BaseModel, EmailStr, Field, field_validator
-from sqlalchemy import and_, func, or_
+from sqlalchemy import and_
+from sqlalchemy import case as sql_case
+from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
+from core import teams
 from core.audit import retention
-from core.auth import current_user as current_user_module
 from core.auth import (
+    directory_sync,
     dormancy,
+    invites,
     mcp_credential_service,
     mfa_methods,
     principals,
+    security_keys,
     session_policy,
     sign_ins,
+    sso,
+    sso_settings,
     step_up,
     trail_events,
 )
+from core.auth.acting import acts_as_person as _acts_as_person
+from core.auth.acting import is_service_account as _is_service_account
+from core.auth.acting import principal_kind as _principal_kind
 from core.auth.auth_cookies import clear_auth_cookies
 from core.auth.auth_service import (
     PERSON_ONLY,
     AuthService,
     _account_is_locked,
     clear_lock,
+    managers,
+    with_dispute,
 )
-from core.auth.deactivation import deactivate_account, when_committed
-from core.auth.password_validator import PasswordPolicyError, validate_password_strength
+from core.auth.deactivation import (
+    clear_deactivation,
+    deactivate_account,
+    when_committed,
+)
+from core.auth.identity import (
+    RESERVED,
+    UNAVAILABLE,
+    claim_sign_in_names,
+    fold,
+    identifier_in_use,
+    sql_fold,
+)
+from core.auth.password_reset import reset_link
+from core.auth.password_validator import USERS_LINK
 from core.auth.permissions import (
     CATALOG,
     KNOWN_PERMISSIONS,
+    NEW_CAPABILITIES,
     PLATFORM_EQUIVALENT,
     PRESETS,
     STEP_UP,
     builtin_diff,
+    case_read_clause,
     deny_unless,
+    missing_permission,
+    require_person_permission,
 )
-from core.auth.service_account import USERNAME_PATTERN as MEDIC_USERNAME_PATTERN
+from core.auth.service_account import is_medic as _is_medic
+from core.cases.case_readers import no_active_reader
+from core.config import get_settings
+from core.platform.email_service import mail_is_configured, send_email
 from core.platform.notices import notify
 from core.routing import Auth, RouterMeta, UnitOfWorkSession
-from core.storage.models import Case, Principal, Role, User
+from core.storage.models import (
+    AuthLink,
+    Case,
+    CaseTask,
+    DirectoryGroupMember,
+    DirectoryPending,
+    Principal,
+    Role,
+    SecurityKey,
+    SsoLink,
+    Team,
+    User,
+)
 from core.storage.schemas import RoleSchema, UserSchema
+from core.storage.schemas.base import IsoDateTime
 from core.storage.unit_of_work import unit_of_work
 from core.time import utcnow
 from core.upgrade.adopt import LEGACY_ROLE_IDS
@@ -75,14 +120,29 @@ ROUTER_META = RouterMeta(
 
 
 # Request/Response Models
-class CreateUserRequest(BaseModel):
-    """Create user request."""
+SERVICE_ACCOUNT_NAME = r"^[a-z0-9][a-z0-9._-]{2,63}$"
 
-    username: str
-    email: EmailStr
-    password: str
-    full_name: str
-    role_id: str
+
+class CreateServiceAccountRequest(BaseModel):
+    """Create a token-only account for an integration, with the person answerable for it."""
+
+    name: str = Field(pattern=SERVICE_ACCOUNT_NAME)
+    purpose: str = Field(min_length=1, max_length=500)
+    role_id: str = "role-viewer"
+    # The accountable person's user id (their principal id).
+    accountable: str
+
+    @field_validator("purpose")
+    @classmethod
+    def _purpose(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("A purpose is required")
+        return value
+
+
+class ReassignRequest(BaseModel):
+    accountable: str
 
 
 class UpdateUserRequest(BaseModel):
@@ -114,20 +174,6 @@ BUILTIN_ROLE_REFUSED = (
 )
 
 
-def _is_service_account(user: User) -> bool:
-    # Only an explicit True is one; a user object without the field is not.
-    try:
-        return user.service_account is True
-    except AttributeError:
-        return False
-
-
-def _is_medic(user: User) -> bool:
-    return _is_service_account(user) and bool(
-        re.fullmatch(MEDIC_USERNAME_PATTERN, user.username or "")
-    )
-
-
 def _refuse_medic_reassignment(user: User) -> None:
     # Medic's gateway stays Viewer, an outside observer (#2851).
     if _is_medic(user):
@@ -137,27 +183,10 @@ def _refuse_medic_reassignment(user: User) -> None:
         )
 
 
-def _principal_kind(user: User, session: Session) -> Optional[str]:
-    return (
-        session.query(Principal.kind)
-        .filter(Principal.principal_id == user.principal_id)
-        .scalar()
-    )
-
-
 def _is_person_account(user: User, session: Session) -> bool:
     return not _is_service_account(user) and (
         _principal_kind(user, session) == principals.PERSON
     )
-
-
-def _acts_as_person(user: User, session: Session) -> bool:
-    """A person's own session. A service account's is not, nor is any API token's;
-    DEV_MODE's dev user is."""
-    if _is_service_account(user) or current_user_module.is_token_request():
-        return False
-    kind = _principal_kind(user, session)
-    return kind == principals.PERSON if kind else current_user_module.DEV_MODE
 
 
 def _granted(permissions: Optional[dict]) -> set[str]:
@@ -224,14 +253,19 @@ def _manager_accounts(
     roles: Optional[dict[str, Optional[dict]]] = None,
     users: Optional[dict[str, tuple[str, bool]]] = None,
 ) -> list[User]:
-    """Active people with a password whose role holds roles.manage, with
-    ``roles`` ({id: permissions}) and ``users`` ({id: (role_id, is_active)})
+    """Active people who can sign in (a password, or a single sign-on link while
+    it is on; only the link while it is required) whose role holds roles.manage,
+    with ``roles`` ({id: permissions}) and ``users`` ({id: (role_id, is_active)})
     applied as if saved. Locked ones included."""
     held = {role.role_id: role.permissions for role in session.query(Role)}
     held.update(roles or {})
     people = (
         _not_deleted(session.query(User)).filter(Principal.kind == principals.PERSON)
     ).all()
+    current = sso_settings.settings()
+    required = sso.required(current)
+    # Linked people count while required even if SSO is broken now: they are back once it is fixed.
+    linked = sso.linked_principals(session) if required or sso.is_on(current) else set()
     found = []
     for user in people:
         role_id, active = (users or {}).get(
@@ -239,7 +273,7 @@ def _manager_accounts(
         )
         if (
             active
-            and user.password_hash
+            and (user.principal_id in linked or (user.password_hash and not required))
             and (held.get(role_id) or {}).get(ROLES_MANAGE)
         ):
             found.append(user)
@@ -418,24 +452,90 @@ def _dump_accounts(session: Session, users: list[User]) -> list[dict]:
             Principal.principal_id.in_(ids), Principal.deleted_at.isnot(None)
         )
     }
+    # Who on this page has a security key. One query: method_types only needs
+    # the boolean, and methods() would also read the trail once per person.
+    keyed: set[str] = set()
+    if ids:
+        keyed = {
+            pid
+            for (pid,) in (
+                session.query(SecurityKey.principal_id)
+                .filter(SecurityKey.principal_id.in_(ids))
+                .distinct()
+            )
+        }
     # Shown before a deactivate or delete, as deactivation tells managers.
-    open_cases = dict(
-        session.query(Case.assignee, func.count())
+    # Restricted cases the caller may not read are counted apart: "N hidden".
+    # A CASE, not the bare clause: for a built-in reader the clause is a constant,
+    # which Postgres won't GROUP BY.
+    readable = sql_case((case_read_clause(), 1), else_=0)
+    open_cases: dict = {}
+    hidden_cases: dict = {}
+    for assignee, can_read, count in (
+        session.query(Case.assignee, readable, func.count())
         .filter(Case.assignee.in_([u.username for u in users]), Case.status != "closed")
-        .group_by(Case.assignee)
-        .all()
-    )
+        .group_by(Case.assignee, readable)
+    ):
+        (open_cases if can_read else hidden_cases)[assignee] = count
+    linked = sso.linked_principals(session)
+    unused = _unused_sync(session, users)
+    # Who each service account answers to: worked out here, never stored.
+    answerable = {
+        user.principal_id: (user, gone is not None)
+        for user, gone in session.query(User, Principal.deleted_at)
+        .join(Principal, Principal.principal_id == User.principal_id)
+        .filter(
+            User.principal_id.in_(
+                [
+                    u.accountable_principal_id
+                    for u in users
+                    if u.accountable_principal_id
+                ]
+            )
+        )
+    }
     now = utcnow()
     dumped = []
     for user in users:
         entry = UserSchema.dump(user)
+        # How the account signs in (#4285); never the hash or the subject.
+        entry["has_password"] = bool(user.password_hash)
+        entry["has_sso"] = user.principal_id in linked
+        # Types only, same decision as the Sign-in methods dialog.
+        entry["mfa_method_types"] = mfa_methods.method_types(
+            user, user.principal_id in keyed
+        )
+        # A pushed account nobody used, which Remove frees for the next push.
+        entry["unused_sync"] = user.user_id in unused
         entry["status"] = _account_status(user, user.principal_id in deleted)
+        entry["deactivation_route"] = user.deactivation_route
+        entry["deactivated_at"] = (
+            user.deactivated_at.isoformat() + "Z" if user.deactivated_at else None
+        )
         entry["open_cases"] = open_cases.get(user.username, 0)
+        entry["open_cases_hidden"] = hidden_cases.get(user.username, 0)
         machine = _is_service_account(user)
         entry["principal_kind"] = (
             principals.SERVICE_ACCOUNT if machine else principals.PERSON
         )
         entry["managed_by_medic"] = _is_medic(user)
+        entry["break_glass"] = user.break_glass_at is not None
+        entry["purpose"] = user.purpose
+        entry["accountable"] = None
+        entry["accountable_gone"] = False
+        if machine and not _is_medic(user):
+            person, deleted_person = answerable.get(
+                user.accountable_principal_id, (None, True)
+            )
+            entry["accountable_gone"] = (
+                deleted_person or not person.is_active or _is_erased(person)
+            )
+            if person is not None and not _is_erased(person):
+                entry["accountable"] = {
+                    "user_id": person.user_id,
+                    "username": person.username,
+                    "full_name": person.full_name,
+                }
         # Stored on the role. AuthService.check_permission refuses them for a
         # non-person, so for this account they do nothing.
         entry["no_effect"] = (
@@ -451,7 +551,13 @@ def _dump_accounts(session: Session, users: list[User]) -> list[dict]:
         entry["locked_from"] = user.locked_from
         # When an idle account will be deactivated, once it is inside the warning window.
         entry["deactivating_at"] = None
-        if days and user.is_active and not machine and user.user_id in last:
+        if (
+            days
+            and user.is_active
+            and not machine
+            and user.break_glass_at is None  # dormancy skips a break-glass account
+            and user.user_id in last
+        ):
             if now >= dormancy.warning_start(last[user.user_id], days):
                 entry["deactivating_at"] = (
                     dormancy.deadline(last[user.user_id], days).isoformat() + "Z"
@@ -466,6 +572,7 @@ def list_users(
     limit: int = Query(100, ge=1, le=1000),
     role_id: Optional[str] = None,
     is_active: Optional[bool] = None,
+    service_account: Optional[bool] = None,
     search: Optional[str] = None,
     account_status: AccountStatus = Query("current", alias="status"),
     *,
@@ -480,6 +587,7 @@ def list_users(
         limit: Maximum number of users to return
         role_id: Filter by role ID
         is_active: Filter by active status
+        service_account: Only service accounts (true) or only people (false)
         search: Search in username, email, or full name
         account_status: "current" (not deleted or erased), "all", or one status
         current_user: Current authenticated user
@@ -507,6 +615,13 @@ def list_users(
         if is_active is not None:
             query = query.filter(User.is_active == is_active)
 
+        if service_account is not None:
+            query = query.filter(
+                User.service_account.is_(True)
+                if service_account
+                else User.service_account.isnot(True)
+            )
+
         if search:
             search_pattern = f"%{search}%"
             query = query.filter(
@@ -526,6 +641,10 @@ def list_users(
             "skip": skip,
             "limit": limit,
             "users": _dump_accounts(session, users),
+            # Install-wide, outside the read rule: a count only, never which cases.
+            "restricted_no_reader": session.query(func.count(Case.case_id))
+            .filter(no_active_reader())
+            .scalar(),
         }
 
     except Exception as e:
@@ -534,6 +653,816 @@ def list_users(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to list users",
         )
+
+
+class PersonTeam(BaseModel):
+    """One team a person is on. Archived teams are left out: they accept no one."""
+
+    id: str
+    name: str
+    is_default: bool
+
+
+class Person(BaseModel):
+    """One current person, as a picker shows them."""
+
+    username: str
+    display_name: Optional[str] = None
+    # The id a case's reader list names this person by.
+    principal_id: str
+    teams: list[PersonTeam] = []
+
+
+@router.get("/people", response_model=list[Person])
+def list_people(
+    session: UnitOfWorkSession,
+    current_user: Annotated[
+        User,
+        Depends(
+            require_person_permission(
+                "cases.read", "cases.assign", "cases.write", refuse_machine=True
+            )
+        ),
+    ],
+):
+    """Current people, for the owner picker and for My teams.
+
+    Current is ``owner_states``'s test: active, not a service account, not
+    deleted. cases.assign or cases.write sees everyone. cases.read sees only
+    the signed-in person, which is enough to send that person's team ids.
+    """
+    where = [
+        User.is_active.is_(True),
+        User.service_account.is_not(True),
+        Principal.deleted_at.is_(None),
+    ]
+    # The full directory is the picker. A reader who cannot assign still needs
+    # their own teams for the queue's My teams filter.
+    if missing_permission(
+        current_user.user_id, "cases.assign", session
+    ) and missing_permission(current_user.user_id, "cases.write", session):
+        where.append(User.user_id == current_user.user_id)
+    rows = session.execute(
+        select(User.username, User.full_name, User.principal_id)
+        .join(Principal, Principal.principal_id == User.principal_id)
+        .where(*where)
+        .order_by(
+            func.lower(func.coalesce(func.nullif(User.full_name, ""), User.username))
+        )
+    ).all()
+    held = teams.teams_for(session, {username for username, _name, _id in rows})
+    return [
+        Person(
+            username=username,
+            display_name=(name or "").strip() or None,
+            principal_id=principal_id,
+            teams=[
+                PersonTeam(id=team.team_id, name=team.name, is_default=team.is_default)
+                for team in held.get(username, [])
+            ],
+        )
+        for username, name, principal_id in rows
+    ]
+
+
+class InviteRequest(BaseModel):
+    """Invite an address to set up their own account."""
+
+    email: EmailStr = Field(max_length=200)
+    role_id: str
+    channel: Literal["email", "copy"]
+    # Named instead of the default team. Needs teams.manage; absent joins the default.
+    team_ids: Optional[list[str]] = None
+
+
+class ResendRequest(BaseModel):
+    channel: Literal["email", "copy"]
+
+
+class InviteEntry(BaseModel):
+    link_id: str
+    email: str
+    role_id: str
+    invited_by: Optional[str] = None
+    invited_by_name: Optional[str] = None
+    channel: Literal["email", "copy"]
+    issued_at: IsoDateTime
+    expires_at: IsoDateTime
+    expired: bool
+    team_ids: list[str] = []
+
+
+class InviteList(BaseModel):
+    """The pending invites, and what Email needs before it can be offered."""
+
+    invites: list[InviteEntry]
+    email_missing: list[str]
+
+
+class InviteIssued(BaseModel):
+    """A new link. ``token`` and ``link`` come back once, for a copied link only;
+    ``link`` is empty when VIGIL_FRONTEND_URL isn't set and the console builds
+    it from its own address."""
+
+    invite: InviteEntry
+    token: Optional[str] = None
+    link: Optional[str] = None
+
+
+def _invite_entry(session: Session, row: AuthLink) -> InviteEntry:
+    who = (
+        session.query(User.full_name, User.username)
+        .filter(User.principal_id == row.invited_by)
+        .first()
+    )
+    return InviteEntry(
+        link_id=row.link_id,
+        email=row.email or "",
+        role_id=row.role_id or "",
+        invited_by=row.invited_by,
+        invited_by_name=(who and (who.full_name or who.username)) or None,
+        channel=row.channel or "copy",
+        issued_at=row.issued_at,
+        expires_at=row.expires_at,
+        expired=invites.is_expired(row),
+        team_ids=list(row.team_ids or []),
+    )
+
+
+def _email_missing() -> list[str]:
+    """What has to be set before an invite can be emailed; empty when it can."""
+    missing = []
+    if not mail_is_configured():
+        missing.append("VIGIL_EMAIL_BACKEND=smtp")
+    if not get_settings().vigil_frontend_url.strip():
+        missing.append("VIGIL_FRONTEND_URL")
+    return missing
+
+
+def _refuse_invite_actor(current_user: User, session: Session) -> None:
+    """Inviting is a person's own act, and the invite is theirs to answer for."""
+    if not _acts_as_person(current_user, session) or not _principal_kind(
+        current_user, session
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Inviting needs a person's own sign-in",
+        )
+
+
+def _held_detail(value: str, held: str, in_use: str) -> str:
+    """What a manager is told: a reserved value is named apart from one in use."""
+    if held == RESERVED:
+        return f"{value} is reserved and can't be used as a sign-in name."
+    if held == UNAVAILABLE:
+        return f"{value} can't be checked right now. Try again."
+    return in_use
+
+
+def _refuse_held_address(session: Session, email: str) -> None:
+    """An address an account already holds is not invited: bring that account back."""
+    held = (
+        session.query(User, Principal.deleted_at)
+        .join(Principal, Principal.principal_id == User.principal_id)
+        .filter(sql_fold(User.email) == fold(email))
+        .first()
+    )
+    if held:
+        user, deleted_at = held
+        if deleted_at is not None:
+            detail = (
+                f"{email} belongs to a deleted account. Restore it instead of inviting."
+            )
+        elif not user.is_active:
+            detail = f"{email} belongs to a deactivated account. Reactivate it instead of inviting."
+        else:
+            detail = f"{email} already has an account."
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=detail)
+    # Its own pending invite is the one being replaced.
+    mine = invites.open_for(session, email)
+    held = identifier_in_use(session, email, except_link_id=mine and mine.link_id)
+    if held:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=_held_detail(
+                email, held, f"{email} is already used as a sign-in name."
+            ),
+        )
+
+
+def _person_direct(session: Session, user: User) -> bool:
+    """A person in their own session, not a token, run or MCP call: the one
+    caller that may widen who reads a restricted case (#4360)."""
+    from core.cases.case_readers import http_restricter
+
+    return http_restricter(session, user).person_direct
+
+
+def _issue_invite(
+    session: Session,
+    current_user: User,
+    email: str,
+    role_id: str,
+    channel: str,
+    team_ids: Optional[list[str]] = None,
+) -> InviteIssued:
+    settings = get_settings()
+    base = settings.vigil_frontend_url.strip()
+    if channel == invites.EMAIL and (missing := _email_missing()):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Email isn't available: set {' and '.join(missing)}, "
+            "or copy the link instead.",
+        )
+    role = session.get(Role, role_id)
+    if role is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid role ID"
+        )
+    _refuse_uncovered(
+        current_user, role.permissions, session, "Cannot invite to this role"
+    )
+    # An address is a sign-in name: hold it so two invites or sign-ups can't race.
+    claim_sign_in_names(session, email)
+    _refuse_held_address(session, email)
+    chosen = teams.check_invite_teams(
+        session,
+        team_ids,
+        actor=current_user.principal_id,
+        direct=_person_direct(session, current_user),
+    )
+    row, token = invites.issue(
+        session, email, role_id, current_user.principal_id, channel, chosen
+    )
+    entry = _invite_entry(session, row)
+    if channel == invites.EMAIL:
+        link = invites.link_url(base, token)
+        who = current_user.full_name or current_user.username
+        when_committed(
+            session,
+            lambda: send_email(
+                to=email,
+                subject="You're invited to Vigil SOC",
+                body=(
+                    f"{who} invited you to Vigil SOC as {role.name}.\n\n"
+                    "Open the link below to choose your username and password. "
+                    "It is valid for 24 hours and can only be used once.\n\n"
+                    f"{link}\n\n"
+                    "If you weren't expecting this, you can ignore this email."
+                ),
+            ),
+        )
+        return InviteIssued(invite=entry)
+    return InviteIssued(
+        invite=entry, token=token, link=invites.link_url(base, token) if base else None
+    )
+
+
+@router.get("/invites", response_model=InviteList)
+def list_invites(
+    current_user: Annotated[User, Depends(get_current_user)],
+    session: UnitOfWorkSession,
+):
+    """Invites not yet accepted or revoked, expired ones too (users.write)."""
+    with _denials(current_user, "invite.list"):
+        deny_unless(current_user.user_id, "users.write")
+    rows = invites.pending(session)
+    for row in rows:
+        invites.note_expired(session, row)
+    return InviteList(
+        invites=[_invite_entry(session, row) for row in rows],
+        email_missing=_email_missing(),
+    )
+
+
+@router.post(
+    "/invites",
+    response_model=InviteIssued,
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[_step_up("users.write")],
+)
+def create_invite(
+    request: InviteRequest,
+    current_user: Annotated[User, Depends(get_current_user)],
+    session: UnitOfWorkSession,
+):
+    """Invite an address, replacing its pending invite if it has one."""
+    with _denials(current_user, "invite.create"):
+        deny_unless(current_user.user_id, "users.write")
+        _refuse_invite_actor(current_user, session)
+        if any((team_id or "").strip() for team_id in (request.team_ids or [])):
+            deny_unless(current_user.user_id, "teams.manage")
+        return _issue_invite(
+            session,
+            current_user,
+            str(request.email),
+            request.role_id,
+            request.channel,
+            request.team_ids,
+        )
+
+
+@router.post(
+    "/invites/{link_id}/resend",
+    response_model=InviteIssued,
+    dependencies=[_step_up("users.write")],
+)
+def resend_invite(
+    link_id: str,
+    request: ResendRequest,
+    current_user: Annotated[User, Depends(get_current_user)],
+    session: UnitOfWorkSession,
+):
+    """A new link for a pending invite; the earlier one stops working."""
+    with _denials(current_user, "invite.resend"):
+        deny_unless(current_user.user_id, "users.write")
+        _refuse_invite_actor(current_user, session)
+        row = invites.get(session, link_id)
+        if row is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="Invite not found"
+            )
+        return _issue_invite(
+            session,
+            current_user,
+            row.email,
+            row.role_id,
+            request.channel,
+            list(row.team_ids or []),
+        )
+
+
+@router.delete("/invites/{link_id}", dependencies=[_step_up("users.write")])
+def revoke_invite(
+    link_id: str,
+    current_user: Annotated[User, Depends(get_current_user)],
+    session: UnitOfWorkSession,
+):
+    """Cancel a pending invite; its link stops working."""
+    with _denials(current_user, "invite.revoke"):
+        deny_unless(current_user.user_id, "users.write")
+        _refuse_invite_actor(current_user, session)
+    row = invites.get(session, link_id, lock=True)
+    if row is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Invite not found"
+        )
+    invites.revoke(session, row, current_user.principal_id)
+    return {"message": "Invite revoked"}
+
+
+class TeamOut(BaseModel):
+    id: str
+    name: str
+    is_default: bool
+    archived: bool
+    # Derived from the directory mapping. No column.
+    synced: bool = False
+
+
+class TeamMemberOut(BaseModel):
+    user_id: str
+    username: str
+    display_name: Optional[str] = None
+
+
+class TeamDetail(TeamOut):
+    members: list[TeamMemberOut]
+
+
+class TeamName(BaseModel):
+    name: str = Field(min_length=1, max_length=teams.NAME_MAX)
+
+
+class TeamMemberAdd(BaseModel):
+    user_id: str
+
+
+class TeamMemberRemoved(BaseModel):
+    user_id: str
+    warning: Optional[str] = None
+
+
+def _team_out(team, synced: set[str]) -> TeamOut:
+    return TeamOut(
+        id=team.team_id,
+        name=team.name,
+        is_default=team.is_default,
+        archived=team.archived_at is not None,
+        synced=team.team_id in synced,
+    )
+
+
+def _team_detail(session: Session, team, synced: set[str]) -> TeamDetail:
+    return TeamDetail(
+        **_team_out(team, synced).model_dump(),
+        members=[
+            TeamMemberOut(
+                user_id=user.user_id,
+                username=user.username,
+                display_name=(user.full_name or "").strip() or None,
+            )
+            for user in teams.members_of(session, team.team_id)
+        ],
+    )
+
+
+@router.get("/teams", response_model=list[TeamOut])
+def list_teams(
+    current_user: Annotated[User, Depends(get_current_user)],
+    session: UnitOfWorkSession,
+):
+    """Every team, archived included (users.read)."""
+    with _denials(current_user, "team.list"):
+        deny_unless(current_user.user_id, "users.read")
+    synced = teams.mapped_team_ids(session)
+    return [_team_out(team, synced) for team in teams.list_teams(session)]
+
+
+@router.post("/teams", response_model=TeamOut, status_code=status.HTTP_201_CREATED)
+def create_team(
+    body: TeamName,
+    current_user: Annotated[User, Depends(get_current_user)],
+    session: UnitOfWorkSession,
+):
+    """Create a team (teams.manage)."""
+    with _denials(current_user, "team.create"):
+        deny_unless(current_user.user_id, "teams.manage")
+    return _team_out(
+        teams.create_team(session, body.name, actor=current_user.principal_id),
+        teams.mapped_team_ids(session),
+    )
+
+
+@router.get("/teams/{team_id}", response_model=TeamDetail)
+def get_team(
+    team_id: str,
+    current_user: Annotated[User, Depends(get_current_user)],
+    session: UnitOfWorkSession,
+):
+    """One team and its members (users.read)."""
+    with _denials(current_user, "team.read"):
+        deny_unless(current_user.user_id, "users.read")
+    team = session.get(Team, team_id)
+    if team is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Team not found"
+        )
+    return _team_detail(session, team, teams.mapped_team_ids(session))
+
+
+@router.post("/teams/{team_id}/rename", response_model=TeamOut)
+def rename_team(
+    team_id: str,
+    body: TeamName,
+    current_user: Annotated[User, Depends(get_current_user)],
+    session: UnitOfWorkSession,
+):
+    """Rename a team, archived names included in the uniqueness check (teams.manage)."""
+    with _denials(current_user, "team.rename"):
+        deny_unless(current_user.user_id, "teams.manage")
+    return _team_out(
+        teams.rename_team(session, team_id, body.name, actor=current_user.principal_id),
+        teams.mapped_team_ids(session),
+    )
+
+
+@router.post("/teams/{team_id}/archive", response_model=TeamOut)
+def archive_team(
+    team_id: str,
+    current_user: Annotated[User, Depends(get_current_user)],
+    session: UnitOfWorkSession,
+):
+    """Archive a team once every case on it is closed. The default team cannot be."""
+    with _denials(current_user, "team.archive"):
+        deny_unless(current_user.user_id, "teams.manage")
+    return _team_out(
+        teams.archive_team(session, team_id, actor=current_user.principal_id),
+        teams.mapped_team_ids(session),
+    )
+
+
+@router.post("/teams/{team_id}/unarchive", response_model=TeamOut)
+def unarchive_team(
+    team_id: str,
+    current_user: Annotated[User, Depends(get_current_user)],
+    session: UnitOfWorkSession,
+):
+    """Bring an archived team back (teams.manage)."""
+    with _denials(current_user, "team.unarchive"):
+        deny_unless(current_user.user_id, "teams.manage")
+    return _team_out(
+        teams.unarchive_team(session, team_id, actor=current_user.principal_id),
+        teams.mapped_team_ids(session),
+    )
+
+
+@router.post(
+    "/teams/{team_id}/members",
+    response_model=TeamDetail,
+    status_code=status.HTTP_201_CREATED,
+)
+def add_team_member(
+    team_id: str,
+    body: TeamMemberAdd,
+    current_user: Annotated[User, Depends(get_current_user)],
+    session: UnitOfWorkSession,
+):
+    """Add a person to a team. An archived team accepts no one (teams.manage)."""
+    with _denials(current_user, "team.member_add"):
+        deny_unless(current_user.user_id, "teams.manage")
+    teams.add_member(
+        session,
+        team_id,
+        body.user_id,
+        actor=current_user.principal_id,
+        direct=_person_direct(session, current_user),
+    )
+    return _team_detail(
+        session, session.get(Team, team_id), teams.mapped_team_ids(session)
+    )
+
+
+@router.delete("/teams/{team_id}/members/{user_id}", response_model=TeamMemberRemoved)
+def remove_team_member(
+    team_id: str,
+    user_id: str,
+    current_user: Annotated[User, Depends(get_current_user)],
+    session: UnitOfWorkSession,
+):
+    """Remove a person from a team (teams.manage)."""
+    with _denials(current_user, "team.member_remove"):
+        deny_unless(current_user.user_id, "teams.manage")
+    warning = teams.remove_member(
+        session, team_id, user_id, actor=current_user.principal_id
+    )
+    return TeamMemberRemoved(user_id=user_id, warning=warning)
+
+
+# --- Directory sync: pushes waiting for a link, a window of sync deactivations ---
+
+
+class PendingHolder(BaseModel):
+    user_id: str
+    username: str
+    full_name: Optional[str] = None
+
+
+class PendingPush(BaseModel):
+    """A pushed person whose username or email an existing account holds."""
+
+    pending_id: str
+    external_id: str
+    username: str
+    email: str
+    display_name: Optional[str] = None
+    received_at: IsoDateTime
+    # The accounts holding that username or email: the likely link.
+    holders: list[PendingHolder]
+
+
+class PendingPushes(BaseModel):
+    sync_enabled: bool
+    pending: list[PendingPush]
+
+
+class LinkRequest(BaseModel):
+    user_id: str
+
+
+class SyncWindow(BaseModel):
+    since: datetime
+    until: datetime
+
+
+class SyncWindowCount(BaseModel):
+    # Accounts deactivated by sync in the window that would come back.
+    count: int
+    # Of those, the ones whose role grants something the caller lacks.
+    skipped: int
+
+
+class SyncWindowResult(BaseModel):
+    reactivated: int
+    skipped: int
+
+
+def _naive_utc(value: datetime) -> datetime:
+    if value.tzinfo is not None:
+        value = value.astimezone(timezone.utc).replace(tzinfo=None)
+    return value
+
+
+@router.get("/sync/pending", response_model=PendingPushes)
+def list_pending_pushes(
+    current_user: Annotated[User, Depends(get_current_user)],
+    session: UnitOfWorkSession,
+):
+    """Pushes refused because their username or email is in use, oldest first."""
+    with _denials(current_user, "directory.pending_list"):
+        deny_unless(current_user.user_id, "users.read")
+    rows = session.query(DirectoryPending).order_by(DirectoryPending.received_at).all()
+    out = []
+    for row in rows:
+        names = {fold(row.username), fold(row.email)}
+        holders = (
+            _not_deleted(session.query(User))
+            .filter(
+                User.service_account.isnot(True),
+                or_(
+                    sql_fold(User.username).in_(names),
+                    sql_fold(User.email).in_(names),
+                ),
+            )
+            .order_by(User.username)
+            .all()
+        )
+        out.append(
+            PendingPush(
+                pending_id=row.pending_id,
+                external_id=row.external_id,
+                username=row.username,
+                email=row.email,
+                display_name=row.display_name,
+                received_at=row.received_at,
+                holders=[
+                    PendingHolder(
+                        user_id=u.user_id, username=u.username, full_name=u.full_name
+                    )
+                    for u in holders
+                    if not _is_erased(u)
+                ],
+            )
+        )
+    settings = sso_settings.read_row(session)[0].settings
+    return PendingPushes(sync_enabled=settings.sync_enabled, pending=out)
+
+
+def _refuse(detail: str, code: int = status.HTTP_409_CONFLICT) -> None:
+    raise HTTPException(status_code=code, detail=detail)
+
+
+@router.post("/sync/pending/{pending_id}/link", dependencies=[_step_up("users.write")])
+def link_pending_push(
+    pending_id: str,
+    body: LinkRequest,
+    current_user: Annotated[User, Depends(get_current_user)],
+    session: UnitOfWorkSession,
+):
+    """Attach one waiting push to one existing person account. The provider's
+    next retry matches the link and takes the account over. The password stays."""
+    with _denials(current_user, "directory.link"):
+        deny_unless(current_user.user_id, "users.write")
+        pending = session.get(DirectoryPending, pending_id)
+        if pending is None:
+            _refuse("That push is no longer waiting", status.HTTP_404_NOT_FOUND)
+        user = _live_user(session, body.user_id)
+        _refuse_erased(user)
+        if not _is_person_account(user, session):
+            _refuse("A service account can't take a directory link")
+        if user.break_glass_at is not None:
+            _refuse("Remove the break-glass mark at the host first")
+        _require_privileges_cover_target(current_user, user, session, action="link")
+        issuer = sso_settings.read_row(session)[0].settings.issuer
+        if not issuer:
+            _refuse("Single sign-on has no issuer")
+        external_id = pending.external_id
+        held = sso.linked_by_directory(session, issuer, external_id) or sso.linked(
+            session, issuer, external_id
+        )
+        if held is not None and held.principal_id != user.principal_id:
+            _refuse("Another account already holds this directory id")
+        link = (
+            session.query(SsoLink)
+            .filter(SsoLink.principal_id == user.principal_id, SsoLink.issuer == issuer)
+            .first()
+        )
+        if link is not None and link.directory_id not in (None, external_id):
+            _refuse("This account is already linked to a different directory id")
+    if link is None:
+        # The subject is a placeholder until the first real sign-in adopts it.
+        link = sso.link(session, user.principal_id, issuer, external_id)
+    link.directory_id = external_id
+    link.managed = True
+    session.delete(pending)
+    session.flush()
+    trail_events.record(
+        session,
+        "directory.linked",
+        actor=current_user.principal_id,
+        principal=user.principal_id,
+        external_id=external_id,
+    )
+    # No mapping pass here: the account has no pushed groups yet, so it would
+    # fall to the default role. The provider's group push applies the mapping.
+    logger.info(f"Directory push linked by {current_user.username}: {user.username}")
+    return _dump_accounts(session, [user])[0]
+
+
+def _sync_window(
+    session: Session, current_user: User, window: SyncWindow, write: bool
+) -> tuple[list[User], int]:
+    """Accounts sync deactivated in the window that the caller may bring back,
+    and how many it may not. ``write`` brings them back."""
+    since, until = _naive_utc(window.since), _naive_utc(window.until)
+    if until < since:
+        _refuse("The window ends before it starts", status.HTTP_400_BAD_REQUEST)
+    rows = (
+        _not_deleted(session.query(User))
+        .filter(
+            User.is_active.is_(False),
+            User.deactivation_route == "sync",
+            User.deactivated_at >= since,
+            User.deactivated_at <= until,
+        )
+        .order_by(User.user_id)
+        .all()
+    )
+    back, skipped = [], 0
+    for user in rows:
+        if _is_erased(user):
+            continue
+        role = session.get(Role, user.role_id)
+        try:
+            # The per-account checks reactivate_user makes.
+            _require_privileges_cover_target(
+                current_user, user, session, action="reactivate"
+            )
+            _refuse_machine_widening(
+                current_user, session, None, role.permissions if role else {}
+            )
+        except HTTPException:
+            skipped += 1
+            continue
+        back.append(user)
+        if not write:
+            continue
+        user.is_active = True
+        clear_deactivation(user)
+        user.dormancy_floor = utcnow()
+        clear_lock(user)
+        session.flush()
+        trail_events.record(
+            session,
+            "user.enabled",
+            actor=current_user.principal_id,
+            principal=user.principal_id,
+            window_since=since.isoformat() + "Z",
+            window_until=until.isoformat() + "Z",
+        )
+        teams.join_default_if_none(
+            session, user.principal_id, actor=current_user.principal_id
+        )
+    return back, skipped
+
+
+@router.get("/sync/window", response_model=SyncWindowCount)
+def count_sync_window(
+    current_user: Annotated[User, Depends(get_current_user)],
+    session: UnitOfWorkSession,
+    since: datetime = Query(...),
+    until: datetime = Query(...),
+):
+    """How many accounts a window reactivation would bring back. Changes nothing."""
+    with _denials(current_user, "directory.window_count"):
+        deny_unless(current_user.user_id, "users.write")
+    back, skipped = _sync_window(
+        session, current_user, SyncWindow(since=since, until=until), write=False
+    )
+    return SyncWindowCount(count=len(back) + skipped, skipped=skipped)
+
+
+@router.post(
+    "/sync/window",
+    response_model=SyncWindowResult,
+    dependencies=[_step_up("users.write")],
+)
+def reactivate_sync_window(
+    body: SyncWindow,
+    current_user: Annotated[User, Depends(get_current_user)],
+    session: UnitOfWorkSession,
+):
+    """Reactivate every account directory sync deactivated in the window. Other
+    routes stay deactivated, tokens stay revoked, nobody is sent a notice."""
+    with _denials(current_user, "directory.window_reactivate"):
+        deny_unless(current_user.user_id, "users.write")
+    back, skipped = _sync_window(session, current_user, body, write=True)
+    if back:
+        # Imported here: group_mapping imports this module.
+        from services.api import group_mapping
+
+        stored = sso_settings.read_row(session)[0]
+        group_mapping.apply_current(
+            session,
+            stored.settings,
+            {user.principal_id for user in back},
+            stored.version,
+        )
+    logger.info(
+        f"Sync window reactivated by {current_user.username}: {len(back)} back, "
+        f"{skipped} skipped"
+    )
+    return SyncWindowResult(reactivated=len(back), skipped=skipped)
 
 
 @router.get("/{user_id}")
@@ -609,6 +1538,16 @@ def _managed_sign_ins(
     return user
 
 
+def _sign_in_ended(actor: str, principal: str, sign_in: str, reason: str, note: str):
+    return dict(
+        actor=actor,
+        principal=principal,
+        sign_in=sign_in,
+        end_reason=reason,
+        note=note,
+    )
+
+
 def _end_as_admin(
     request: Request,
     session: Session,
@@ -617,20 +1556,31 @@ def _end_as_admin(
     note: str,
     reason: str = sign_ins.ENDED_BY_ADMIN,
 ) -> list[tuple[str, str]]:
-    """End these (sign-in id, principal id) pairs through ``sign_ins.end``, then
-    write an entry for each with the actor and the typed reason. Rows are locked
-    before the trail's lock, the order every path takes."""
+    """End these (sign-in id, principal id) pairs through ``sign_ins.end``.
+
+    With a trail, the ends commit first and each entry is appended or held, so
+    a refused insert leaves the sign-ins ended. Without one, both stay in the
+    request transaction. Rows are locked before the trail's lock on that path.
+    """
+    beside = {"source_ip": client_host(request)}
+    actor = current_user.principal_id
+    if trail_events.ready(session):
+        with unit_of_work() as own:
+            ended = [(sid, pid) for sid, pid in ids if sign_ins.end(sid, reason, own)]
+        for sid, pid in ended:
+            trail_events.safety(
+                "auth.sign_in_ended",
+                beside,
+                **_sign_in_ended(actor, pid, sid, reason, note),
+            )
+        return ended
     ended = [(sid, pid) for sid, pid in ids if sign_ins.end(sid, reason, session)]
     for sid, pid in ended:
         trail_events.record(
             session,
             "auth.sign_in_ended",
-            {"source_ip": client_host(request)},
-            actor=current_user.principal_id,
-            principal=pid,
-            sign_in=sid,
-            end_reason=reason,
-            note=note,
+            beside,
+            **_sign_in_ended(actor, pid, sid, reason, note),
         )
     return ended
 
@@ -719,14 +1669,12 @@ def end_everyones_sign_ins(
         body.reason,
         sign_ins.EVERYONE,
     )
-    trail_events.record(
-        session,
-        "auth.everyone_signed_out",
-        {"source_ip": client_host(request)},
-        actor=current_user.principal_id,
-        count=len(ended),
-        note=body.reason,
-    )
+    beside = {"source_ip": client_host(request)}
+    fields = dict(actor=current_user.principal_id, count=len(ended), note=body.reason)
+    if trail_events.ready(session):
+        trail_events.safety("auth.everyone_signed_out", beside, **fields)
+    else:
+        trail_events.record(session, "auth.everyone_signed_out", beside, **fields)
     here = False
     for principal_id in {pid for _, pid in ended} - {current_user.principal_id}:
         # People only: a service account or agent has nobody to tell.
@@ -793,12 +1741,160 @@ def end_user_sign_in(
     return sign_ins.EndedSignIns(ended=len(ended))
 
 
-class UnlockRequest(BaseModel):
-    """How the manager confirmed the person is who they say. Kept in the trail."""
+IdentityConfirmedBy = Literal[
+    "in_person", "video_call", "phone_call_back", "other_verified_channel"
+]
 
-    identity_confirmed_by: Literal[
-        "in_person", "video_call", "phone_call_back", "other_verified_channel"
-    ]
+
+class UnlockRequest(EndSignInsRequest):
+    """A typed reason and how the manager confirmed the person is who they say,
+    both kept. ``suspected_compromise`` also revokes the person's API tokens."""
+
+    identity_confirmed_by: IdentityConfirmedBy
+    suspected_compromise: bool = False
+
+
+class ResetLinkRequest(EndSignInsRequest):
+    """A typed reason, and a reset link emailed or copied to hand over. A copied
+    link needs how their identity was confirmed."""
+
+    channel: Literal["email", "copy"]
+    identity_confirmed_by: Optional[IdentityConfirmedBy] = None
+    suspected_compromise: bool = False
+
+
+class ResetLinkEntry(BaseModel):
+    link_id: str
+    channel: str
+    issued_by_name: Optional[str] = None
+    issued_at: IsoDateTime
+    expires_at: IsoDateTime
+
+
+class ResetLinkState(BaseModel):
+    """The person's open reset link, if any, and what Email needs first."""
+
+    reset_link: Optional[ResetLinkEntry] = None
+    email_missing: list[str]
+
+
+class ResetLinkIssued(BaseModel):
+    """``token`` and ``link`` come back once, for a copied link only; ``link`` is
+    empty when VIGIL_FRONTEND_URL isn't set and the console builds it."""
+
+    reset_link: ResetLinkEntry
+    token: Optional[str] = None
+    link: Optional[str] = None
+    tokens_revoked: int = 0
+
+
+class MfaResetRequest(EndSignInsRequest):
+    """A typed reason and how the person's identity was confirmed, both kept."""
+
+    identity_confirmed_by: IdentityConfirmedBy
+    suspected_compromise: bool = False
+
+
+class MfaResetResult(BaseModel):
+    ended: int
+    tokens_revoked: int = 0
+    # Set when the person is the last who can manage roles besides the caller.
+    warning: Optional[str] = None
+
+
+def _recovery_target(
+    current_user: User, session: Session, user_id: str, action: str
+) -> User:
+    """The account a recovery act is for: users.write over it, a role the caller
+    covers, a person's own act and never on themselves or a service account."""
+    deny_unless(current_user.user_id, "users.write")
+    user = _live_user(session, user_id)
+    if user.user_id == current_user.user_id or _account_is_locked(current_user):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=f"Ask another administrator to {action} this account",
+        )
+    if not _acts_as_person(current_user, session):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Recovering an account needs a person's own sign-in",
+        )
+    _require_privileges_cover_target(current_user, user, session, action=action)
+    if _is_service_account(user):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="A service account has no password or two-step sign-in to recover",
+        )
+    return user
+
+
+def _tell_of_recovery(
+    session: Session,
+    current_user: User,
+    user: User,
+    title: str,
+    to_person: str,
+    to_managers: str,
+) -> None:
+    """Once committed: the person, and every other holder of users.write but the
+    caller. Never the link: notices are emailed."""
+    # Read now: the rows are expired once the commit has happened.
+    about, actor = user.principal_id, current_user.principal_id
+    theirs = title.replace("Your", f"{user.username}'s")
+
+    def send() -> None:
+        notify(about, "account_recovery", title, to_person, priority="high")
+        for to in managers(about):
+            if to == actor:
+                continue
+            try:
+                notify(
+                    to,
+                    "account_recovery",
+                    theirs,
+                    to_managers,
+                    USERS_LINK,
+                    priority="high",
+                    about=about,
+                )
+            except Exception:  # noqa: BLE001 - the others are still told
+                logger.exception("could not send a recovery notice to %s", to)
+
+    when_committed(session, send)
+
+
+def _revoke_tokens(session: Session, current_user: User, user: User) -> int:
+    """Suspected compromise: every API token the person holds is revoked."""
+    revoked = 0
+    for credential in mcp_credential_service.list_for_user(
+        user.user_id, session=session
+    ):
+        if mcp_credential_service.revoke(credential.credential_id, session=session):
+            trail_events.record(
+                session,
+                "credential.revoked",
+                actor=current_user.principal_id,
+                principal=user.principal_id,
+                credential_id=credential.credential_id,
+                compromised=True,
+            )
+            revoked += 1
+    return revoked
+
+
+def _reset_entry(session: Session, row: AuthLink) -> ResetLinkEntry:
+    who = row.invited_by and (
+        session.query(User.full_name, User.username)
+        .filter(User.principal_id == row.invited_by)
+        .first()
+    )
+    return ResetLinkEntry(
+        link_id=row.link_id,
+        channel=row.channel or "",
+        issued_by_name=(who and (who.full_name or who.username)) or None,
+        issued_at=row.issued_at,
+        expires_at=row.expires_at,
+    )
 
 
 @router.post("/{user_id}/unlock")
@@ -809,9 +1905,10 @@ def unlock_user(
     current_user: Annotated[User, Depends(get_current_user)],
     session: UnitOfWorkSession,
 ):
-    """End a lock and the failure count. users.write over the account, a role the
-    caller covers, and a person's own act, not a playbook's. A lock ends no
-    sign-in, so a locked caller's open session may not unlock anyone, itself included.
+    """End a lock, the failure count and the person's open sign-ins, with a typed
+    reason. users.write over the account, a role the caller covers, and a person's
+    own act, not a playbook's. A lock ends no sign-in, so a locked caller's open
+    session may not unlock anyone, itself included.
     """
     with _denials(current_user, "user.unlock"):
         deny_unless(current_user.user_id, "users.write")
@@ -840,80 +1937,348 @@ def unlock_user(
         actor=current_user.principal_id,
         principal=user.principal_id,
         identity_confirmed_by=body.identity_confirmed_by,
+        suspected_compromise=body.suspected_compromise or None,
+        note=body.reason,
+    )
+    _end_as_admin(
+        request,
+        session,
+        current_user,
+        sign_ins.open_ids(session, user.principal_id),
+        body.reason,
+    )
+    if body.suspected_compromise:
+        _revoke_tokens(session, current_user, user)
+    who = current_user.full_name or current_user.username
+    _tell_of_recovery(
+        session,
+        current_user,
+        user,
+        "Your account was unlocked",
+        with_dispute(
+            user.principal_id,
+            f"{who} unlocked your account and ended your sign-ins. "
+            "If you didn't ask for this, tell an admin now.",
+            "If you didn't ask for this, tell an admin now.",
+            session,
+        ),
+        f"{who} unlocked {user.username}'s account and ended their sign-ins.",
     )
     return _dump_accounts(session, [user])[0]
 
 
-@router.post(
-    "/", status_code=status.HTTP_201_CREATED, dependencies=[_step_up("users.write")]
-)
-def create_user(
-    request: CreateUserRequest,
+@router.get("/{user_id}/reset-link", response_model=ResetLinkState)
+def get_reset_link(
+    user_id: str,
     current_user: Annotated[User, Depends(get_current_user)],
     session: UnitOfWorkSession,
 ):
-    """
-    Create a new user (requires users.write permission).
-
-    Args:
-        request: User creation details
-        current_user: Current authenticated user
-        session: Database session
-
-    Returns:
-        Created user information
-    """
-    with _denials(current_user, "user.create"):
+    """The person's open reset link, never its value. users.write over the account."""
+    with _denials(current_user, "user.reset_link.read"):
         deny_unless(current_user.user_id, "users.write")
-        return _create_user(request, current_user, session)
-
-
-def _create_user(request: CreateUserRequest, current_user: User, session: Session):
-    # Check permission
-    deny_unless(current_user.user_id, "users.write")
-
-    # Validate password against the full strength policy. Penalize passwords
-    # built from the new account's own identifiers.
-    try:
-        validate_password_strength(
-            request.password,
-            user_inputs=[request.username, request.email],
+        user = _live_user(session, user_id)
+        _require_privileges_cover_target(
+            current_user, user, session, action="see the reset link of"
         )
-    except PasswordPolicyError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=exc.as_detail(),
-        )
-
-    # Verify role exists
-    role = session.query(Role).filter(Role.role_id == request.role_id).first()
-    if not role:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid role ID"
-        )
-
-    _refuse_uncovered(
-        current_user, role.permissions, session, "Cannot assign this role"
-    )
-    # An account that holds a role is a widening.
-    _refuse_machine_widening(current_user, session, None, role.permissions)
-
-    # Create user
-    user = AuthService.create_user(
-        username=request.username,
-        email=request.email,
-        password=request.password,
-        full_name=request.full_name,
-        role_id=request.role_id,
-        session=session,
+    rows = invites.open_resets(session, user.principal_id)
+    for row in rows:
+        invites.note_expired(session, row)
+    live = next((r for r in rows if not invites.is_expired(r)), None)
+    return ResetLinkState(
+        reset_link=live and _reset_entry(session, live), email_missing=_email_missing()
     )
 
-    if not user:
+
+@router.post(
+    "/{user_id}/reset-link",
+    response_model=ResetLinkIssued,
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[_step_up("users.write")],
+)
+def issue_reset_link(
+    user_id: str,
+    request: Request,
+    body: ResetLinkRequest,
+    current_user: Annotated[User, Depends(get_current_user)],
+    session: UnitOfWorkSession,
+):
+    """A one-hour, single-use reset link for the person, replacing any open one,
+    and their open sign-ins ended, with a typed reason: emailed to their address,
+    or returned once to hand over. It never touches two-step sign-in. They and
+    the other holders of users.write are told."""
+    with _denials(current_user, "user.reset_link"):
+        user = _recovery_target(current_user, session, user_id, "reset the password of")
+        if not user.is_active:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="This account is deactivated. Reactivate it first.",
+            )
+        if sso.required():
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Single sign-on is required, so no reset links are issued",
+            )
+        if body.channel == invites.EMAIL and (missing := _email_missing()):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Email isn't available: set {' and '.join(missing)}, "
+                "or copy the link instead.",
+            )
+        if (
+            body.channel == invites.COPY or not user.is_verified
+        ) and not body.identity_confirmed_by:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=(
+                    "Say how you confirmed it is them before copying a link"
+                    if body.channel == invites.COPY
+                    else "A verification method is needed before emailing a "
+                    "reset link to an address that isn't confirmed yet"
+                ),
+            )
+    row, token = invites.issue_reset(
+        session,
+        user,
+        body.channel,
+        current_user.principal_id,
+        identity_confirmed_by=body.identity_confirmed_by,
+        suspected_compromise=body.suspected_compromise or None,
+        note=body.reason,
+    )
+    _end_as_admin(
+        request,
+        session,
+        current_user,
+        sign_ins.open_ids(session, user.principal_id),
+        body.reason,
+    )
+    revoked = (
+        _revoke_tokens(session, current_user, user) if body.suspected_compromise else 0
+    )
+    base = get_settings().vigil_frontend_url.strip()
+    who = current_user.full_name or current_user.username
+    if body.channel == invites.EMAIL:
+        link, to = reset_link(base, token), user.email
+        mailed = with_dispute(
+            user.principal_id,
+            "If you weren't expecting this, tell an administrator.",
+            "If you weren't expecting this, tell an administrator.",
+            session,
+        )
+        when_committed(
+            session,
+            lambda: send_email(
+                to=to,
+                subject="Vigil SOC — password reset",
+                body=(
+                    f"{who} sent you a link to choose a new password.\n\n"
+                    "It is valid for one hour and can only be used once.\n\n"
+                    f"{link}\n\n"
+                    f"{mailed}"
+                ),
+            ),
+        )
+    how = "emailed you" if body.channel == invites.EMAIL else "made"
+    _tell_of_recovery(
+        session,
+        current_user,
+        user,
+        "Your password reset link",
+        with_dispute(
+            user.principal_id,
+            f"{who} {how} a link to reset your password and ended your sign-ins. "
+            "It works once, for one hour. If you didn't ask for this, tell an admin now.",
+            "If you didn't ask for this, tell an admin now.",
+            session,
+        ),
+        f"{who} issued a password reset link for {user.username} and ended their "
+        f"sign-ins{' and revoked their API tokens' if revoked else ''}.",
+    )
+    entry = _reset_entry(session, row)
+    if body.channel == invites.EMAIL:
+        return ResetLinkIssued(reset_link=entry, tokens_revoked=revoked)
+    return ResetLinkIssued(
+        reset_link=entry,
+        token=token,
+        link=reset_link(base, token) if base else None,
+        tokens_revoked=revoked,
+    )
+
+
+@router.delete("/{user_id}/reset-link", dependencies=[_step_up("users.write")])
+def revoke_reset_link(
+    user_id: str,
+    current_user: Annotated[User, Depends(get_current_user)],
+    session: UnitOfWorkSession,
+):
+    """Cancel the person's open reset link; it stops working."""
+    with _denials(current_user, "user.reset_link.revoke"):
+        user = _recovery_target(
+            current_user, session, user_id, "revoke the reset link of"
+        )
+    if not invites.revoke_resets(
+        session, user.principal_id, current_user.principal_id, "revoked"
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="No open reset link"
+        )
+    return {"message": "Reset link revoked"}
+
+
+@router.post(
+    "/{user_id}/mfa/reset",
+    response_model=MfaResetResult,
+    dependencies=[_step_up("users.write")],
+)
+def reset_user_mfa(
+    user_id: str,
+    request: Request,
+    body: MfaResetRequest,
+    current_user: Annotated[User, Depends(get_current_user)],
+    session: UnitOfWorkSession,
+):
+    """Remove every two-step method the person has (the authenticator app,
+    security keys, recovery codes) and end their sign-ins, with a typed reason.
+    Exempt from the last-manager guard: it warns instead. The MFA requirement
+    asks them to set it up again at their next sign-in."""
+    with _denials(current_user, "user.mfa_reset"):
+        user = _recovery_target(
+            current_user, session, user_id, "reset two-step sign-in for"
+        )
+    user = AuthService._lock_user(session, user.user_id)
+    if not (
+        user.mfa_enabled
+        or user.mfa_secret
+        or user.mfa_recovery_codes
+        or security_keys.has_keys(session, user.principal_id)
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="They have no two-step sign-in to reset",
+        )
+    AuthService.clear_mfa(user)
+    keys = security_keys.remove_all(session, user.principal_id)
+    trail_events.record(
+        session,
+        "auth.mfa_reset",
+        {"source_ip": client_host(request)},
+        actor=current_user.principal_id,
+        principal=user.principal_id,
+        identity_confirmed_by=body.identity_confirmed_by,
+        security_keys=keys,
+        suspected_compromise=body.suspected_compromise or None,
+        note=body.reason,
+    )
+    ended = _end_as_admin(
+        request,
+        session,
+        current_user,
+        sign_ins.open_ids(session, user.principal_id),
+        body.reason,
+        sign_ins.MFA_RESET,
+    )
+    revoked = (
+        _revoke_tokens(session, current_user, user) if body.suspected_compromise else 0
+    )
+    warning = None
+    held = {u.user_id for u in _manager_accounts(session)}
+    if user.user_id in held and not held - {user.user_id, current_user.user_id}:
+        warning = (
+            f"{user.username} is the only other person who can manage roles. "
+            "They must set up two-step sign-in again at their next sign-in."
+        )
+    who = current_user.full_name or current_user.username
+    _tell_of_recovery(
+        session,
+        current_user,
+        user,
+        "Your two-step sign-in was reset",
+        with_dispute(
+            user.principal_id,
+            f"{who} removed your two-step sign-in methods and recovery codes, and "
+            "ended your sign-ins. Set two-step sign-in up again when you next sign "
+            "in. If you didn't ask for this, tell an admin now.",
+            "If you didn't ask for this, tell an admin now.",
+            session,
+        ),
+        f"{who} reset {user.username}'s two-step sign-in and ended their sign-ins"
+        f"{' and revoked their API tokens' if revoked else ''}.",
+    )
+    return MfaResetResult(ended=len(ended), tokens_revoked=revoked, warning=warning)
+
+
+@router.post(
+    "/service-accounts",
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[_step_up("users.write")],
+)
+def create_service_account(
+    request: CreateServiceAccountRequest,
+    current_user: Annotated[User, Depends(get_current_user)],
+    session: UnitOfWorkSession,
+):
+    """Create a service account: no password, no MFA, signed in by token only.
+    users.write, a person's own act, and a role the caller covers; a role holding
+    audit.read needs audit.forward too. Tokens are minted on /api/tokens."""
+    with _denials(current_user, "user.create_service_account"):
+        deny_unless(current_user.user_id, "users.write")
+        if not _acts_as_person(current_user, session):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Creating a service account needs a person's own sign-in",
+            )
+        role = session.get(Role, request.role_id)
+        if role is None:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid role ID"
+            )
+        _refuse_uncovered(
+            current_user, role.permissions, session, "Cannot assign this role"
+        )
+        if "audit.read" in _granted(role.permissions):
+            _refuse_audit_read_to_machine(current_user, session)
+    person = _accountable_person(session, request.accountable)
+    name, email = request.name, f"{request.name}@service.invalid"
+    # medic-* is Medic's: the enable flow names and retires accounts of that kind.
+    if name.startswith("medic-"):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Username or email already exists",
+            detail="That name is reserved for Medic's account",
         )
-
+    if name == directory_sync.USERNAME or role.role_id == directory_sync.ROLE_ID:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="That account is directory sync's and can't be created here",
+        )
+    if directory_sync.PERMISSION in _granted(role.permissions):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="directory.sync is held only by directory sync and can't be granted",
+        )
+    claim_sign_in_names(session, name, email)
+    for value in (name, email):
+        held = identifier_in_use(session, value)
+        if held:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=_held_detail(value, held, "Username or email already exists"),
+            )
+    user = User(
+        user_id=f"user-{uuid.uuid4().hex[:12]}",
+        username=name,
+        email=email,
+        password_hash=None,
+        full_name=name,
+        role_id=role.role_id,
+        is_active=True,
+        is_verified=True,
+        service_account=True,
+        purpose=request.purpose,
+        accountable_principal_id=person.principal_id,
+    )
+    principals.add_for_user(session, user)
+    session.add(user)
+    session.flush()
     trail_events.record(
         session,
         "user.created",
@@ -921,19 +2286,127 @@ def _create_user(request: CreateUserRequest, current_user: User, session: Sessio
         actor=current_user.principal_id,
         principal=user.principal_id,
         role_id=user.role_id,
+        service_account=True,
+        accountable=person.principal_id,
     )
-    logger.info(f"User created by {current_user.username}: {user.username}")
-    return UserSchema.dump(user)
+    logger.info(f"Service account created by {current_user.username}: {name}")
+    return _dump_accounts(session, [user])[0]
 
 
-def _disable_alone(user_id: str, actor: str, by_person: bool) -> list[str]:
+def _accountable_person(session: Session, user_id: str) -> User:
+    """An active person who is not deleted, erased or a service account."""
+    person = _not_deleted(session.query(User)).filter(User.user_id == user_id).first()
+    if (
+        person is None
+        or not person.is_active
+        or _is_erased(person)
+        or not _is_person_account(person, session)
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="The accountable person must be an active person, not a service account",
+        )
+    return person
+
+
+@router.put(
+    "/service-accounts/{user_id}/accountable",
+    dependencies=[_step_up("users.write")],
+)
+def reassign_service_account(
+    user_id: str,
+    body: ReassignRequest,
+    current_user: Annotated[User, Depends(get_current_user)],
+    session: UnitOfWorkSession,
+):
+    """Name another person accountable for a service account. users.write over the
+    account, and a person's own act; recorded in the trail."""
+    with _denials(current_user, "user.reassign_service_account"):
+        deny_unless(current_user.user_id, "users.write")
+        if not _acts_as_person(current_user, session):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Reassigning needs a person's own sign-in",
+            )
+        user = _live_user(session, user_id)
+        if not _is_service_account(user) or _is_medic(user):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Only a service account made on this screen has an accountable person",
+            )
+        _require_privileges_cover_target(current_user, user, session, action="reassign")
+    person = _accountable_person(session, body.accountable)
+    previous = user.accountable_principal_id
+    user.accountable_principal_id = person.principal_id
+    session.flush()
+    trail_events.record(
+        session,
+        "user.accountable_changed",
+        actor=current_user.principal_id,
+        principal=user.principal_id,
+        accountable=person.principal_id,
+        previous_accountable=previous,
+    )
+    who = current_user.full_name or current_user.username
+    when_committed(
+        session,
+        lambda: notify(
+            person.principal_id,
+            "service_account",
+            "You are accountable for a service account",
+            f"{who} made you accountable for the service account {user.username}.",
+            link="/settings?section=users",
+        ),
+    )
+    logger.info(
+        f"Service account reassigned by {current_user.username}: {user.username}"
+    )
+    return _dump_accounts(session, [user])[0]
+
+
+def _disable_alone(
+    user_id: str, actor: str, by_person: bool
+) -> tuple[list[str], list[str]]:
     """Commit a disable on its own: it stands whatever else the request does.
-    Returns the credentials it revoked, for the caller to put on the trail."""
+    Returns the credentials and reset links it revoked, for the caller's trail."""
     with unit_of_work() as session:
         user = session.get(User, user_id)
-        return deactivate_account(
-            session, user, actor=actor, by_person=by_person, record_trail=False
+        revoked = deactivate_account(
+            session,
+            user,
+            actor=actor,
+            by_person=by_person,
+            record_trail=False,
+            route="person",
         )
+        links = invites.revoke_resets(
+            session, user.principal_id, actor, "deactivated", record=False
+        )
+        return revoked, links
+
+
+def _profile_sent(request: UpdateUserRequest) -> bool:
+    """A profile field in the body, changed or not. That request is not a demotion."""
+    return bool({"full_name", "email"} & request.model_fields_set)
+
+
+def _strictly_narrower(change: Optional[tuple]) -> bool:
+    """The new role drops at least one permission and adds none."""
+    if change is None:
+        return False
+    before, after = set(change[0]), set(change[1])
+    return after < before
+
+
+def _commit_narrowing(user_id: str, role_id: str) -> dict:
+    """The demotion and the sign-ins it ends, committed together."""
+    with unit_of_work() as own:
+        user = own.get(User, user_id)
+        user.role_id = role_id
+        own.flush()
+        sign_ins.end_all_for_user(user.user_id, sign_ins.ACCOUNT_CHANGED, own)
+        own.refresh(user)
+        return UserSchema.dump(user)
 
 
 def _apply_user_update(
@@ -946,7 +2419,7 @@ def _apply_user_update(
     user = _live_user(session, user_id)
     _require_privileges_cover_target(current_user, user, session, action="update")
 
-    if request.email is not None and request.email.casefold() != user.email.casefold():
+    if request.email is not None and fold(request.email) != fold(user.email):
         if _is_service_account(user):
             # A reachable address is the first step to a password reset.
             raise HTTPException(
@@ -968,6 +2441,10 @@ def _apply_user_update(
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid role ID"
             )
+        if role.role_id == directory_sync.ROLE_ID and role.role_id != user.role_id:
+            _refuse_sync_role(role.role_id)
+        if user.role_id == directory_sync.ROLE_ID and role.role_id != user.role_id:
+            _refuse_sync_role(user.role_id)
         _refuse_uncovered(
             current_user, role.permissions, session, "Cannot assign this role"
         )
@@ -993,6 +2470,30 @@ def _apply_user_update(
         )
 
     actor, principal = current_user.principal_id, user.principal_id
+    # A pure demotion commits on its own and is recorded, or held. The same
+    # grants, any grant added, or a profile field in the body stays in this
+    # transaction, so a trail failure changes nothing.
+    if (
+        _strictly_narrower(permission_change)
+        and not _profile_sent(request)
+        and trail_events.ready(session)
+    ):
+        previous = user.role_id
+        payload = _commit_narrowing(user.user_id, request.role_id)
+        before, after = permission_change
+        trail_events.safety(
+            "user.role_changed",
+            actor=actor,
+            principal=principal,
+            role_id=request.role_id,
+            previous_role_id=previous,
+            permissions_before=before,
+            permissions_after=after,
+        )
+        session.refresh(user)
+        # Sign-ins already ended in that transaction. No per-sign-in entries.
+        return user, None, payload
+
     entries = []
     stale_reason = None
     changed = []
@@ -1071,7 +2572,8 @@ async def update_user(
 
         # Sign the user out everywhere so their next session carries the new
         # email or role, not the claims and permissions cached at login. In
-        # this transaction: the change does not commit without it.
+        # this transaction: the change does not commit without it. A pure
+        # demotion already ended them in the transaction that committed it.
         if stale_reason:
             await asyncio.to_thread(
                 sign_ins.end_all_for_user,
@@ -1131,7 +2633,7 @@ def deactivate_user(
     # A safety action: committed on its own and recorded, or held to record
     # late, so a trail failure leaves it in place.
     if trail_events.ready(session):
-        revoked = _disable_alone(user_id, actor, by_person)
+        revoked, links = _disable_alone(user_id, actor, by_person)
         trail_events.safety("user.disabled", actor=actor, principal=principal)
         for credential_id in revoked:
             trail_events.safety(
@@ -1140,9 +2642,19 @@ def deactivate_user(
                 principal=principal,
                 credential_id=credential_id,
             )
+        for link_id in links:
+            trail_events.safety(
+                "reset.revoked",
+                actor=actor,
+                principal=principal,
+                link_id=link_id,
+                reason="deactivated",
+            )
         session.refresh(user)
     else:
-        deactivate_account(session, user, actor=actor, by_person=by_person)
+        deactivate_account(
+            session, user, actor=actor, by_person=by_person, route="person"
+        )
     logger.info(f"User deactivated by {current_user.username}: {user.username}")
     return _dump_accounts(session, [user])[0]
 
@@ -1172,6 +2684,7 @@ def reactivate_user(
             current_user, session, None, role.permissions if role else {}
         )
     user.is_active = True
+    clear_deactivation(user)
     # Back in use: the idle clock starts again and a lock ends.
     user.dormancy_floor = utcnow()
     clear_lock(user)
@@ -1182,14 +2695,23 @@ def reactivate_user(
         actor=current_user.principal_id,
         principal=user.principal_id,
     )
+    # Someone already deactivated at the upgrade has no team. Joining is recorded.
+    teams.join_default_if_none(
+        session, user.principal_id, actor=current_user.principal_id
+    )
     who = current_user.full_name or current_user.username
     _tell_person(
         session,
         user,
         "account_reactivated",
         "Your account was reactivated",
-        f"{who} reactivated your account. Sign in with your password and two-step "
-        "sign-in as before. MCP tokens from before stay revoked: mint new ones.",
+        with_dispute(
+            user.principal_id,
+            f"{who} reactivated your account. Sign in with your password and two-step "
+            "sign-in as before. MCP tokens from before stay revoked: mint new ones.",
+            "",
+            session,
+        ),
     )
     logger.info(f"User reactivated by {current_user.username}: {user.username}")
     entry = _dump_accounts(session, [user])[0]
@@ -1251,11 +2773,120 @@ def restore_user(
         user,
         "account_restored",
         "Your account was restored",
-        f"{who} restored your deleted account. It stays deactivated until an "
-        "administrator reactivates it; MCP tokens from before stay revoked.",
+        with_dispute(
+            user.principal_id,
+            f"{who} restored your deleted account. It stays deactivated until an "
+            "administrator reactivates it; MCP tokens from before stay revoked.",
+            "",
+            session,
+        ),
     )
     logger.info(f"User restored by {current_user.username}: {user.username}")
     return _dump_accounts(session, [user])[0]
+
+
+def _unused_sync(session: Session, users: list[User]) -> set[str]:
+    """The user ids, of ``users``, a provider pushed that nobody has used: a
+    managed link, no sign-in, and no case or task, open or closed, names them."""
+    ids = {
+        pid
+        for (pid,) in session.query(SsoLink.principal_id).filter(
+            SsoLink.principal_id.in_([u.principal_id for u in users]),
+            SsoLink.managed.is_(True),
+        )
+    }
+    found = [u for u in users if u.principal_id in ids and not u.login_count]
+    names = [u.username for u in found]
+    if not names:
+        return set()
+    named = {
+        name
+        for model in (Case, CaseTask)
+        for (name,) in session.query(model.assignee)
+        .filter(model.assignee.in_(names))
+        .distinct()
+    }
+    return {u.user_id for u in found if u.username not in named}
+
+
+@router.post("/{user_id}/remove-unused", dependencies=[_step_up("users.delete")])
+def remove_unused_sync_account(
+    user_id: str,
+    current_user: Annotated[User, Depends(get_current_user)],
+    session: UnitOfWorkSession,
+):
+    """Remove an account a push created for the wrong person: its username and
+    email are freed, its link and pushed groups go, and it is deactivated. The
+    principal stays. The provider's next push creates a new account."""
+    with _denials(current_user, "user.remove_unused"):
+        deny_unless(current_user.user_id, "users.delete")
+        if not _acts_as_person(current_user, session):
+            _refuse(
+                "Removing an account needs a person's own sign-in",
+                status.HTTP_403_FORBIDDEN,
+            )
+        user = _live_user(session, user_id)
+        _refuse_erased(user)
+        _require_privileges_cover_target(current_user, user, session, action="remove")
+        link = (
+            session.query(SsoLink)
+            .filter(SsoLink.principal_id == user.principal_id)
+            .order_by(SsoLink.managed.desc())
+            .first()
+        )
+        if link is None or not link.managed:
+            _refuse("Only an account directory sync manages can be removed this way")
+        if user.login_count:
+            _refuse("This account has signed in, so it can't be removed this way")
+        if user.user_id not in _unused_sync(session, [user]):
+            _refuse("A case or task names this account, so it can't be removed")
+        if user.is_active:
+            _refuse_lockout(
+                current_user, session, users={user.user_id: (user.role_id, False)}
+            )
+    actor, principal = current_user.principal_id, user.principal_id
+    external_id = link.directory_id or link.subject
+    if user.is_active:
+        deactivate_account(session, user, actor=actor, by_person=True, route="person")
+    trail_events.record(
+        session,
+        "user.removed_unused",
+        actor=actor,
+        principal=principal,
+        external_id=external_id,
+    )
+    # A synced team refuses a hand remove, and the mapping no longer sees the
+    # account once its link goes: leave mapped teams first, as erasure does.
+    retention._leave_mapped_teams(session, principal, user.user_id)
+    for model in (SsoLink, DirectoryGroupMember):
+        session.query(model).filter(model.principal_id == principal).delete(
+            synchronize_session=False
+        )
+    session.flush()
+    retention.free_identifiers(session, principal)
+    session.expire(user)
+    logger.info(f"Unused directory account removed by {current_user.username}")
+    return _dump_accounts(session, [user])[0]
+
+
+def _delete_committed(user_id: str, actor: str, by_person: bool) -> None:
+    """Commit the delete, then append or hold every entry it wrote."""
+    with trail_events.capture() as entries:
+        with unit_of_work() as own:
+            user = own.get(User, user_id)
+            principals.mark_deleted(own, user.principal_id)
+            deactivate_account(
+                own,
+                user,
+                actor=actor,
+                by_person=by_person,
+                route="person",
+            )
+            trail_events.record(
+                own, "user.deleted", actor=actor, principal=user.principal_id
+            )
+    for action, beside, fields in entries:
+        trail_events.safety(action, beside, **fields)
 
 
 def _delete_user(session: Session, current_user: User, user_id: str) -> User:
@@ -1273,14 +2904,22 @@ def _delete_user(session: Session, current_user: User, user_id: str) -> User:
     _refuse_lockout(current_user, session, users={user.user_id: (user.role_id, False)})
 
     actor = current_user.principal_id
+    by_person = _acts_as_person(current_user, session)
+    if trail_events.ready(session):
+        # Every entry the delete writes (revoked credentials and reset links
+        # included) is held until the delete has committed.
+        _delete_committed(user_id, actor, by_person)
+        session.expire(user)
+        return user
     principals.mark_deleted(session, user.principal_id)
     deactivate_account(
         session,
         user,
         actor=actor,
-        by_person=_acts_as_person(current_user, session),
+        by_person=by_person,
+        route="person",
     )
-    # In this transaction: the delete does not happen without its entries.
+    # No trail yet: the delete and its entries commit with the request.
     trail_events.record(
         session, "user.deleted", actor=actor, principal=user.principal_id
     )
@@ -1343,6 +2982,8 @@ def list_roles(
             "presets": [{"key": key, **preset} for key, preset in PRESETS.items()],
             "permissions": sorted(KNOWN_PERMISSIONS),
             "platform_equivalent": sorted(PLATFORM_EQUIVALENT),
+            "person_only": sorted(PERSON_ONLY),
+            "new_permissions_unheld": _new_permissions_unheld(roles),
             "nobody_can_manage_roles": _role_managers(session) == 0,
         }
 
@@ -1354,6 +2995,25 @@ def list_roles(
         )
 
 
+def _new_permissions_unheld(roles: list[Role]) -> list[str]:
+    """New-capability permissions no custom or legacy role holds.
+
+    Built-ins receive these by definition, so they never take one off the
+    list. A later catalog permission whose origin is a new capability appears
+    here with no other change.
+    """
+    held: set[str] = set()
+    for role in roles:
+        if role.role_id in CATALOG["builtins"]:
+            continue
+        for key, value in (role.permissions or {}).items():
+            if value is True:
+                held.add(key)
+    # directory.sync is a new capability no custom role may hold, so it is
+    # not a gap an admin can close.
+    return sorted(NEW_CAPABILITIES - held - {directory_sync.PERMISSION})
+
+
 def _role_entry(role: Role, holders: int) -> dict:
     entry = RoleSchema.dump(role)
     if role.role_id in CATALOG["builtins"]:
@@ -1362,6 +3022,7 @@ def _role_entry(role: Role, holders: int) -> dict:
         entry.update(kind="builtin", modified=bool(diff), diff=diff)
     else:
         entry["kind"] = "legacy" if role.role_id in LEGACY_ROLE_IDS else "custom"
+    entry["reserved"] = role.role_id == directory_sync.ROLE_ID
     entry["unrecognised"] = sorted(set(role.permissions or {}) - KNOWN_PERMISSIONS)
     entry["holders"] = holders
     return entry
@@ -1372,6 +3033,11 @@ def _require_permission(current_user: User, permission: str, session) -> None:
 
 
 def _known(permissions: dict) -> dict:
+    if directory_sync.PERMISSION in permissions:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="directory.sync is held only by directory sync and can't be granted",
+        )
     unknown = sorted(set(permissions) - KNOWN_PERMISSIONS)
     if unknown:
         raise HTTPException(
@@ -1400,6 +3066,14 @@ def _role_name(session: Session, name: str, role_id: Optional[str] = None) -> st
     return name
 
 
+def _refuse_sync_role(role_id: str) -> None:
+    if role_id == directory_sync.ROLE_ID:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="This role is directory sync's and can't be changed or granted",
+        )
+
+
 def _editable_role(session: Session, role_id: str) -> Role:
     role = session.get(Role, role_id)
     if role is None:
@@ -1410,6 +3084,7 @@ def _editable_role(session: Session, role_id: str) -> Role:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN, detail=BUILTIN_ROLE_REFUSED
         )
+    _refuse_sync_role(role.role_id)
     return role
 
 

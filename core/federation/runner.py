@@ -14,7 +14,9 @@ Design notes (locked decisions from MVP plan):
 * Per-source severity floor honored at ingest time (filter before enqueue).
 * "Poll now" is a Redis flag the loop checks each tick.
 * Live config changes (enable, interval, min_severity) are picked up on the
-  next tick — no daemon restart needed.
+  next tick — no daemon restart needed. The wait between polls is short
+  slices of ``idle_seconds``, re-reading the row each slice, so a shorter
+  interval applies without finishing the sleep the old interval started.
 """
 
 from __future__ import annotations
@@ -58,6 +60,8 @@ class FederationRunner:
         self._adapter_tasks: Dict[str, asyncio.Task] = {}
         # Set by the daemon: watch(name, task, shutdown_event) for /status loops.
         self.watch_loop: Optional[Callable[..., None]] = None
+        # Set by the daemon: counts one poll-loop pass on the poller's /health.
+        self.note_pass: Optional[Callable[[], None]] = None
         self._dedup: Dict[str, RedisDedupSet] = {}
         # Sources already warned about as unconfigured, so the warning is
         # logged on the transition rather than every tick.
@@ -92,14 +96,25 @@ class FederationRunner:
                 self.watch_loop(adapter.name, task, shutdown_event)
 
         if not self._adapter_tasks:
-            # No adapters at all — wait for shutdown.
-            await shutdown_event.wait()
+            # No poll loops to tick. Keep passing until shutdown so an idle
+            # poller is not read as hung. DataPoller.run does not tick.
+            while not shutdown_event.is_set():
+                self._tick_pass()
+                try:
+                    await asyncio.wait_for(shutdown_event.wait(), timeout=1.0)
+                    break
+                except asyncio.TimeoutError:
+                    pass
             return
 
         try:
             await asyncio.gather(*self._adapter_tasks.values(), return_exceptions=True)
         except asyncio.CancelledError:
             pass
+
+    def _tick_pass(self) -> None:
+        if self.note_pass is not None:
+            self.note_pass()
 
     def is_active_for(self, source_id: str) -> bool:
         """True if federation owns polling for ``source_id`` right now.
@@ -131,8 +146,15 @@ class FederationRunner:
         # Smallest sane sleep when waiting for global+per-source enable.
         idle_seconds = 5.0
         store_ok = True
+        # Start of the poll we're waiting out. The next one is due once the
+        # row's current interval, times the backoff latched at that start, has
+        # passed. None: no poll yet, so the first pass polls immediately.
+        poll_started: float | None = None
+        backoff_mult = 1
 
         while not shutdown_event.is_set():
+            # One pass, including the disabled idle continue below.
+            self._tick_pass()
             # Re-read DB state on every tick. Cheap enough at MVP cadence.
             try:
                 row = store.read_source(source_id) or {}
@@ -162,22 +184,27 @@ class FederationRunner:
                     continue
 
             interval = int(row.get("interval_seconds") or adapter.default_interval())
+            wait = max(interval * backoff_mult, 5)
+            elapsed = None if poll_started is None else time.monotonic() - poll_started
+            # Honor "poll now" — a redis flag the API sets when the user
+            # clicks the button. Checked each slice, same as the row.
+            poll_now = await self._consume_poll_now(source_id)
+            if elapsed is not None and elapsed < wait and not poll_now:
+                try:
+                    await asyncio.wait_for(
+                        shutdown_event.wait(),
+                        timeout=min(idle_seconds, wait - elapsed),
+                    )
+                    break
+                except asyncio.TimeoutError:
+                    continue
+
+            # Latch from the count before this poll. The failure it records is
+            # the next wait's multiplier, matching a sleep chosen before the poll.
             errors = int(row.get("consecutive_errors") or 0)
             backoff_mult = min(2**errors, 8) if errors else 1
-            sleep_for = max(interval * backoff_mult, 5)
-
-            # Honor "poll now" — a redis flag the API sets when the user
-            # clicks the button. We check it each tick rather than wait.
-            if await self._consume_poll_now(source_id):
-                sleep_for = 0
-
+            poll_started = time.monotonic()
             await self._do_one_tick(adapter, row)
-
-            try:
-                await asyncio.wait_for(shutdown_event.wait(), timeout=sleep_for)
-                break
-            except asyncio.TimeoutError:
-                continue
 
         logger.info("Federation adapter %s loop exited", source_id)
 
@@ -232,8 +259,10 @@ class FederationRunner:
 
         candidates = []
         dropped = result.dropped
+        filtered = 0
         for finding in result.findings:
             if not _severity_passes(finding.get("severity"), min_severity):
+                filtered += 1
                 continue
             ext = finding.get("external_id") or finding.get("finding_id")
             if ext:
@@ -292,7 +321,15 @@ class FederationRunner:
                 source_id,
                 prior_failures,
             )
-        store.record_success(source_id, cursor=result.cursor or {}, dropped=dropped)
+        store.record_success(
+            source_id,
+            cursor=result.cursor or {},
+            dropped=dropped,
+            received=new_count,
+            # The adapter's whole result, its pre-transform drops included.
+            returned=len(result.findings) + result.dropped,
+            filtered=filtered,
+        )
 
     async def _enqueue(
         self,

@@ -11,8 +11,12 @@ from __future__ import annotations
 import functools
 import importlib.util
 import logging
+import sys
+from contextlib import contextmanager
+from contextvars import ContextVar
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Any, Callable, Iterator, Optional
 
 from fastapi import Depends, Header, HTTPException, Request, status
 
@@ -24,7 +28,8 @@ from core.auth.current_user import get_current_user
 from core.auth.mcp_credential_service import looks_like_mcp_token
 from core.auth.tool_principal import current_claims
 from core.integrations.mcp.surface import current_caller
-from core.storage.models import User
+from core.storage import case_read_hook
+from core.storage.models import Case, TeamMembership, User
 from core.storage.unit_of_work import unit_of_work
 
 logger = logging.getLogger(__name__)
@@ -34,6 +39,8 @@ APPROVE_PERMISSION = "ai_decisions.approve"
 # pack). Seeded by 45_medic_permissions.sql; pinned by test_medic_route_matrix.
 MEDIC_READ_PERMISSION = "medic.read"
 MEDIC_ADMIN_PERMISSION = "medic.admin"
+# Erases re-decision ledgers once the import is gone. A person's own act.
+LEDGERS_ERASE = "ledgers.erase"
 
 # The permission vocabulary (#2915). ``permissions`` is each name's origin.
 # ``builtins`` is what an unmodified built-in holds once 0008 has run.
@@ -64,9 +71,22 @@ CATALOG = {
         "integrations.read": _SIGNED_IN_READ,
         "integrations.install": _split_from("integrations.write"),
         "cases.assign": _split_from("cases.write"),
+        # Sends a whole case outside Vigil in one signed file. Apart from
+        # cases.read so not every reader of a case can carry all of it out.
+        "cases.export": _NEW_CAPABILITY,
+        "cases.move": _NEW_CAPABILITY,
         "roles.manage": _NEW_CAPABILITY,
+        "teams.manage": _NEW_CAPABILITY,
         "sessions.manage": _NEW_CAPABILITY,
         "ai_decisions.read": _SIGNED_IN_READ,
+        # Held only by the directory-sync account, on no built-in role (#4423).
+        "directory.sync": _NEW_CAPABILITY,
+        # Releases a held operator skill to agents. Apart from automation.write
+        # so whoever uploads a skill cannot also approve it.
+        "skills.approve": _NEW_CAPABILITY,
+        # Erases re-decision ledgers after the import is gone. Apart from
+        # findings.write, which deletes the import and keeps the ledgers.
+        LEDGERS_ERASE: _NEW_CAPABILITY,
     },
     "builtins": {
         "role-admin": {
@@ -83,6 +103,8 @@ CATALOG = {
             "automation.write": True,
             "cases.assign": True,
             "cases.delete": True,
+            "cases.export": True,
+            "cases.move": True,
             "cases.read": True,
             "cases.write": True,
             "detections.read": True,
@@ -93,6 +115,7 @@ CATALOG = {
             "integrations.install": True,
             "integrations.read": True,
             "integrations.write": True,
+            LEDGERS_ERASE: True,
             "loglm.view": True,
             "medic.admin": True,
             "medic.read": True,
@@ -100,6 +123,8 @@ CATALOG = {
             "platform.write": True,
             "roles.manage": True,
             "sessions.manage": True,
+            "skills.approve": True,
+            "teams.manage": True,
             "users.delete": True,
             "users.read": True,
             "users.write": True,
@@ -136,6 +161,8 @@ CATALOG = {
             "automation.write": True,
             "cases.assign": True,
             "cases.delete": True,
+            "cases.export": True,
+            "cases.move": True,
             "cases.read": True,
             "cases.write": True,
             "detections.read": True,
@@ -150,6 +177,7 @@ CATALOG = {
             "medic.read": True,
             "platform.read": True,
             "platform.write": True,
+            "teams.manage": True,
             "users.delete": False,
             "users.read": True,
             "users.write": True,
@@ -163,6 +191,7 @@ CATALOG = {
             "automation.read": True,
             "cases.assign": True,
             "cases.delete": False,
+            "cases.move": True,
             "cases.read": True,
             "cases.write": True,
             "detections.read": True,
@@ -196,16 +225,25 @@ CATALOG = {
 KNOWN_PERMISSIONS = frozenset(CATALOG["permissions"]) | frozenset(
     CATALOG["builtins"]["role-admin"]
 )
+# A new capability goes to the built-ins only. Read from the catalog's origin,
+# so a later permission with that origin joins this set on its own.
+NEW_CAPABILITIES = frozenset(
+    name for name, origin in CATALOG["permissions"].items() if origin == _NEW_CAPABILITY
+)
 # Platform-equivalent: installing integration code runs code as Vigil. In no preset.
 PLATFORM_EQUIVALENT = frozenset({"integrations.install"})
 
 
 # Permissions whose writes ask "Confirm it's you" unless the sign-in confirmed
-# inside the privileged idle window (#4179, core/auth/step_up.py). The value is
+# inside the window: the privileged idle limit, up to 12 hours, or 10 minutes
+# when that limit is 0 (#4179, core/auth/step_up.py). The value is
 # the action the dialog's title names. A route that gates on one of these through
 # ``deny_unless`` asks by itself, so ``require_permission`` and an inline check
 # are covered alike; a handler that records its own 403s adds ``step_up.gate``.
 # Never ai_decisions.approve: routine approvals must not ask.
+# Never detections.write: only reverting a live rule and removing a source ask,
+# and those routes gate themselves. Minting a token asks when the holder has
+# any permission in this set.
 # Machines are never asked, whatever they hold.
 STEP_UP = {
     "platform.write": "change settings",
@@ -214,8 +252,10 @@ STEP_UP = {
     "ai_autonomy.write": "change AI autonomy",
     "sessions.manage": "change session settings",
     "roles.manage": "change roles",
+    "skills.approve": "approve a skill",
     "users.write": "change users",
     "users.delete": "delete a user",
+    LEDGERS_ERASE: "erase re-decision ledgers",
 }
 
 
@@ -247,11 +287,11 @@ PRESETS = {
     },
     "auditor": {
         "name": "Auditor",
-        "description": "Reads everything, including the audit trail. No writes.",
+        "description": "Reads everything, including the audit trail, and exports cases. No writes.",
         "permissions": {
             k: True
             for k in sorted(KNOWN_PERMISSIONS)
-            if k.endswith(".read") or k == "loglm.view"
+            if k.endswith(".read") or k in ("loglm.view", "cases.export")
         },
     },
 }
@@ -307,6 +347,22 @@ def missing_permission(user_id: str, permission: str, session=None) -> Optional[
                 return permission
             return None if allowed else permission
         return missing_permission(user_id, permission, owned)
+
+
+def holders(permission: str) -> list[str]:
+    """Principal ids of the active people, service accounts apart, who hold
+    ``permission``: who a notice about it is for. (Not the MCP token holders.)"""
+    with unit_of_work() as session:
+        people = (
+            session.query(User.user_id, User.principal_id)
+            .filter(User.is_active.is_(True), User.service_account.isnot(True))
+            .all()
+        )
+        return [
+            principal
+            for user_id, principal in people
+            if missing_permission(user_id, permission, session) is None
+        ]
 
 
 def deny_unless(user_id: str, permission: str, session=None) -> None:
@@ -394,22 +450,34 @@ async def resolve_signed_in_user(
     return user
 
 
-def require_person_permission(permission: str) -> Callable[..., User]:
-    """``permission`` held by a person principal, never by a credential.
+def require_person_permission(
+    permission: str, *either: str, refuse_machine: bool = False
+) -> Callable[..., User]:
+    """``permission`` (or any of ``either``) held by a person principal, never by a credential.
 
     The kind check is ``AuthService.check_permission``, which refuses a
     non-person for ``audit.forward`` and ``audit.manage`` even when dev mode
     grants every role permission. A missing sign-in is refused first, except
-    in dev mode, which has no token. The role matrix reads ``permission``.
+    in dev mode, which has no token; ``refuse_machine`` refuses a service
+    account's sign-in the same way. The role matrix reads ``permission``.
     """
 
     def _check(request: Request, user: User = Depends(resolve_signed_in_user)) -> User:
         if not current_user_module.DEV_MODE:
             claims = getattr(request.state, "access_claims", None)
-            if not isinstance(claims, dict) or not claims.get("sid"):
+            if (
+                not isinstance(claims, dict)
+                or not claims.get("sid")
+                or (
+                    refuse_machine
+                    and current_user_module.is_machine_request(user, request)
+                )
+            ):
                 raise HTTPException(
                     status_code=status.HTTP_401_UNAUTHORIZED, detail=SIGN_IN_REQUIRED
                 )
+        if any(missing_permission(user.user_id, other) is None for other in either):
+            return user
         deny_unless(user.user_id, permission)
         return user
 
@@ -455,3 +523,181 @@ def permission_refusal(permission: str) -> Optional[dict[str, str]]:
         return None
     logger.warning("%s refused: %s required", caller, permission)
     return {"error": f"{caller} may not do this: {permission} required"}
+
+
+# ---- Restricted cases (#4352, #4354, #4360) --------------------------------
+# The one read rule. A caller may read a case when it is open (no reader named),
+# or its bound principal is on the reader list or on a team named there (#4360;
+# archived teams too: archiving changes nothing a team grants), or it is an
+# unattended run with no person bound: the one built-in reader class (decision A). A person's token
+# and an agent acting for a person read as that person. Nothing bound reads no
+# restricted case. No Admin bypass: DEV_MODE takes the same test as its dev user.
+
+
+@dataclass(frozen=True)
+class CaseReader:
+    """``team_ids`` None means not yet looked up: read from ``team_memberships``
+    when a case names a team."""
+
+    principal_id: Optional[str] = None
+    builtin: bool = False
+    team_ids: Optional[frozenset] = None
+
+
+def teams_of(principal_id: Optional[str], session: Any = None) -> frozenset:
+    """Every team ``principal_id`` is on, archived ones included."""
+    if not principal_id:
+        return frozenset()
+    from sqlalchemy import select
+
+    with unit_of_work(session) as session:
+        return frozenset(
+            session.scalars(
+                select(TeamMembership.team_id).where(
+                    TeamMembership.principal_id == principal_id
+                )
+            )
+        )
+
+
+def case_reader_for(principal_id: Optional[str], session: Any = None) -> CaseReader:
+    """A reader for ``principal_id`` with its teams looked up now (on ``session``)."""
+    return CaseReader(principal_id, team_ids=teams_of(principal_id, session))
+
+
+_builtin_reader: ContextVar[bool] = ContextVar("vigil_builtin_reader", default=False)
+
+
+@contextmanager
+def builtin_reader() -> Iterator[None]:
+    """Vigil's own unattended work with no run claims (intake, the agent layer's
+    run bridge): the built-in reader class, as a run with no person is."""
+    token = _builtin_reader.set(True)
+    try:
+        yield
+    finally:
+        _builtin_reader.reset(token)
+
+
+async def builtin_reader_request() -> None:
+    """Router dependency: this whole request is Vigil's own unattended work.
+
+    Async, so the flag is set in the request's own task and its endpoint (or the
+    threadpool copy of that context) sees it; the task ends with the request.
+    """
+    _builtin_reader.set(True)
+
+
+def current_case_reader() -> CaseReader:
+    """Who is reading, from the context the permission check already reads."""
+    from core.cases.agent_closure import current_http_actor, principal_for_username
+
+    claims = current_claims()
+    if claims is not None:
+        if claims.person_id:
+            return CaseReader(claims.person_id)
+        from core.response.ceiling import execution_held
+
+        # A run no person started reads open cases only while stopped, or while
+        # the ceiling can't be read; Vigil's own non-run work keeps every case.
+        return CaseReader() if execution_held() else CaseReader(builtin=True)
+    if _builtin_reader.get():
+        return CaseReader(builtin=True)
+    caller = current_caller()
+    if caller:
+        with unit_of_work() as session:
+            return CaseReader(principal_for_username(session, caller))
+    actor = current_http_actor()
+    if actor is not None:
+        return CaseReader(actor.principal_id)
+    return CaseReader(current_user_module.dev_principal.get())
+
+
+def _read_terms(
+    reader: CaseReader,
+    is_open: Any,
+    named: Callable[[str], Any],
+    on_team: Callable[[CaseReader], Any],
+):
+    """The definition, once. ``None`` reads every case; else any one term."""
+    if reader.builtin:
+        return None
+    if reader.principal_id is None:
+        return [is_open]
+    return [is_open, named(reader.principal_id), on_team(reader)]
+
+
+def case_restricted(case: Any) -> bool:
+    """Whether a case row names any reader."""
+    return bool(
+        getattr(case, "reader_principal_ids", None)
+        or getattr(case, "reader_team_ids", None)
+    )
+
+
+def may_read_case(case: Any, reader: Optional[CaseReader] = None) -> bool:
+    """The single-record test, on a ``Case`` row."""
+    teams = getattr(case, "reader_team_ids", None) or []
+
+    def on_team(reader: CaseReader) -> bool:
+        held = reader.team_ids
+        if held is None:
+            # On the row's own session, when it has one: no second connection.
+            from sqlalchemy.orm import object_session
+            from sqlalchemy.orm.exc import UnmappedInstanceError
+
+            try:
+                session = object_session(case)
+            except UnmappedInstanceError:
+                session = None
+            held = teams_of(reader.principal_id, session)
+        return any(team in held for team in teams)
+
+    terms = _read_terms(
+        reader or current_case_reader(),
+        not case_restricted(case),
+        lambda principal: principal in (case.reader_principal_ids or []),
+        # Deferred: the membership lookup runs only when no earlier term reads it.
+        lambda reader: (lambda: on_team(reader)) if teams else False,
+    )
+    return terms is None or any(t() if callable(t) else t for t in terms)
+
+
+def case_read_clause(reader: Optional[CaseReader] = None):
+    """The same test as a SQL clause on ``cases``."""
+    from sqlalchemy import String, and_, exists, false, func, or_, true
+    from sqlalchemy.dialects.postgresql import array
+
+    is_open = and_(
+        func.coalesce(func.cardinality(Case.reader_principal_ids), 0) == 0,
+        func.coalesce(func.cardinality(Case.reader_team_ids), 0) == 0,
+    )
+
+    def on_team(reader: CaseReader):
+        if reader.team_ids is not None:
+            if not reader.team_ids:
+                return false()
+            return func.coalesce(
+                Case.reader_team_ids.overlap(
+                    array(sorted(reader.team_ids), type_=String(50))
+                ),
+                false(),
+            )
+        return exists().where(
+            TeamMembership.principal_id == reader.principal_id,
+            Case.reader_team_ids.any(TeamMembership.team_id),
+        )
+
+    terms = _read_terms(
+        reader or current_case_reader(),
+        is_open,
+        # Never NULL, so the negation (cases left out) is exact too.
+        lambda principal: func.coalesce(
+            Case.reader_principal_ids.any(principal), false()
+        ),
+        on_team,
+    )
+    return true() if terms is None else or_(*terms)
+
+
+case_read_hook.install(sys.modules[__name__])

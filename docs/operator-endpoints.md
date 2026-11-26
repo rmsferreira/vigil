@@ -13,33 +13,38 @@ Only `migrate-to-encrypted` writes an audit record (config type `secrets`, key `
 
 ## Calling them with curl
 
-The API accepts a session cookie or an `Authorization: Bearer` token. From a script, use the token.
+From a script, use a personal API token. Mint one in the console: **Settings**, **Team & access**, the **API tokens** card. Give it a label and a lifetime, then **Mint**. The token is shown once, so store it then.
 
-Every `POST` must also pass the CSRF check, unless `VIGIL_CSRF_ENABLED=false` or `VIGIL_CSRF_REPORT_ONLY=true`. The check only compares the `X-CSRF-Token` header with the `csrf_token` cookie, so a script can pick any value and send it as both. This applies to the login call too.
+- A person's token lasts 90 days by default and 365 at most. A service account's lasts 365 days. An administrator with `sessions.manage` can set a lower maximum for each under **Settings**, **Sessions**, **API tokens**. Lowering a maximum also shortens the tokens already issued to end no later than that many days from the change; raising it never lengthens one. A request for longer than the maximum is refused with the maximum in the message, and if the stored policy can't be read no token is minted until it is saved again.
+- Creating or rotating a token asks the person calling to confirm it's them, whatever their role. With Require MFA off, a person with no second factor confirms with their password. Otherwise they need two-step sign-in set up first.
+- A token can do what its holder's role allows. It can never mint or rotate a token, or change an account.
+- For unattended work, use a service account's token. Someone who holds `users.write` mints it, from the **Tokens of** card on that account.
 
-The token is bound to the `User-Agent` it was issued to. Send the same one on every call. A token copied from a browser will not work from curl.
+A token needs no login call, no `User-Agent` match, and no CSRF header or cookie, and it is not counted as a sign-in. It is never asked to confirm it's you, so `migrate-to-encrypted` works with it at any time. It is recorded against its holder.
 
 ```bash
 API=http://localhost:6987          # add VIGIL_CONTEXT_PATH here if you set one
-UA="vigil-ops"
-CSRF=$(openssl rand -hex 16)
-read -rsp "Password: " PW; echo
+read -rsp "Token: " VIGIL_TOKEN; echo   # a vgl_api_... token; or export it in the shell
 
-TOKEN=$(curl -s -A "$UA" "$API/api/auth/login" \
-  -H "Content-Type: application/json" \
-  -H "X-CSRF-Token: $CSRF" -b "csrf_token=$CSRF" \
-  -d "{\"username_or_email\": \"admin\", \"password\": \"$PW\"}" \
-  | jq -r .access_token)
-# With MFA on, add "mfa_code": "123456" to the login body.
+curl -s "$API/api/config/secrets/status" \
+  -H "Authorization: Bearer $VIGIL_TOKEN"
 
-curl -s -A "$UA" -X POST "$API/api/config/secrets/migrate-to-encrypted" \
-  -H "Authorization: Bearer $TOKEN" \
-  -H "X-CSRF-Token: $CSRF" -b "csrf_token=$CSRF" \
+curl -s -X POST "$API/api/config/secrets/migrate-to-encrypted" \
+  -H "Authorization: Bearer $VIGIL_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"keys": ["SOME_API_KEY"]}'
 ```
 
-The `GET` route needs only the `Authorization` header and the same `-A "$UA"`.
+### Why not log in with a password
+
+A script can still sign in with a password and use the bearer token the login returns, but that is a person's sign-in and it follows the person's rules:
+
+- It ends at the idle limit and at the length limit. Each idle limit is 0 (no idle limit) to 720 minutes (12 hours), and the two are set independently. 0 does not end the sign-in for idleness.
+- Where an admin has set a sign-in limit, it counts toward that limit and a newer sign-in can end it. The limit is off by default.
+- It is bound to the `User-Agent` it signed in with. Send the same one on every call.
+- Every `POST` must pass the CSRF check, unless `VIGIL_CSRF_ENABLED=false` or `VIGIL_CSRF_REPORT_ONLY=true`. The check compares the `X-CSRF-Token` header with the `csrf_token` cookie, so a script can pick any value and send it as both. This applies to the login call too.
+- With two-step sign-in on, the login needs a current `mfa_code`.
+- A privileged write such as `migrate-to-encrypted` asks it to confirm it's you. With Require MFA off, a person with no second factor confirms with their password, and a password sign-in by that person opens the confirmation window. Otherwise, with no two-step sign-in the call is refused until they set it up. With two-step sign-in, the call works only inside the confirmation window: the privileged idle limit, up to 12 hours, or 10 minutes when that limit is 0. After that it is refused until the person confirms again, and the refusal names that length in minutes.
 
 ## `GET /api/config/secrets/status`
 

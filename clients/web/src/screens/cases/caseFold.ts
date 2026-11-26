@@ -433,13 +433,13 @@ export function workerAt(fold: HuntFold, iteration: number): string | null {
 
 /**
  * Who wrote a record row. A case activity is typed by its own activity_type, never as the run-event
- * kind it may share a name with: runs, their proposals and findings are the agent's, a merge or a
+ * kind it may share a name with: runs, their proposals (filed or refused) and findings are the agent's, a merge or a
  * repeated request the system's, the rest (approvals included) an analyst's. An audit trail row's kind is the server's word for its actor's principal.
  */
 export function recordChip(kind: string, source = 'run'): RecordChip {
   if (source === 'audit_trail') return kind === 'human' || kind === 'system' ? kind : 'agent'
   if (source === 'case_activities') {
-    if (kind.startsWith('agent_run_') || kind === 'finding_added' || kind === 'actions_proposed') return 'agent'
+    if (kind.startsWith('agent_run_') || kind === 'finding_added' || kind === 'actions_proposed' || kind === 'proposal_rejected') return 'agent'
     return kind === 'case_merged' || kind === 'alert_added' || kind === 'action_already_requested' ? 'system' : 'human'
   }
   switch (kind) {
@@ -857,8 +857,6 @@ export interface EndedRun {
   line: string
   /** What follows the Idle pill: "hunt concluded, handed to IR", or "hunt concluded · " and the line. */
   reason: string
-  /** The reason as the server wrote it, model prose included; '' when none was recorded. */
-  raw: string
   question: OpenQuestionRow | null
   /** A model call is why it ended here (a gateway budget refusal keeps its report): said beside the line. */
   cause: StopCause | null
@@ -878,7 +876,7 @@ export function endedRun(fold: RunFold | null): EndedRun | null {
   const record = foldRecord(fold)
   if (!record) {
     const line = plural(fold.kind === 'lead' ? fold.findings.length : 0, 'finding')
-    return { line, reason: said ?? `${concluded} · ${line}`, raw: fold.reason, question: null, cause }
+    return { line, reason: said ?? `${concluded} · ${line}`, question: null, cause }
   }
   const tally = new Map<string, number>()
   for (const row of record.hypotheses) {
@@ -894,10 +892,17 @@ export function endedRun(fold: RunFold | null): EndedRun | null {
   return {
     line,
     reason: said ?? (handedOff ? `${concluded}, handed to IR` : `${concluded} · ${line}`),
-    raw: fold.reason,
     question: cited ? record.openQuestions.find((q) => q.question_id === cited) ?? null : null,
     cause,
   }
+}
+
+/** What the latest concluded run reported, as the server wrote it ('' when it has not concluded or said nothing).
+ *  Unlike endedRun it does not depend on the case's state, so a closed case still has its report. */
+export function runReport(fold: RunFold | null): string {
+  if (!fold || ENDED.includes(fold.run.status)) return ''
+  if (fold.run.status !== 'completed' && fold.run.huntStatus !== 'terminal') return ''
+  return fold.reason.trim()
 }
 
 /** Model or worker text as one plain line: list markers, headings and emphasis dropped, so no raw markdown shows. */

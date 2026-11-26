@@ -20,15 +20,20 @@ from pydantic import BaseModel, Field, field_validator
 from core.agents.projections import read_events
 from core.auth.permissions import deny_unless, permission_gate
 from core.cases import case_journal_service, case_records_service
-from core.cases.assignee import resolve_assignee, resolve_escalation_target
+from core.cases.assignee import (
+    require_current_owner,
+    resolve_assignee,
+    task_is_open,
+    with_owner_state,
+)
 from core.cases.case_attachment_service import attach_document
 from core.cases.case_collaboration_service import CaseCollaborationService
 from core.cases.case_evidence_service import CaseEvidenceService
+from core.cases.case_handoff import ESCALATE_REPLACED
 from core.cases.case_notification_service import WATCHER_NOTIFICATION_TYPES
 from core.cases.case_record import merge_record, unread_row
 from core.cases.case_sla_service import CaseSLAService, SlaOutcome
-from core.cases.case_state import case_run_refs, primary_ref
-from core.cases.case_workflow_service import CaseWorkflowService
+from core.cases.case_state import case_run_refs, primary_choice, run_ids
 from core.documents.extract import ACCEPTED_TYPES, DocumentRefused, spool_upload
 from core.routing import Auth, OptionalUnitOfWorkSession, RouterMeta, UnitOfWorkSession
 from core.storage.database_data_service import DatabaseDataService
@@ -93,7 +98,7 @@ def _mark_workdirs_failed(investigation_ids: List[str], reason: str) -> None:
     Runs after the request commits, because the sidecar cannot be rolled back
     with the rows. One unwritable workdir must not abandon the rest.
     """
-    from services.daemon.config import DaemonConfig
+    from core.daemon_config import DaemonConfig
     from services.daemon.workdir import WorkdirManager
 
     workdir = WorkdirManager(DaemonConfig.from_env().orchestrator.workdir_base)
@@ -117,7 +122,10 @@ async def clear_all_cases(
     background_tasks: BackgroundTasks,
     current_user: User = Depends(get_current_user),
 ):
-    """Delete all cases and case-derived generated data (requires cases.delete)."""
+    """Delete all cases and case-derived generated data (requires cases.delete).
+
+    Restricted cases the caller may not read are kept and counted (#4354).
+    """
     deny_unless(current_user.user_id, "cases.delete", session)
 
     # The purge's one trail entry commits with it (case_trail.PURGE).
@@ -129,13 +137,19 @@ async def clear_all_cases(
         case_records_service.RESET_KILL_REASON,
     )
 
+    kept = (
+        f"; {result.kept} restricted case{'' if result.kept == 1 else 's'} kept"
+        if result.kept
+        else ""
+    )
     return {
         "success": True,
         "deleted": result.cases,
         "killed_investigations": killed,
+        "restricted_kept": result.kept,
         "message": (
             f"Deleted {result.cases} cases and case-derived records; "
-            f"killed {killed} live investigations"
+            f"killed {killed} live investigations{kept}"
         ),
     }
 
@@ -516,7 +530,7 @@ async def add_custody_entry(
     """Add chain of custody entry."""
     evidence_service = CaseEvidenceService()
     success = evidence_service.add_chain_of_custody_entry(
-        evidence_id, data.action, current_user.username, data.notes
+        case_id, evidence_id, data.action, current_user.username, data.notes
     )
     if not success:
         raise HTTPException(status_code=500, detail="Failed to add custody entry")
@@ -564,10 +578,10 @@ async def add_task(
 
 
 @router.get("/{case_id}/tasks", response_model=CaseTasksResponse)
-async def get_tasks(case_id: str):
-    """Get all tasks for case."""
-    tasks = case_records_service.list_tasks(case_id)
-    return {"tasks": CaseTaskSchema.dump_many(tasks)}
+def get_tasks(case_id: str, session: OptionalUnitOfWorkSession):
+    """Get all tasks for case, each with its owner's state."""
+    tasks = CaseTaskSchema.dump_many(case_records_service.list_tasks(case_id))
+    return {"tasks": with_owner_state(session, tasks)}
 
 
 class TaskUpdate(BaseModel):
@@ -599,10 +613,16 @@ def update_task(
 
     # A blank assignee unassigns; a refusal raises before anything is written.
     task = case_records_service.update_task(
-        session, task_id, data.model_dump(), signed_in=current_user.username
+        session,
+        task_id,
+        data.model_dump(),
+        signed_in=current_user.username,
+        case_id=case_id,
     )
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
+    # Judged once status and assignee are both applied; a refusal rolls it all back.
+    require_current_owner(session, task.assignee, is_open=task_is_open(task.status))
     return CaseTaskSchema.dump(task)
 
 
@@ -647,8 +667,9 @@ async def add_relationship(
 async def get_relationships(case_id: str, session: UnitOfWorkSession):
     """Get related cases."""
 
-    rows = case_records_service.list_relationships(session, case_id)
+    rows, hidden = case_records_service.list_relationships(session, case_id)
     return {
+        "hidden": hidden,
         "relationships": [
             {
                 **CaseRelationshipSchema.dump(rel),
@@ -656,51 +677,20 @@ async def get_relationships(case_id: str, session: UnitOfWorkSession):
                 "related_status": status,
             }
             for rel, title, status in rows
-        ]
+        ],
     }
 
 
 # Case Closure
 
 
-# Case Escalation
-class EscalationAdd(BaseModel):
-    """Escalate case."""
-
-    escalated_from: Optional[str] = Field(
-        default=None,
-        description="Ignored: the signed-in user is recorded as who escalated.",
+@router.post("/{case_id}/escalate", dependencies=_CASES_WRITE, status_code=410)
+async def escalate_case(case_id: str):
+    """Escalation has been replaced by the beta move and ``move_case``."""
+    raise HTTPException(
+        status_code=410,
+        detail=ESCALATE_REPLACED.format(case_id=case_id),
     )
-    escalated_to: str
-    reason: str
-    urgency_level: str = "high"
-
-
-@router.post(
-    "/{case_id}/escalate", dependencies=_CASES_WRITE, response_model=CaseSuccessResponse
-)
-async def escalate_case(
-    case_id: str,
-    data: EscalationAdd,
-    session: UnitOfWorkSession,
-    current_user: User = Depends(get_current_user),
-):
-    """Escalate case. Who escalated it is the signed-in user."""
-    # Escalation hands the case to escalated_to, which is an owner change.
-    deny_unless(current_user.user_id, "cases.assign", session)
-    # Before the call: it swallows errors into "Failed to escalate case".
-    escalated_to = resolve_escalation_target(session, data.escalated_to)
-    workflow_service = CaseWorkflowService()
-    success = workflow_service.escalate_case(
-        case_id,
-        escalated_from=current_user.username,
-        escalated_to=escalated_to,
-        reason=data.reason,
-        urgency_level=data.urgency_level,
-    )
-    if not success:
-        raise HTTPException(status_code=500, detail="Failed to escalate case")
-    return {"success": True}
 
 
 @router.get("/{case_id}/escalations", response_model=CaseEscalationsResponse)
@@ -736,7 +726,8 @@ async def get_case_record(case_id: str, session: OptionalUnitOfWorkSession):
     concurrently; a run that cannot be read is one row saying why, not a failed
     record. Audit rows are ``entity_type == case`` and ``entity_id`` this case —
     the table has no ``case_id`` column. ``run_id`` is the case's run
-    (``primary_ref``), which Replay, Verify chain and Export audit read.
+    (``primary_choice``), which Replay, Verify chain and Export audit read, and
+    ``primary_basis`` names what picked it.
     """
     if data_service.is_demo_mode():
         from core.platform.demo_data_service import DemoDataService
@@ -759,14 +750,13 @@ async def get_case_record(case_id: str, session: OptionalUnitOfWorkSession):
     if not case:
         raise HTTPException(status_code=404, detail="Case not found")
 
-    refs = [
-        ref
-        for ref, _ in case_run_refs(
-            case_records_service.list_case_investigations(session, case_id),
-            case_records_service.list_case_runs(session, case_id),
-        )
-    ]
-    primary = primary_ref(refs)
+    investigations = case_records_service.list_case_investigations(session, case_id)
+    case_runs = case_records_service.list_case_runs(session, case_id)
+    facts = case_records_service.list_run_facts(
+        session, run_ids(investigations, case_runs)
+    )
+    refs = [ref for ref, _ in case_run_refs(investigations, case_runs, facts=facts)]
+    primary, basis = primary_choice(refs)
     reads = await asyncio.gather(*(_run_events(ref) for ref in refs))
     runs, unread = [], []
     for ref, (events, reason) in zip(refs, reads):
@@ -780,6 +770,7 @@ async def get_case_record(case_id: str, session: OptionalUnitOfWorkSession):
     return {
         "run_id": primary["run_id"] if primary else None,
         "investigation_id": primary["investigation_id"] if primary else None,
+        "primary_basis": basis,
         "rows": merge_record(
             runs,
             audits,

@@ -1,31 +1,68 @@
+import asyncio
 import functools
 import inspect
 import json
 import logging
 from datetime import datetime
-from typing import Literal, Optional
+from typing import Annotated, Any, Awaitable, Callable, Literal, Optional
 
 from mcp.server.mcpserver import MCPServer
+from mcp.types import ToolAnnotations
+from pydantic import Field
 
 from core.agents import tool_registry
+from core.agents.custom_agent_service import CustomAgentService
+from core.audit import reads, trail
 from core.auth.permissions import permission_refusal
-from core.cases.agent_closure import actor, service_session
-from core.cases.assignee import resolve_assignee, resolve_escalation_target
+from core.cases.agent_closure import acting_principal, actor, service_session
+from core.cases.assignee import (
+    OwnerNotCurrent,
+    require_current_owner,
+    resolve_assignee,
+    task_is_open,
+    with_owner_state,
+)
+from core.cases.case_handoff import ESCALATE_REPLACED
+from core.cases.case_handoff import move_case as move_case_row
 from core.cases.case_status import CaseStatus
+from core.cases.closure import FalsePositiveCause, false_positive_cause_value
 from core.response.approval_service import ActionStatus, ActionType, ApprovalService
+from core.response.ceiling import ceiling_read
+from core.storage.connection import get_db_session
+from core.storage.schemas.case import CaseSchema
 from core.storage.schemas.case_entities import (
     CaseClosureInfoSchema,
     CaseCommentSchema,
-    CaseEscalationSchema,
     CaseEvidenceSchema,
     CaseIOCSchema,
     CaseRelationshipSchema,
     CaseTaskSchema,
 )
 from core.time import utcnow
+from core.workflows import catalog
+from core.workflows.workflows_service import WorkflowsService
 
 logger = logging.getLogger(__name__)
 mcp = MCPServer("vigil")
+
+
+def tool(title: str, *, reads: bool = False, destructive: bool = False):
+    """``@mcp.tool()`` with the annotations a client reads before it calls.
+
+    ``reads``: the tool changes nothing. ``destructive``: it changes or removes
+    what exists, as against adding to it; ignored when ``reads``. Every tool
+    acts on this Vigil alone, so none is open-world.
+    """
+    return mcp.tool(
+        title=title,
+        annotations=ToolAnnotations(
+            title=title,
+            read_only_hint=reads,
+            destructive_hint=False if reads else destructive,
+            open_world_hint=False,
+        ),
+    )
+
 
 # The frozen tools: names and input schemas promised to external callers, held
 # by tools/mcp/frozen_tools.snapshot.json. Rule: a tool is frozen when the HTTP
@@ -50,6 +87,13 @@ FROZEN_TOOLS = frozenset(
         "get_approval_action",
         "approve_action",
         "reject_action",
+        "list_workflows",
+        "get_workflow",
+        "list_operator_agents",
+        "get_operator_agent",
+        "get_autonomy_ceiling",
+        "list_audit_entries",
+        "get_entity_facts",
         "send_directive",
     }
 )
@@ -132,7 +176,7 @@ def get_data_service():
     return _data_service
 
 
-@mcp.tool()
+@tool("List findings", reads=True)
 @requires("findings.read")
 def list_findings(
     severity: Optional[str] = None,
@@ -163,23 +207,40 @@ def list_findings(
     )
 
 
-@mcp.tool()
+@tool("Get finding", reads=True)
 @requires("findings.read")
-def get_finding(finding_id: str) -> str:
+def get_finding(
+    finding_id: str, records_offset: Annotated[int, Field(ge=0)] = 0
+) -> str:
     """Get a specific finding by ID: its stored triage under ``triage``, then
-    ``entity_context`` with a sample of the source records. A null confidence in mitre_predictions means the source named the technique and gave no confidence: it is unknown, not 0.
+    ``entity_context`` with a page of up to 5 source records. ``records_shown``
+    says which, of how many; pass its ``next_offset`` as ``records_offset`` to
+    read the next page. A null confidence in mitre_predictions means the source named the technique and gave no confidence: it is unknown, not 0.
     """
-    return _call(tool_registry.get_finding, finding_id=finding_id)
+    return _call(
+        tool_registry.get_finding, finding_id=finding_id, records_offset=records_offset
+    )
 
 
-@mcp.tool()
+@tool("Dismiss finding", destructive=True)
 @requires("findings.write")
-def dismiss_finding(finding_id: str, reason: str) -> str:
-    """Dismiss a finding as noise, with the reason. The actor is the caller."""
-    return _call(tool_registry.dismiss_finding, finding_id=finding_id, reason=reason)
+def dismiss_finding(
+    finding_id: str, reason: str, noise_cause: Optional[str] = None
+) -> str:
+    """Dismiss a finding as noise, with the reason. The actor is the caller.
+
+    ``noise_cause`` is optional: expected, too_broad, data, or other. Omit it
+    to record no cause. A value outside that set dismisses nothing.
+    """
+    return _call(
+        tool_registry.dismiss_finding,
+        finding_id=finding_id,
+        reason=reason,
+        noise_cause=noise_cause,
+    )
 
 
-@mcp.tool()
+@tool("List completed hunts", reads=True)
 @requires("automation.read")
 async def list_completed_hunts(
     start: str,
@@ -192,7 +253,7 @@ async def list_completed_hunts(
     )
 
 
-@mcp.tool()
+@tool("Replay a hunt's steps", reads=True)
 @requires("automation.read")
 async def replay_hunt(
     run_id: str,
@@ -214,7 +275,7 @@ async def replay_hunt(
     )
 
 
-@mcp.tool()
+@tool("Technique rollup", reads=True)
 @requires("findings.read")
 def get_technique_rollup(min_confidence: float = 0.0, time_range: str = "all") -> str:
     """Roll up ATT&CK techniques by finding count and severity. min_confidence applies only to techniques with a confidence: at 0 an occurrence with no confidence is counted, above 0 it is excluded and counted in excluded_occurrences on the response."""
@@ -225,7 +286,7 @@ def get_technique_rollup(min_confidence: float = 0.0, time_range: str = "all") -
     )
 
 
-@mcp.tool()
+@tool("List cases", reads=True)
 @requires("cases.read")
 def list_cases(
     status: Optional[str] = None,
@@ -243,14 +304,14 @@ def list_cases(
     )
 
 
-@mcp.tool()
+@tool("Get case", reads=True)
 @requires("cases.read")
 def get_case(case_id: str) -> str:
     """Get one case. A null confidence in mitre_predictions means the source named the technique and gave no confidence: it is unknown, not 0."""
     return _call(tool_registry.get_case, case_id=case_id)
 
 
-@mcp.tool()
+@tool("Create case")
 @requires("cases.write")
 def create_case(
     title: str,
@@ -276,7 +337,7 @@ def create_case(
     )
 
 
-@mcp.tool()
+@tool("Update case", destructive=True)
 @requires("cases.write")
 def update_case(
     case_id: str,
@@ -300,7 +361,52 @@ def update_case(
     )
 
 
-@mcp.tool()
+@tool("Restrict case", destructive=True)
+@requires("cases.write")
+def restrict_case(
+    case_id: str, readers: Optional[list] = None, reader_teams: Optional[list] = None
+) -> str:
+    """Restrict an open case to its readers: usernames or principal ids, the whole
+    list. Left out, the owner, task assignees and the person you act for. Naming
+    teams is a person's act in the console and is refused here. Not frozen."""
+    return _call(
+        tool_registry.restrict_case,
+        case_id=case_id,
+        readers=readers,
+        reader_teams=reader_teams,
+    )
+
+
+@tool("Remove case readers", destructive=True)
+@requires("cases.write")
+def change_case_readers(
+    case_id: str,
+    remove: Optional[list] = None,
+    add: Optional[list] = None,
+    remove_teams: Optional[list] = None,
+    add_teams: Optional[list] = None,
+) -> str:
+    """Remove readers or reader teams from a restricted case; the list may not end
+    empty. Adding either is a person's act in the console and is refused here.
+    Not frozen."""
+    return _call(
+        tool_registry.change_case_readers,
+        case_id=case_id,
+        remove=remove,
+        add=add,
+        remove_teams=remove_teams,
+        add_teams=add_teams,
+    )
+
+
+def _not_found(case_id: str) -> Optional[str]:
+    """A case the caller can't read is not found, as one it can't find (#4358)."""
+    from core.cases.case_access import readable
+
+    return None if readable(case_id) else jdump({"error": f"Case {case_id} not found"})
+
+
+@tool("Add finding to case")
 @requires("cases.write")
 def add_finding_to_case(case_id: str, finding_id: str) -> str:
     """Attach a finding to a case."""
@@ -309,9 +415,10 @@ def add_finding_to_case(case_id: str, finding_id: str) -> str:
     )
 
 
-@mcp.tool()
+@tool("Remove finding from case", destructive=True)
 @requires("cases.write")
 def remove_finding_from_case(case_id: str, finding_id: str) -> str:
+    """Removing an alert that intake merged into this Case sends it back to intake."""
     try:
         from core.cases import case_journal_service
 
@@ -334,7 +441,7 @@ def remove_finding_from_case(case_id: str, finding_id: str) -> str:
         return jdump({"error": str(e)})
 
 
-@mcp.tool()
+@tool("Add case activity")
 @requires("cases.write")
 def add_case_activity(
     case_id: str,
@@ -380,7 +487,7 @@ def add_case_activity(
         return jdump({"error": str(e)})
 
 
-@mcp.tool()
+@tool("Add timeline entry")
 @requires("cases.write")
 def add_case_timeline_entry(
     case_id: str,
@@ -428,7 +535,7 @@ def add_case_timeline_entry(
         return jdump({"error": str(e)})
 
 
-@mcp.tool()
+@tool("Add MITRE techniques")
 @requires("cases.write")
 def add_case_mitre_techniques(case_id: str, technique_ids: list) -> str:
     """
@@ -461,7 +568,7 @@ def add_case_mitre_techniques(case_id: str, technique_ids: list) -> str:
         return jdump({"error": str(e)})
 
 
-@mcp.tool()
+@tool("Add resolution step")
 @requires("cases.write")
 def add_resolution_step(
     case_id: str,
@@ -479,7 +586,7 @@ def add_resolution_step(
     )
 
 
-@mcp.tool()
+@tool("Add findings to case")
 @requires("cases.write")
 def bulk_add_findings_to_case(
     case_id: str, finding_ids: list, note: Optional[str] = None
@@ -531,7 +638,7 @@ def bulk_add_findings_to_case(
         return jdump({"error": str(e)})
 
 
-@mcp.tool()
+@tool("Create case from kill chain")
 @requires("cases.write")
 def create_case_from_killchain(
     title: str,
@@ -627,7 +734,7 @@ def create_case_from_killchain(
         return jdump({"error": str(e)})
 
 
-@mcp.tool()
+@tool("Add case comment")
 @requires("cases.write")
 def add_case_comment(
     case_id: str,
@@ -646,6 +753,8 @@ def add_case_comment(
         - add_case_comment("case-123", "Confirmed lateral movement pattern")
         - add_case_comment("case-123", "I see the same pattern", parent_comment_id=5)
     """
+    if (refused := _not_found(case_id)) is not None:
+        return refused
     try:
         from core.cases.case_collaboration_service import CaseCollaborationService
 
@@ -676,10 +785,12 @@ def add_case_comment(
         return jdump({"error": str(e)})
 
 
-@mcp.tool()
+@tool("Case comments", reads=True)
 @requires("cases.read")
 def get_case_comments(case_id: str) -> str:
     """Get all comments for a case."""
+    if (refused := _not_found(case_id)) is not None:
+        return refused
     try:
         from core.cases.case_collaboration_service import CaseCollaborationService
 
@@ -700,7 +811,7 @@ def get_case_comments(case_id: str) -> str:
         return jdump({"error": str(e)})
 
 
-@mcp.tool()
+@tool("Add case evidence")
 @requires("cases.write")
 def add_case_evidence(
     case_id: str,
@@ -729,6 +840,8 @@ def add_case_evidence(
         - add_case_evidence("case-123", "log", "firewall-logs.txt",
                            source="Palo Alto FW", tags=["c2", "exfiltration"])
     """
+    if (refused := _not_found(case_id)) is not None:
+        return refused
     try:
         from core.cases.case_evidence_service import CaseEvidenceService
 
@@ -761,7 +874,7 @@ def add_case_evidence(
         return jdump({"error": str(e)})
 
 
-@mcp.tool()
+@tool("Add case IOC")
 @requires("cases.write")
 def add_case_ioc(
     case_id: str,
@@ -794,6 +907,8 @@ def add_case_ioc(
         - add_case_ioc("case-123", "hash", "a1b2c3...", ioc_type="md5",
                       tags=["malware", "ransomware"])
     """
+    if (refused := _not_found(case_id)) is not None:
+        return refused
     try:
         from core.cases.case_ioc_service import CaseIOCService
 
@@ -827,7 +942,61 @@ def add_case_ioc(
         return jdump({"error": str(e)})
 
 
-@mcp.tool()
+@tool("Mark case IOC false positive")
+@requires("cases.write")
+def set_case_ioc_false_positive(
+    case_id: str, ioc_type: str, value: str, is_false_positive: bool = True
+) -> str:
+    """
+    Mark an indicator on a case as a false positive, or clear the mark.
+
+    While marked, no alert joins the case or links to it on that value. The
+    mark covers the value under any spelling (``src_ip``, ``dst_ip``, ``ip``).
+    An indicator only a linked alert names gets a recorded, marked row. Name
+    it by type and value as ``get_case_iocs`` lists it.
+
+    Args:
+        case_id: The case ID
+        ioc_type: The indicator's type, e.g. "ip", "domain", "hash"
+        value: The indicator's value
+        is_false_positive: True to mark it, False to clear the mark
+
+    Example:
+        set_case_ioc_false_positive("case-123", "ip", "203.0.113.7")
+        set_case_ioc_false_positive("case-123", "ip", "203.0.113.7", False)
+    """
+    if (refused := _not_found(case_id)) is not None:
+        return refused
+    try:
+        from core.cases.case_ioc_service import CaseIOCService
+
+        with service_session() as session:
+            rows, changed = CaseIOCService().set_false_positive(
+                case_id,
+                ioc_type,
+                value,
+                is_false_positive,
+                session=session,
+                added_by=actor(),
+            )
+            session.flush()
+            payload = CaseIOCSchema.dump_many(rows)
+
+        verb = "Marked" if is_false_positive else "Cleared the mark on"
+        return jdump(
+            {
+                "success": True,
+                "changed": changed,
+                "message": f"{verb} {ioc_type}:{value} on {case_id}"
+                + ("" if changed else " (nothing to change)"),
+                "iocs": payload,
+            }
+        )
+    except Exception as e:
+        return jdump({"error": str(e)})
+
+
+@tool("Add case IOCs")
 @requires("cases.write")
 def bulk_add_iocs(case_id: str, iocs: list) -> str:
     """
@@ -845,6 +1014,8 @@ def bulk_add_iocs(case_id: str, iocs: list) -> str:
             {"ioc_type": "domain", "value": "evil.com", "threat_level": "critical"}
         ])
     """
+    if (refused := _not_found(case_id)) is not None:
+        return refused
     try:
         from core.cases.case_ioc_service import CaseIOCService
 
@@ -886,18 +1057,17 @@ def bulk_add_iocs(case_id: str, iocs: list) -> str:
         return jdump({"error": str(e)})
 
 
-@mcp.tool()
+@tool("Case IOCs", reads=True)
 @requires("cases.read")
 def get_case_iocs(case_id: str, ioc_type: Optional[str] = None) -> str:
-    """Get all IOCs for a case, optionally filtered by type."""
+    """Get all IOCs for a case, optionally filtered by type: recorded, then those its alerts name, each with what intake does with it (`intake`) and whether it is `linked` yet."""
+    if (refused := _not_found(case_id)) is not None:
+        return refused
     try:
         from core.cases.case_ioc_service import CaseIOCService
 
         with service_session() as session:
-            iocs = CaseIOCService().get_case_iocs(
-                case_id=case_id, ioc_type=ioc_type, session=session
-            )
-            payload = CaseIOCSchema.dump_many(iocs)
+            payload = CaseIOCService().list_iocs(case_id, ioc_type, session=session)
 
         return jdump(
             {
@@ -910,7 +1080,7 @@ def get_case_iocs(case_id: str, ioc_type: Optional[str] = None) -> str:
         return jdump({"error": str(e)})
 
 
-@mcp.tool()
+@tool("Add case task")
 @requires("cases.write")
 def add_case_task(
     case_id: str,
@@ -936,6 +1106,8 @@ def add_case_task(
         - add_case_task("case-123", "Interview affected users", assignee="analyst2",
                        due_date="2026-01-25T17:00:00Z")
     """
+    if (refused := _not_found(case_id)) is not None:
+        return refused
     try:
         from datetime import datetime
 
@@ -971,7 +1143,7 @@ def add_case_task(
         return jdump({"error": str(e)})
 
 
-@mcp.tool()
+@tool("Update case task", destructive=True)
 @requires("cases.write")
 def update_case_task(
     task_id: int,
@@ -1002,11 +1174,22 @@ def update_case_task(
             updates["completed_at"] = utcnow()
 
         with service_session() as session:
+            from core.cases.case_access import readable
+            from core.storage.models import CaseTask
+
+            # A task on a case the caller can't read is not found (#4358).
+            held = session.get(CaseTask, task_id)
+            if held is None or not readable(held.case_id):
+                return jdump({"error": f"Task {task_id} not found"})
             task = case_records_service.update_task(
                 session, task_id, updates, signed_in=actor()
             )
             if task is None:
                 return jdump({"error": f"Task {task_id} not found"})
+            # Judged with status and assignee both applied; raising rolls back.
+            require_current_owner(
+                session, task.assignee, is_open=task_is_open(task.status)
+            )
             payload = CaseTaskSchema.dump(task)
             case_id = task.case_id
             title = task.title
@@ -1036,19 +1219,28 @@ def update_case_task(
                 "task": payload,
             }
         )
+    except OwnerNotCurrent as e:
+        return jdump({"error": e.message, "code": e.code})
     except Exception as e:
         return jdump({"error": str(e)})
 
 
-@mcp.tool()
+@tool("Case tasks", reads=True)
 @requires("cases.read")
 def get_case_tasks(case_id: str) -> str:
     """Get all tasks for a case."""
+    if (refused := _not_found(case_id)) is not None:
+        return refused
     try:
         from core.cases import case_records_service
 
-        tasks = case_records_service.list_tasks(case_id)
-        payload = CaseTaskSchema.dump_many(tasks)
+        payload = CaseTaskSchema.dump_many(case_records_service.list_tasks(case_id))
+        # Demo mode has no database and no accounts: nothing is current.
+        if get_data_service().is_using_database():
+            with service_session() as session:
+                with_owner_state(session, payload)
+        else:
+            with_owner_state(None, payload)
 
         return jdump(
             {
@@ -1061,7 +1253,7 @@ def get_case_tasks(case_id: str) -> str:
         return jdump({"error": str(e)})
 
 
-@mcp.tool()
+@tool("Link related cases")
 @requires("cases.write")
 def link_related_cases(
     case_id: str,
@@ -1084,6 +1276,8 @@ def link_related_cases(
         - link_related_cases("case-123", "case-125", "parent",
                             notes="case-123 is the parent campaign")
     """
+    if (refused := _not_found(case_id) or _not_found(related_case_id)) is not None:
+        return refused
     try:
         from core.cases import case_records_service
 
@@ -1121,76 +1315,62 @@ def link_related_cases(
         return jdump({"error": str(e)})
 
 
-@mcp.tool()
-@requires("cases.assign")
+@tool("Move case to a team", destructive=True)
 @requires("cases.write")
+def move_case(
+    case_id: str,
+    team: str,
+    source_team_id: str,
+    reason: Optional[str] = None,
+    owner: Optional[str] = None,
+) -> str:
+    """Move a case to a team, named uniquely ignoring case.
+
+    ``source_team_id`` is the team id on the case you read. An unknown or
+    archived team is refused. A person sends a reason. Not a frozen tool.
+    """
+    from core.exceptions import SOCError
+
+    if (refused := _not_found(case_id)) is not None:
+        return refused
+    try:
+        with service_session() as session:
+            moved = move_case_row(
+                session,
+                case_id,
+                source_team_id=source_team_id,
+                destination_name=team,
+                reason=reason,
+                owner=owner,
+                username=actor(),
+                user_id=None,
+                http=False,
+            )
+            payload = CaseSchema.dump(moved)
+        return jdump({"success": True, "case": payload})
+    except SOCError as exc:
+        return jdump({"error": exc.message, "code": exc.code})
+    except Exception as e:
+        return jdump({"error": str(e)})
+
+
+@tool("Escalate case (replaced by move_case)", reads=True)
 def escalate_case(
     case_id: str,
     escalated_to: str,
     reason: str,
     urgency_level: str = "high",
 ) -> str:
-    """
-    Escalate a case to higher tier or management.
-
-    Args:
-        case_id: The case ID
-        escalated_to: Who to escalate to (username/team)
-        reason: Reason for escalation
-        urgency_level: Urgency ("low", "medium", "high", "critical")
-
-    Example:
-        escalate_case("case-123", "soc-manager",
-                     "Suspected APT activity requires management approval",
-                     urgency_level="critical")
-    """
-    try:
-        from core.cases import case_records_service
-        from core.cases.case_workflow_service import CaseWorkflowService
-
-        with service_session() as session:
-            # Before the call: it swallows errors into a bare False.
-            escalated_to = resolve_escalation_target(session, escalated_to)
-            escalated = CaseWorkflowService().escalate_case(
-                case_id=case_id,
-                escalated_from=actor(),
-                escalated_to=escalated_to,
-                reason=reason,
-                urgency_level=urgency_level,
-                session=session,
-            )
-            if not escalated:
-                return jdump({"error": f"Could not escalate {case_id}"})
-
-            session.flush()
-            # Read back the way POST /{case_id}/escalate does: the service
-            # reports whether it escalated, not which row it wrote.
-            escalations = case_records_service.list_escalations(session, case_id)
-            payload = CaseEscalationSchema.dump(escalations[-1]) if escalations else {}
-
-        add_case_activity(
-            case_id,
-            "escalation",
-            f"Case escalated to {escalated_to}: {reason}",
-            {
-                "escalation_id": payload.get("escalation_id"),
-                "urgency": urgency_level,
-            },
-        )
-
-        return jdump(
-            {
-                "success": True,
-                "escalation_id": payload.get("escalation_id"),
-                "message": f"Escalated {case_id} to {escalated_to}",
-                "escalation": payload,
-            }
-        )
-    except Exception as e:
-        return jdump({"error": str(e)})
+    """Escalation has been replaced by the beta move and ``move_case``."""
+    return jdump(
+        {
+            "error": ESCALATE_REPLACED.format(case_id=case_id),
+            "code": "ESCALATE_REPLACED",
+        }
+    )
 
 
-@mcp.tool()
+@tool("Close case", destructive=True)
 @requires("cases.write")
 def close_case(
     case_id: str,
@@ -1201,6 +1381,7 @@ def close_case(
     executive_summary: Optional[str] = None,
     false_positive_reason: Optional[str] = None,
     closure_notes: Optional[str] = None,
+    false_positive_cause: Optional[str] = None,
 ) -> str:
     """
     Properly close a case with closure metadata.
@@ -1214,6 +1395,9 @@ def close_case(
         executive_summary: Optional executive summary
         false_positive_reason: Optional reason a false-positive closure was one
         closure_notes: Optional free-text notes on the closure
+        false_positive_cause: Optional cause (expected, too_broad, data, other).
+            Omit it to leave a standing cause. A value outside that set closes nothing.
+            A valid cause on any other category is dropped.
 
     Example:
         close_case("case-123", "resolved",
@@ -1222,6 +1406,8 @@ def close_case(
                   recommendations="Deploy MFA to all users, additional phishing training",
                   executive_summary="Lateral movement attack contained and remediated")
     """
+    if (refused := _not_found(case_id)) is not None:
+        return refused
     try:
         from core.cases.case_workflow_service import CaseWorkflowService
         from core.cases.closure import ClosureCategory
@@ -1240,6 +1426,27 @@ def close_case(
                 }
             )
 
+        cause_arg: dict = {}
+        if false_positive_cause is not None:
+            try:
+                cause_arg["false_positive_cause"] = false_positive_cause_value(
+                    false_positive_cause
+                )
+            except ValueError as exc:
+                return jdump(
+                    {
+                        "error": str(exc),
+                        "causes": [member.value for member in FalsePositiveCause],
+                    }
+                )
+
+        # After the arguments are checked, before anything is written. A
+        # re-close of a closed case is held too, with no "left open" activity.
+        stored = get_data_service().get_case(case_id) or {}
+        left_open = stored.get("status") != "closed"
+        if (held := tool_registry.held_close(case_id, left_open=left_open)) is not None:
+            return jdump(held)
+
         with service_session() as session:
             # Through the service rather than writing the rows here. This tool
             # had its own copy of the close, so the SLA clock, the IOC index and
@@ -1257,6 +1464,8 @@ def close_case(
                 executive_summary=executive_summary,
                 false_positive_reason=false_positive_reason,
                 closure_notes=closure_notes,
+                by_model=True,
+                **cause_arg,
             )
             if closure is None:
                 return jdump({"error": f"Case {case_id} not found"})
@@ -1286,9 +1495,21 @@ def close_case(
 # --- Approval queue -------------------------------------------------------
 
 
-@mcp.tool()
+# Ceiling releases still running after their tool call returned (#5235).
+_releases: set = set()
+
+
+def _run_case_params(run_id: str) -> dict:
+    from core.workflows.run_bridge_router import _origin_case
+    from core.workflows.workflow_run_service import WorkflowRunService
+
+    case_id = _origin_case(run_id, WorkflowRunService())
+    return {"run_id": run_id, **({"case_ids": [case_id]} if case_id else {})}
+
+
+@tool("Propose an action for approval")
 @requires("ai_chat.use")
-def create_approval_action(
+async def create_approval_action(
     action_type: str,
     title: str,
     description: str,
@@ -1300,16 +1521,39 @@ def create_approval_action(
     """Submit action to approval queue.
 
     ``action_type`` is one of isolate_host, block_ip, block_domain,
-    quarantine_file, disable_user, custom.
+    quarantine_file, disable_user, revoke_session (end an account's sessions;
+    the account stays usable), custom.
 
     The caller's ``confidence`` is its own claim, so it never releases the
-    action: the row waits in the queue for a person.
+    action: the row waits in the queue for a person, unless a run no person
+    started proposed a kind Vigil carries and the autonomy ceiling lets that
+    run take the act, in which case it is carried out at once.
     """
-    if not 0.0 <= confidence <= 1.0:
-        return jdump({"error": "confidence must be between 0 and 1"})
+    from core.auth.tool_principal import current_claims
+    from core.response import containment
+    from core.response.proposal_targets import (
+        REASON_SENTENCES,
+        check_confidence,
+        check_target,
+    )
+
+    # Only the kinds a run may propose; the target must fit the kind and the
+    # confidence be above zero.
+    checked, code = check_target(action_type, target)
+    code = code or check_confidence({"confidence": confidence})
+    if code:
+        return jdump({"error": REASON_SENTENCES[code], "reason_code": code})
+    target = checked
+    run_claims = containment.unattended(current_claims())
     try:
-        svc = ApprovalService()
-        action = svc.create_action(
+        # On the run's case, as its conclusion's are, so the case shows the ask.
+        params = (
+            await asyncio.to_thread(_run_case_params, run_claims.run_id)
+            if run_claims
+            else None
+        )
+        action, inserted = await asyncio.to_thread(
+            ApprovalService()._put_action,
             action_type=ActionType(action_type),
             title=title,
             description=description,
@@ -1318,21 +1562,38 @@ def create_approval_action(
             reason=reason,
             evidence=evidence or [],
             created_by=actor(),
+            created_by_principal_id=acting_principal(),
+            parameters=params,
+            # A run no person started asks each act once, as its conclusion does:
+            # a retried call finds the row and is not carried out twice.
+            idempotency_key=(
+                f"run-proposal:{run_claims.run_id}:{action_type}:{target}"
+                if run_claims
+                else None
+            ),
             human_only=True,
-        )
-        return jdump(
-            {
-                "success": True,
-                "action_id": action.action_id,
-                "status": action.status,
-                "message": f"Action created. Status: {action.status}",
-            }
         )
     except Exception as e:
         return jdump({"error": str(e)})
+    if inserted and run_claims is not None:
+        # Shielded and held: a timed-out tool call must not cancel an act mid-claim.
+        task = asyncio.ensure_future(
+            containment.release_under_ceiling(action, run_claims)
+        )
+        _releases.add(task)
+        task.add_done_callback(_releases.discard)
+        action = await asyncio.shield(task)
+    return jdump(
+        {
+            "success": True,
+            "action_id": action.action_id,
+            "status": action.status,
+            "message": f"Action created. Status: {action.status}",
+        }
+    )
 
 
-@mcp.tool()
+@tool("List approval actions", reads=True)
 @requires("ai_decisions.read")
 def list_approval_actions(
     status: Optional[str] = None,
@@ -1343,10 +1604,14 @@ def list_approval_actions(
     ``status`` is one of pending, approved, rejected, executed, failed.
     """
     try:
+        from core.response.approval_service import screen_actions
+
         svc = ApprovalService()
-        actions = svc.list_actions(
-            status=ActionStatus(status) if status else None,
-            action_type=ActionType(action_type) if action_type else None,
+        actions = screen_actions(
+            svc.list_actions(
+                status=ActionStatus(status) if status else None,
+                action_type=ActionType(action_type) if action_type else None,
+            )
         )
         return jdump(
             {
@@ -1370,21 +1635,24 @@ def list_approval_actions(
         return jdump({"error": str(e)})
 
 
-@mcp.tool()
+@tool("Get approval action", reads=True)
 @requires("ai_decisions.read")
-def get_approval_action(action_id: str) -> str:
-    """Get action details."""
-    return _call(tool_registry.get_approval_action, action_id=action_id)
+async def get_approval_action(action_id: str) -> str:
+    """Get action details. An isolation or account disable carries the vendor
+    IDs its target resolved to, or what it is waiting on, in
+    ``parameters.containment``, and once run, the vendor's state in
+    ``execution_result.state``."""
+    return await _acall(tool_registry.get_approval_action, action_id=action_id)
 
 
-@mcp.tool()
+@tool("Approve action (confirmed in Approvals)", reads=True)
 @requires("ai_decisions.approve")
 def approve_action(action_id: str) -> str:
     """Leave a pending action pending. Confirm it in Approvals."""
     return _call(tool_registry.approve_action, action_id=action_id)
 
 
-@mcp.tool()
+@tool("Reject action", destructive=True)
 @requires("ai_decisions.approve")
 async def reject_action(
     action_id: str,
@@ -1392,6 +1660,519 @@ async def reject_action(
 ) -> str:
     """Reject a pending action. The actor is the caller, not an argument."""
     return await _acall(tool_registry.reject_action, action_id=action_id, reason=reason)
+
+
+# Catalog and oversight reads (#4249): each mirrors a frozen /api/v1 GET and
+# checks the permission that route checks.
+
+
+@tool("List workflows", reads=True)
+@requires("automation.read")
+def list_workflows() -> str:
+    """List the workflows, file-based and custom, as GET /api/v1/workflows does:
+    ``{workflows, count}``."""
+    return _call(catalog.listing, service=WorkflowsService())
+
+
+@tool("Get workflow", reads=True)
+@requires("automation.read")
+def get_workflow(workflow_id: str) -> str:
+    """Get one workflow in full, as GET /api/v1/workflows/{workflow_id} does."""
+    try:
+        workflow = catalog.detail(WorkflowsService(), workflow_id)
+    except Exception as e:
+        logger.error("get_workflow failed: %s", e)
+        return jdump({"error": str(e)})
+    if workflow is None:
+        return jdump({"error": f"Workflow not found: {workflow_id}"})
+    return jdump(workflow)
+
+
+# The keys GET /api/v1/agents serves (AgentManifestResponse).
+_AGENT_KEYS = ("id", "description", "needs", "skills", "manifest")
+_AGENT_TIMES = ("created_at", "updated_at")
+
+
+def _agent(row: dict) -> dict:
+    return {
+        **{k: row.get(k) for k in _AGENT_KEYS},
+        **{k: row[k].isoformat() if row.get(k) else None for k in _AGENT_TIMES},
+    }
+
+
+@tool("List operator agents", reads=True)
+@requires("automation.read")
+def list_operator_agents() -> str:
+    """List the operator agents (stored plugin manifests), as GET /api/v1/agents
+    does: ``{agents, count}``. Read only."""
+
+    def listing():
+        agents = [_agent(row) for row in CustomAgentService().list_manifests()]
+        return {"agents": agents, "count": len(agents)}
+
+    return _call(listing)
+
+
+@tool("Get operator agent", reads=True)
+@requires("automation.read")
+def get_operator_agent(agent_id: str) -> str:
+    """Get one operator agent's manifest, as GET /api/v1/agents/{agent_id} does."""
+    try:
+        row = CustomAgentService().get_manifest(agent_id)
+    except Exception as e:
+        logger.error("get_operator_agent failed: %s", e)
+        return jdump({"error": str(e)})
+    if row is None:
+        return jdump({"error": f"Agent not found: {agent_id}"})
+    return jdump(_agent(row))
+
+
+@tool("Autonomy ceiling", reads=True)
+@requires("ai_autonomy.read")
+def get_autonomy_ceiling() -> str:
+    """Read the autonomy ceiling, as GET /api/v1/autonomy does: the stored act
+    flags, who stopped it, the actions that stop is holding, the effective
+    read/write/propose state, environment_locked, four_eyes, hold_crown_jewels,
+    the declared crown_jewels count, released_per_hour and each workflow's own tier. Read only.
+    """
+    try:
+        return jdump(ceiling_read())
+    except Exception as e:
+        logger.error("get_autonomy_ceiling failed: %s", e)
+        return jdump({"error": "Could not read the autonomy ceiling"})
+
+
+@tool("Model change preview", reads=True)
+@requires("ai_autonomy.read")
+def preview_model_change(component: str, provider_id: str, model_id: str) -> str:
+    """Preview a model assignment, as GET /api/autonomy/model-change does: the
+    investigation model before and after setting ``component`` to
+    ``provider_id``/``model_id``, and per Act workflow whether it would keep
+    Act (on its live record or replay) or drop to Assist, with the reason.
+    Read only; it saves nothing."""
+    from core.response.ceiling import ModelJudgeError
+    from core.response.ceiling import preview_model_change as preview
+
+    try:
+        return jdump(preview(component, provider_id, model_id))
+    except (ValueError, ModelJudgeError) as e:
+        return jdump({"error": str(e)})
+    except Exception as e:
+        logger.error("preview_model_change failed: %s", e)
+        return jdump({"error": "Could not preview the model change"})
+
+
+@tool("Declared intent report", reads=True)
+@requires("ai_autonomy.read")
+def get_intent_report() -> str:
+    """Read the declared intent report, as GET /api/config/intent does: each
+    INTENT.md key's declared and effective value, and with a declared directory
+    applied, per key whether it is managed, its file, line and revision, drift,
+    pending loosenings and an ignored env value; plus the applied revision, the
+    revision on disk, in_sync and state. Read only; accepting is not exposed."""
+    from core.intent_report import intent_body
+
+    try:
+        return jdump(intent_body())
+    except Exception as e:
+        logger.error("get_intent_report failed: %s", e)
+        return jdump({"error": "Could not read the intent report"})
+
+
+@tool("Declared site context", reads=True)
+@requires("platform.read")
+def get_site_context() -> str:
+    """Read the declared site (site/*.md beside INTENT.md), as GET
+    /api/config/site does: the applied revision, its state (ok, rejected,
+    degraded or none), any refusal with file and line, each zone, crown jewel,
+    owner and blind spot with its selectors, file, line and resolved owner, the
+    applied files' text, and the latest Day 1 Report's site checks and item
+    states. Read only; a change is a commit."""
+    from core.site import site_view
+
+    try:
+        return jdump(site_view())
+    except Exception as e:
+        logger.error("get_site_context failed: %s", e)
+        return jdump({"error": "Could not read the declared site"})
+
+
+@tool("Entity facts held", reads=True)
+@requires("findings.read")
+def get_entity_facts(limit: Annotated[int, Field(ge=1, le=500)] = 100) -> str:
+    """What Vigil holds from Entra, Okta and Falcon about users and hosts, as GET
+    /api/v1/entity-facts does: per source the rows held, oldest and newest fetch,
+    the hit rate and last failure kind over the last window_hours (the TTL); the
+    limits in force; and the newest ``limit`` rows. Rows on a case you may not
+    read are left out of the rows and every count. Read only."""
+    from core.integrations import entity_facts
+
+    try:
+        return jdump(entity_facts.held(limit))
+    except Exception as e:
+        logger.error("get_entity_facts failed: %s", e)
+        return jdump({"error": "Could not read the entity facts"})
+
+
+@tool("Audit trail", reads=True)
+@requires("audit.read")
+def list_audit_entries(
+    since: Optional[datetime] = None,
+    until: Optional[datetime] = None,
+    actor: Optional[str] = None,
+    person: Optional[str] = None,
+    kind: Optional[str] = None,
+    area: Optional[str] = None,
+    object: Optional[str] = None,
+    outcome: Optional[str] = None,
+    attribution: Optional[str] = None,
+    after: Annotated[Optional[int], Field(ge=0)] = None,
+    sign_in: Optional[str] = None,
+    limit: Annotated[int, Field(ge=1, le=trail.POLL_LIMIT)] = 100,
+) -> str:
+    """Read the audit trail, oldest sequence first, as GET /api/v1/audit/entries
+    does: ``{entries, tip, feed}``. Page on ``after``: pass the last ``seq`` read.
+    A plain read: it is not the forwarder's poll and moves no feed or retention
+    state."""
+    try:
+        q = reads.query(
+            since=since,
+            until=until,
+            actor=actor,
+            person=person,
+            kind=kind,
+            area=area,
+            object_=object,
+            outcome=outcome,
+            attribution=attribution,
+            after=after,
+            sign_in=sign_in,
+        )
+    except ValueError as e:
+        return jdump({"error": str(e)})
+    try:
+        # Read only: the session closes without a commit.
+        with get_db_session() as session:
+            return jdump(reads.page(session, q, limit))
+    except Exception as e:
+        logger.error("list_audit_entries failed: %s", e)
+        return jdump({"error": str(e)})
+
+
+# --- Detection engineering (#4737) --------------------------------------------
+# Thin over what /api/detection-rules and /api/detection-engineering call. Only
+# narrowing acts: dismissing a proposal and switching a shadow rule off.
+
+_HEALTH = Literal[
+    "attention",
+    "fails_to_run",
+    "data_silent",
+    "missing_field",
+    "never_fired",
+    "fires",
+    "disabled",
+    "no_fire_data",
+]
+_FLAG = Literal["noisy", "quiet", "accurate", "silent", "drift", "caught"]
+
+
+def _shown(views: list) -> list:
+    """Proposals as the caller may see them, as the proposals router shows them.
+    A run no person started holds no role and reads all, as ``requires`` passes it."""
+    from core.detections.engineering import proposals
+
+    reads_findings = permission_refusal("findings.read") is None
+    reads_cases = permission_refusal("cases.read") is None
+    return [
+        proposals.shown_to(v, reads_findings=reads_findings, reads_cases=reads_cases)
+        for v in views
+    ]
+
+
+def _proposal_answer(step) -> str:
+    """A proposal step's view, or the route's refusal text."""
+    from core.detections.engineering import proposals
+    from core.detections.overlay import Refused
+    from core.storage.models.detection_proposal import InvalidProposalMove
+
+    try:
+        return jdump(_shown([step()])[0])
+    except (proposals.NotFound, InvalidProposalMove) as exc:
+        return jdump({"error": str(exc)})
+    except Refused as exc:
+        return jdump({"error": str(exc), **exc.detail})
+
+
+@tool("List detection rules", reads=True)
+@requires("detections.read")
+def list_detection_rules(
+    health: Optional[_HEALTH] = None,
+    tool: Optional[Literal["elastic", "splunk", "wazuh"]] = None,
+    q: Annotated[Optional[str], Field(max_length=200)] = None,
+    offset: Annotated[int, Field(ge=0)] = 0,
+    sort: Literal["worst", "most_fires", "fewest_fires", "name"] = "worst",
+    flag: Optional[_FLAG] = None,
+    rule_ids: Annotated[Optional[list[int]], Field(max_length=1000)] = None,
+    has_exceptions: bool = False,
+    stage: Optional[Literal["shadow", "live", "off"]] = None,
+) -> str:
+    """Every listed rule copy's health, stage and data source, as GET
+    /api/detection-rules/rules returns it: a page from ``offset``, narrowed by
+    ``health`` ("attention" is every state to act on), ``tool``, ``stage``,
+    ``flag`` (a failing Noisy, Quiet, Accurate, Silent or drift check, or a
+    passing Caught), the search ``q`` and ``rule_ids``, in ``sort`` order; with
+    ``has_exceptions``, every copy with an active exception."""
+    from core.detections.inventory import catalog
+
+    return jdump(
+        catalog.health_listing(
+            health,
+            tool=tool,
+            q=q,
+            offset=offset,
+            sort=sort,
+            flag=flag,
+            rule_ids=rule_ids,
+            has_exceptions=has_exceptions,
+            stage=stage,
+        )
+    )
+
+
+@tool("Get detection rule", reads=True)
+@requires("detections.read")
+def get_detection_rule(rule_id: int) -> str:
+    """One rule copy: its latest version's query and checks (lint, replay, runs,
+    shadow and the rest); ``stage_history``, its stage rows newest first with
+    whether a person's hold keeps it in shadow; and ``proposals``, the gaps-run
+    proposals it answers with the hunts behind them."""
+    from core.detections.engineering import proposals
+    from core.detections.inventory import catalog, stages
+
+    rule = catalog.rule_detail(rule_id)
+    if rule is None:
+        return jdump({"error": f"No detection rule {rule_id}"})
+    return jdump(
+        {
+            **rule,
+            "stage_history": stages.history(rule_id),
+            "proposals": _shown(proposals.for_rule(rule_id)),
+        }
+    )
+
+
+@tool("Detection coverage", reads=True)
+@requires("detections.read")
+async def get_detection_coverage(
+    by_layer: bool = False,
+    scope: Literal["all", "emulated", "intel"] = "all",
+    techniques: Optional[list[str]] = None,
+) -> str:
+    """ATT&CK coverage by technique and SIEM: each technique an active rule
+    declares or an alert shows, proven (an active SIEM copy passes Runs and
+    Sees), unproven or with no rule. A rule failing lint, or a repo rule the
+    import check holds (``held`` on each row counts those), is no coverage.
+
+    ``by_layer`` adds ``by_layer``: which detection layer catches each technique,
+    shown by attack. Rows are layers (each SIEM with rules, each alert source
+    that labels techniques, LogLM when present) and a combined row; each cell is
+    validated, partial, present (not validated), no_detection or not_checked,
+    with marks tested_missed, not_observable and shadow, and its evidence
+    (declaring rules and their checks, the newest emulation run: hosts and steps
+    caught of steps run, older runs, LogLM flags, blind spots). Measures are
+    counts: validated per layer and combined, loglm_lift, validated by one
+    layer, present never validated, not observable. Evidence is the last 30
+    days' compose emulation runs. ``scope``: all (the map's techniques),
+    emulated (those emulated in the window) or intel (those the connected
+    threat intelligence names; says so when none is connected). ``techniques``
+    (e.g. ["T1059", "T1003.001"]) answers for exactly those and implies
+    by_layer."""
+    from core.detections.inventory import coverage
+
+    return jdump(await coverage.read(by_layer, scope, techniques))
+
+
+@tool("List detection proposals", reads=True)
+@requires("detections.read")
+def list_detection_proposals(
+    state: Optional[
+        Literal[
+            "draft", "linted", "replayed", "converted", "shadow", "live", "rejected"
+        ]
+    ] = None,
+) -> str:
+    """Detection proposals newest first, each with its latest replay's counts;
+    ``state`` narrows them. A proposal from a Case the caller can't read is
+    absent, and its logs, findings and Case are withheld from a caller without
+    findings.read or cases.read."""
+    from core.detections.engineering import proposals
+
+    return jdump({"proposals": _shown(proposals.listing(state))})
+
+
+@tool("Get detection proposal", reads=True)
+@requires("detections.read")
+def get_detection_proposal(proposal_id: str) -> str:
+    """One detection proposal with its Sigma, copies and every step on its record."""
+    from core.detections.engineering import proposals
+
+    return _proposal_answer(lambda: proposals.get(proposal_id))
+
+
+@tool("Dismiss detection proposal", destructive=True)
+@requires("detections.write")
+def dismiss_detection_proposal(
+    proposal_id: str, reason: Annotated[str, Field(max_length=2000)]
+) -> str:
+    """Rejects a proposal, with why: it stays on the record and on the audit
+    trail. A gaps-run draft whose run is still working is refused."""
+    from core.auth.tool_principal import current_claims
+    from core.detections.engineering import proposals
+
+    kind = proposals.AGENT if current_claims() is not None else proposals.PERSON
+    return _proposal_answer(
+        lambda: proposals.reject(proposal_id, actor(), reason, kind)
+    )
+
+
+@tool("Switch a shadow rule off", destructive=True)
+@requires("detections.write")
+def switch_off_detection_rule(
+    rule_id: int, reason: Annotated[str, Field(min_length=1, max_length=2000)]
+) -> str:
+    """Switches a shadow rule off and holds it there; a promotion still waiting
+    is declined. A later version waits in shadow until a person releases the
+    hold. A rule not in shadow is refused."""
+    from core.detections.inventory import stages
+
+    if not reason.strip():
+        return jdump({"error": "reason must not be blank"})
+    username = actor()
+    try:
+        return jdump(
+            stages.switch_off(
+                rule_id, (username, acting_principal() or username), reason.strip()
+            )
+        )
+    except (LookupError, ValueError) as exc:
+        return jdump({"error": str(exc)})
+
+
+@tool("Approve a held detection rule")
+@requires("detections.write")
+def approve_detection_rule(
+    rule_id: int, reason: Annotated[str, Field(min_length=1, max_length=2000)]
+) -> str:
+    """Makes a repo or local rule's latest version count as coverage although the
+    import check holds it (checks.import pending, flagged or failed): for
+    example a KQL rule whose Sentinel tables you know are there. Refused when
+    its lint fails or it is not held; its next version is held again."""
+    from core.detections.inventory import import_check
+
+    if not reason.strip():
+        return jdump({"error": "reason must not be blank"})
+    username = actor()
+    try:
+        return jdump(
+            import_check.approve(
+                rule_id, (username, acting_principal() or username), reason.strip()
+            )
+        )
+    except (LookupError, ValueError) as exc:
+        return jdump({"error": str(exc)})
+
+
+# --- Rule libraries: rules imported from a git repo (#5116) -------------------
+
+
+def _library_call(fn) -> str:
+    """Run a rule-library call on a fresh service; a refusal is an error."""
+    from core.detections.detection_rules_service import DetectionRulesService
+
+    try:
+        return jdump(fn(DetectionRulesService()))
+    except (LookupError, ValueError) as exc:
+        return jdump({"error": str(exc)})
+
+
+def _who() -> tuple:
+    username = actor()
+    return acting_principal() or username, username
+
+
+@tool("Read a rule repo", reads=True)
+@requires("detections.write")
+def read_rule_repo(
+    repo: Annotated[Optional[str], Field(max_length=500)] = None,
+    source_id: Optional[str] = None,
+    format: Optional[
+        Literal["auto", "sigma", "splunk", "elastic", "kql", "wazuh"]
+    ] = None,
+) -> str:
+    """Reads a git repo of detection rules (``repo``: owner/repo, a GitHub link
+    or an https URL, with ``@ref``) or an imported library (``source_id``),
+    installing nothing. Returns the ``commit`` read and the rule files grouped
+    by folder, each with language, techniques and ``problem`` (why it cannot be
+    picked: it does not read, or its key is already another source's active
+    rule). For a library, ``library`` lists changed, gone and new files. Pass
+    the commit to import_rules."""
+    from core.detections import rule_libraries
+
+    return _library_call(
+        lambda service: rule_libraries.read(
+            service, repo=repo, source_id=source_id, fmt=format
+        )
+    )
+
+
+@tool("Import detection rules")
+@requires("detections.write")
+def import_rules(
+    commit: Annotated[str, Field(min_length=7, max_length=64)],
+    picks: Annotated[list[str], Field(max_length=20000)],
+    repo: Annotated[Optional[str], Field(max_length=500)] = None,
+    source_id: Optional[str] = None,
+    name: Annotated[Optional[str], Field(max_length=200)] = None,
+    format: Optional[
+        Literal["auto", "sigma", "splunk", "elastic", "kql", "wazuh"]
+    ] = None,
+) -> str:
+    """Imports the rule files ``picks`` (paths as read_rule_repo listed them) at
+    ``commit``: a new library from ``repo`` (no picks makes an empty one), or
+    changed, new and gone files of the library ``source_id``. Refused when the
+    repo has moved since it was read: read it again. All or nothing."""
+    from core.detections import rule_libraries
+
+    def run(service):
+        source = rule_libraries.import_rules(
+            service,
+            commit,
+            picks,
+            _who(),
+            repo=repo,
+            source_id=source_id,
+            name=name,
+            fmt=format,
+        )
+        rule_libraries.sync_soon()
+        return {"success": True, "source": source}
+
+    return _library_call(run)
+
+
+@tool("Remove a rule library", destructive=True)
+@requires("detections.write")
+def remove_rule_library(source_id: str) -> str:
+    """Removes an imported rule library and its files. Its rules are marked
+    removed on the next sync; proposals made from them stay."""
+    from core.detections import rule_libraries
+
+    def run(service):
+        removed = rule_libraries.remove(service, source_id, _who())
+        rule_libraries.sync_soon()
+        return {"success": True, **removed}
+
+    return _library_call(run)
 
 
 # --- Run lifecycle, for a caller outside Vigil (#4248) ------------------------
@@ -1409,22 +2190,37 @@ def _person() -> tuple[Optional[str], str]:
     return actor_identity()
 
 
-@mcp.tool()
+@tool("Start a run")
 @requires("ai_chat.use")
 async def start_run(
     workflow_id: str,
-    case_id: str,
+    case_id: Optional[str] = None,
     context: Optional[str] = None,
     hypothesis: Optional[str] = None,
     finding_id: Optional[str] = None,
+    hypothesis_subjects: Optional[dict[str, list[str]]] = None,
+    restricted: bool = False,
+    approve_hypotheses: bool = False,
+    zone: Optional[str] = None,
 ) -> str:
-    """Start a workflow or operator agent (``agent-run-<id>``) on a case. Returns
-    ``run_id``, ``case_id`` and ``status``; re-read the run with ``get_run``."""
+    """Start a workflow or operator agent (``agent-run-<id>``) on a case. With
+    ``restricted``, the case must be a restricted one, or omit ``case_id`` to open
+    a new case only you can read. ``hypothesis_subjects`` maps each hypothesis
+    line to the Entity Keys it is about; ``approve_hypotheses`` holds a hunt for
+    a person to approve its board. ``zone`` starts a hunt on a zone the applied
+    site declares (``get_site_context``), its selectors as the scope; an unknown
+    zone, or no site declared, is refused. A ``propose_lead_hunt`` proposal passes as-is.
+    Returns ``run_id``, ``case_id`` and ``status``; re-read the run with
+    ``get_run``."""
+    from core.agents.tool_registry import _restricter
     from core.auth import tool_principal
+    from core.workflows.start_case import StartRefused, start_on_case
     from core.workflows.workflows_service import WorkflowsService
 
     if tool_principal.current_claims() is not None:
         return jdump(_OUTSIDE_ONLY)
+    if not case_id and not restricted:
+        return jdump({"error": "case_id is required unless restricted is set"})
 
     async def start() -> dict:
         principal, username = _person()
@@ -1435,33 +2231,69 @@ async def start_run(
                 "context": context,
                 "hypothesis": hypothesis,
                 "finding_id": finding_id,
+                "hypothesis_subjects": hypothesis_subjects,
+                "restricted": restricted,
+                "approve_hypotheses": approve_hypotheses,
             }.items()
             if v
         }
-        # No session to tie the run to, as a scheduled start has none.
-        result = await WorkflowsService().execute_workflow(
-            workflow_id,
-            params,
-            triggered_by=username,
-            principal=tool_principal.mint(
-                username,
-                person_id=principal,
-                origin="person",
-                ttl=tool_principal.RUN_TTL,
-            ),
-        )
+
+        async def execute(params: dict) -> dict:
+            # No session to tie the run to, as a scheduled start has none.
+            return await WorkflowsService().execute_workflow(
+                workflow_id,
+                params,
+                triggered_by=username,
+                principal=tool_principal.mint(
+                    username,
+                    person_id=principal,
+                    origin="person",
+                    ttl=tool_principal.RUN_TTL,
+                ),
+                zone=zone,
+            )
+
+        try:
+            result = await start_on_case(workflow_id, params, _restricter, execute)
+        except StartRefused as refused:
+            return {"error": refused.detail}
         if not result.get("success"):
             return {"error": result.get("error", "the run was not started")}
         return {
             "run_id": result.get("run_id"),
-            "case_id": case_id,
+            "case_id": result.get("case_id"),
             "status": result.get("status"),
         }
 
     return await _acall(start)
 
 
-@mcp.tool()
+@tool("Propose an insider lead hunt", reads=True)
+@requires("ai_chat.use")
+def propose_lead_hunt(finding_id: str) -> str:
+    """For a finding that names an account: a ``start_run`` body (with
+    ``workflow_id`` threat-hunt) hunting each account's data movement on a new
+    restricted case. Starts nothing."""
+    from core.workflows.insider_lead import LeadRefused, lead_proposal
+
+    try:
+        return jdump(lead_proposal(finding_id))
+    except LeadRefused as refused:
+        return jdump({"error": refused.detail})
+
+
+@tool("Insider lead list", reads=True)
+@requires("automation.read")
+def insider_leads() -> str:
+    """Which sources and rule names are insider leads, and the readers and teams of
+    the cases they open: ``{sources, rule_names, readers, teams}``. With no source
+    or rule name, automatic start is off. A person sets it in the console."""
+    from core.workflows.insider_lead import leads
+
+    return jdump(leads())
+
+
+@tool("List runs", reads=True)
 @requires("ai_chat.use")
 def list_runs(
     case_id: Optional[str] = None,
@@ -1473,11 +2305,19 @@ def list_runs(
     from core.workflows.workflow_run_service import WorkflowRunService
 
     def runs() -> dict:
+        hidden: list[int] = []
         rows = WorkflowRunService().list_runs(
-            case_id=case_id, status=status, limit=max(1, min(limit, 100))
+            case_id=case_id,
+            status=status,
+            limit=max(1, min(limit, 100)),
+            readable=True,
+            # not counted under a case filter, so it can't probe a hidden case
+            hidden=None if case_id else hidden,
         )
         return {
             "count": len(rows),
+            # runs on a restricted case the caller can't read, left out
+            "hidden": hidden[0] if hidden else 0,
             "runs": [
                 {
                     "run_id": r.get("run_id"),
@@ -1497,7 +2337,7 @@ def list_runs(
     return _call(runs)
 
 
-@mcp.tool()
+@tool("Get run", reads=True)
 @requires("ai_chat.use")
 async def get_run(run_id: str) -> str:
     """A run's status. While paused, the pending approval ids it waits on; once
@@ -1509,7 +2349,7 @@ async def get_run(run_id: str) -> str:
     )
 
     async def read() -> dict:
-        row = WorkflowRunService().get_run(run_id)
+        row = WorkflowRunService().get_run(run_id, readable=True)
         if row is None:
             return {"error": f"Run not found: {run_id}"}
         out = {
@@ -1555,7 +2395,7 @@ async def get_run(run_id: str) -> str:
     return await _acall(read)
 
 
-@mcp.tool()
+@tool("Steer a run", destructive=True)
 @requires("ai_chat.use")
 def send_directive(
     run_id: str,
@@ -1582,6 +2422,7 @@ def send_directive(
     )
     from core.auth.tool_principal import current_claims
     from core.storage.models import User
+    from core.workflows.workflow_run_service import run_hidden
 
     # Before anything else: a checkpoint is answered on the Approvals screen.
     if kind in DECISION_KINDS:
@@ -1605,6 +2446,9 @@ def send_directive(
             user_id = (
                 session.query(User.user_id).filter(User.username == username).scalar()
             )
+            # A run on a Case the caller can't read looks like no run at all.
+            if run_hidden(session, run_id):
+                return {"error": f"no such run: {run_id}"}
             try:
                 refuse_unpermitted(session, run_id, kind, fields, user_id, principal)
                 directive = enqueue_directive(
@@ -1631,3 +2475,179 @@ def send_directive(
         }
 
     return _call(steer)
+
+
+# The gaps run queues through the daemon's intake (services.daemon.gaps), which
+# tools/ may not import: core reaches this module, and core never reaches services.
+# The API that serves /mcp hands the starter in at startup.
+_gaps_starter: Optional[Callable[..., Awaitable[Any]]] = None
+
+
+def serve_gaps_runs(starter: Callable[..., Awaitable[Any]]) -> None:
+    global _gaps_starter
+    _gaps_starter = starter
+
+
+@tool("Start the detection gaps run")
+@requires("detections.write")
+async def start_gaps_run() -> str:
+    """Start the detection gaps run now instead of on the daily tick, as you. Returns
+    ``status``: queued (with ``proposal_ids``), nothing_to_raise (with the
+    ``floor``), blind_spots_only, or refused, with a ``message`` saying why. One at
+    a time: refused while another gaps run is unfinished."""
+    from core.auth import tool_principal
+
+    if tool_principal.current_claims() is not None:
+        return jdump(_OUTSIDE_ONLY)
+    # Starting a run, as start_run is.
+    if (refusal := permission_refusal("ai_chat.use")) is not None:
+        return jdump(refusal)
+    if _gaps_starter is None:
+        return jdump({"error": "the gaps run cannot be started from this process"})
+    starter = _gaps_starter
+
+    async def start() -> dict:
+        principal, username = _person()
+        outcome = await starter(
+            {
+                "started_by": username,
+                "principal": tool_principal.mint(
+                    username,
+                    person_id=principal,
+                    origin="person",
+                    ttl=tool_principal.RUN_TTL,
+                ),
+            }
+        )
+        return outcome.as_dict()
+
+    return await _acall(start)
+
+
+# --- The assessment, for a caller outside Vigil (#5046) ------------------------
+
+
+def _counted(missed: dict) -> dict:
+    """``runs_rules_missed`` with each hunt and case reduced to a count."""
+    return {
+        **missed,
+        "groups": [
+            {
+                **group,
+                "runs": len(group["runs"]),
+                "confirmed_runs": len(group["confirmed_runs"]),
+                "ruled_out": len(group["ruled_out"]),
+            }
+            for group in missed.get("groups", [])
+        ],
+        "unknown": len(missed.get("unknown", [])),
+    }
+
+
+@tool("Detection gaps report", reads=True)
+@requires("detections.read")
+async def get_gaps_report() -> str:
+    """What Vigil cannot see, as its own agents read it: techniques on stored
+    alerts no active rule declares, blind spots, proven runs no rule alerted on
+    over 30 days (``runs_rules_missed``) and rules that broke (``rule_health``).
+    The hunts and cases behind a missed run are named only to a caller who may
+    read cases; others get counts. A case the caller can't read is left out."""
+    from core.detections.tools import get_security_detection_tools
+
+    async def read() -> dict:
+        report = await get_security_detection_tools().identify_gaps()
+        if permission_refusal("cases.read") is not None:
+            report["runs_rules_missed"] = _counted(report["runs_rules_missed"])
+        return report
+
+    return await _acall(read)
+
+
+@tool("Emulate next", reads=True)
+@requires("detections.read")
+async def get_emulate_next() -> str:
+    """The coverage map's techniques in the order to emulate next: no rule,
+    unproven, proven with nothing caught, then the rest. Each row has
+    technique, name, tactic, state, rules and caught. Says nothing about which
+    tests an emulation runner holds."""
+    from core.detections.tools import get_security_detection_tools
+
+    return await _acall(get_security_detection_tools().emulate_next)
+
+
+@tool("Day 1 Report", reads=True)
+@requires("platform.read")
+def get_day1_report(record_id: Optional[str] = None) -> str:
+    """The Day 1 Report as the console shows it to you: the latest record, or
+    ``record_id``, with each section you may not read withheld. ``status`` says
+    whether a run is being written (``running_since``), did not complete, and
+    which record is the latest (``latest_id``)."""
+    from core.reporting.day1 import status
+    from core.reporting.day1_router import NO_REPORT, presented
+
+    principal, _ = _person()
+    if principal is None:
+        return jdump({"error": "no person is bound to this call"})
+
+    def read() -> dict:
+        report = presented(principal, record_id)
+        if report is None:
+            return {"error": NO_REPORT, "status": status()}
+        return {"status": status(), "report": report}
+
+    return _call(read)
+
+
+# Building the report reads the API's process health, which tools/ cannot reach.
+# The API that serves /mcp hands it in at startup.
+_process_health: Any = None
+_day1_runs: set = set()
+
+
+def serve_day1_runs(processes: Any) -> None:
+    global _process_health
+    _process_health = processes
+
+
+@tool("Start a Day 1 Report run")
+@requires("platform.write")
+async def start_day1_report() -> str:
+    """Run the Day 1 Report now, as you; you are notified when it is ready.
+    Returns at once with ``run_id``: poll ``get_day1_report`` until
+    ``status.latest_id`` changes, and its ``report.run_id`` is this ``run_id``."""
+    import asyncio
+
+    from core.auth import tool_principal
+    from core.reporting.day1 import run_on_demand
+
+    if tool_principal.current_claims() is not None:
+        return jdump(_OUTSIDE_ONLY)
+    if _process_health is None:
+        return jdump({"error": "a report run cannot be started from this process"})
+    principal, _ = _person()
+    if principal is None:
+        return jdump({"error": "no person is bound to this call"})
+
+    begun = asyncio.get_running_loop().create_future()
+    run = asyncio.create_task(run_on_demand(principal, _process_health, begun))
+    # Held until done, so the task is not collected mid-run.
+    _day1_runs.add(run)
+
+    def done(task: asyncio.Task) -> None:
+        _day1_runs.discard(task)
+        if not task.cancelled() and task.exception() is not None:
+            logger.error(
+                "on-demand day 1 report did not complete: %s", task.exception()
+            )
+
+    run.add_done_callback(done)
+    await asyncio.wait({begun, run}, return_when=asyncio.FIRST_COMPLETED)
+    if not begun.done():
+        return jdump({"error": "the report run could not be started"})
+    return jdump(
+        {
+            "run_id": begun.result(),
+            "status": "running",
+            "message": "Poll get_day1_report for status.latest_id.",
+        }
+    )

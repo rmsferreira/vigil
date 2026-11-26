@@ -50,15 +50,22 @@ def sweep() -> None:
     if days is None:
         return
     now = utcnow()
+    # After a restore the clocks are as backed up: nobody is warned or deactivated
+    # until the grace ends, then the normal warning comes first.
+    if dormancy.in_grace(now):
+        return
     with unit_of_work() as session:
         last = dormancy.activity(session)
-        # Active people only: a service account is never deactivated for idleness.
+        # Active people only: a service account or a break-glass account is never
+        # deactivated for idleness.
         people = (
             session.query(User.user_id)
             .join(Principal, Principal.principal_id == User.principal_id)
             .filter(
                 User.is_active.is_(True),
                 User.service_account.isnot(True),
+                # A break-glass account is unused by design.
+                User.break_glass_at.is_(None),
                 Principal.kind == principals.PERSON,
                 Principal.deleted_at.is_(None),
             )
@@ -87,7 +94,12 @@ def _handle(user_id: str, days: int, now) -> None:
             .with_for_update()
             .first()
         )
-        if user is None or not user.is_active or user.service_account is True:
+        if (
+            user is None
+            or not user.is_active
+            or user.service_account is True
+            or user.break_glass_at is not None
+        ):
             return
         last = dormancy.activity(session, [user_id])[user_id]
         start = dormancy.warning_start(last, days)
@@ -108,7 +120,9 @@ def _handle(user_id: str, days: int, now) -> None:
                 user.dormancy_held_at = now
                 _tell_held(session, user, last, days)
             return
-        deactivate_account(session, user, actor=ACTOR, by_person=False)
+        deactivate_account(
+            session, user, actor=ACTOR, by_person=False, route="dormancy"
+        )
         trail_events.record(
             session,
             "user.deactivated_dormant",
@@ -151,7 +165,14 @@ def _warn(session: Session, user: User, due, last) -> None:
     def send() -> None:
         for to in [principal, *managers(principal)]:
             try:
-                notify(to, "dormancy_warning", title, message, link="/settings")
+                notify(
+                    to,
+                    "dormancy_warning",
+                    title,
+                    message,
+                    link="/settings",
+                    about=principal,
+                )
             except Exception:  # noqa: BLE001 - the rest are still told
                 logger.exception("could not send a dormancy warning for %s", name)
 

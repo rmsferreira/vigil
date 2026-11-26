@@ -2,6 +2,7 @@
 // the hunt workflow, the checkpoint mirror, and Python's two permitted reads.
 
 import type { BudgetLimits, SpendPayload } from "./budget.js";
+import type { FactsPayload } from "./facts.js";
 import type { RecallPayload } from "./memory.js";
 
 // Adding a kind is never a migration: kind is text in the table and validated here
@@ -27,6 +28,8 @@ export const RUN_EVENT_KINDS = [
   "run",
   "spend",
   "recall",
+  // The entity facts an investigation opened on (#4742), beside its recall.
+  "facts",
   "dispatch",
   "checkpoint",
   "resolution",
@@ -108,6 +111,10 @@ export interface DispatchPayload {
   // What a gated call returned. Written by the harness and by nothing else, and
   // what makes an approved call run once however many times the run resumes.
   result?: unknown;
+  // Set on a call to a tool the deployment marks as an emulator, gated or not:
+  // the only results whose steps an emulation's coverage report reads.
+  tool?: string;
+  emulator?: true;
 }
 
 // A capability, or a phase's tool, this deployment cannot answer: journalled once
@@ -195,27 +202,32 @@ export interface TerminalPayload {
   summary?: string;
   handoffs?: TerminalHandoff[];
   proposed_actions?: ProposedAction[];
-  // How bad the run rated what it found, in case priorities, for the case it was
-  // started from. Only a completed run whose plugin names a severity_field sets it.
-  severity?: Severity;
   // How sure the run said it was of its verdict. Only a completed run whose plugin
   // names a confidence_field sets it.
   confidence?: Confidence;
   // The run's verdict, after the guard, for the case it was started from. Only a
   // completed run whose plugin names a disposition_field sets it.
   disposition?: string;
+  // A short title for the case the run was started from. Only a completed run whose
+  // plugin names a title_field sets it.
+  title?: string;
   // When the run finished, chosen as the terminal was sealed. The workflow row
   // stores this as finished_at, and the hunt report's Ended line is the same instant.
   finished_at?: string;
+  // What the report stands on (#4962). capped is false on a run with no conclusion;
+  // citation_count is absent when the plugin declares no citations field, and
+  // grounded when its last review did not say. Older ledgers carry none of them.
+  capped?: boolean;
+  citation_count?: number;
+  grounded?: boolean;
 }
-
-// The ratings a run may conclude with: the case priorities, less unknown.
-export const SEVERITIES = ["low", "medium", "high", "critical"] as const;
-export type Severity = (typeof SEVERITIES)[number];
 
 // How sure a run may say it is of its verdict.
 export const CONFIDENCES = ["low", "medium", "high"] as const;
 export type Confidence = (typeof CONFIDENCES)[number];
+
+// The six words a run's conclusion may say its disposition in.
+export const DISPOSITIONS = ["malicious", "suspicious", "benign", "false_positive", "inconclusive", "needs_review"] as const;
 
 // Work the run finished by giving away, each carrying the document it hands over
 // rather than a pointer to one: the receiver has no access to this ledger.
@@ -306,6 +318,9 @@ export interface ReviewPayload {
   // Set when the plugin requires a record: whether it links a cited, served result
   // to a hypothesis. A guarded answer with no such link does not stand.
   grounded?: boolean;
+  // Set when the guard counts sources: the distinct capabilities among the cited,
+  // served, non-empty results. Fewer than the guard asks and the answer does not stand.
+  sources?: { counted: string[]; required: number };
   // The child run the reviewer ran as.
   child_run_id?: string;
 }
@@ -323,6 +338,9 @@ export interface FramePayload {
   task: string;
   // The rendered recall block, which the recall event's rows render to.
   recall: string;
+  // The rendered entity-facts block, which the facts event renders to. Absent when
+  // the run's prefix carried none, as every frame before #4742 did.
+  facts?: string;
   tools: { id: string; hash: string }[];
   // Every skill the plugin offers, by the hash of the body load_skill would return.
   skills: { name: string; hash: string }[];
@@ -394,6 +412,9 @@ export interface RunEventPayloads {
   // the prefix carries the rows but nothing else records them, and a rebuild that
   // re-reads memory reads a neighbourhood that has moved since (ADR 0015).
   recall: RecallPayload;
+  // The entity-facts read an investigation opened on, verbatim, for the same reason:
+  // the prefix carries the rows and a replay renders them from here, not the table.
+  facts: FactsPayload;
   dispatch: DispatchPayload;
   checkpoint: CheckpointPayload;
   resolution: ResolutionPayload;

@@ -3,16 +3,16 @@
 import asyncio
 import logging
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from typing import Callable, Dict, List, Optional
 
 from core.config import get_settings
+from core.daemon_config import SchedulerConfig
 from core.llm.bifrost.admin import refresh_gateway_rates, run_gateway_rates_refresher
 from core.storage.connection import get_db_manager
 from core.time import utcnow
 from core.workflows.enablement import is_enabled
-from core.workflows.routing import SCHEDULED_WORKFLOW
-from services.daemon.config import SchedulerConfig
+from core.workflows.routing import DETECTION_GAPS_WORKFLOW, SCHEDULED_WORKFLOW
 from services.daemon.probes import inject_probes, score_probes
 from services.daemon.threat_feed_poller import ThreatFeedPoller
 
@@ -20,9 +20,8 @@ logger = logging.getLogger(__name__)
 
 # Each sync reads every repo in full; hourly sees a deleted rule soon enough.
 DETECTION_RULES_SYNC_INTERVAL = 3600
-# Once a day, mitre_analyst turns the listed detection gaps into Cases (#3755).
-DETECTION_GAPS_WORKFLOW = "agent-run-mitre_analyst"
 DETECTION_GAPS_INTERVAL = 86400
+SITE_REFRESH_INTERVAL = 86400
 
 
 def _sandbox_poll_enabled() -> bool:
@@ -76,6 +75,8 @@ class TaskScheduler:
         self._tasks: List[ScheduledTask] = []
         # The processor's input queue; probes go on it like polled findings.
         self._processor_queue: Optional[asyncio.Queue] = None
+        # Set by the daemon: counts one scheduler-loop pass on /health.
+        self.note_pass: Optional[Callable[[], None]] = None
 
         # Services (lazy loaded)
         self._data_service = None
@@ -109,6 +110,16 @@ class TaskScheduler:
                 name="detection_gaps",
                 func=self._run_detection_gaps,
                 interval=DETECTION_GAPS_INTERVAL,
+            )
+        )
+
+        # Not in run()'s restored clocks: it runs at startup, and the row's
+        # "seen" state keeps a restart from queueing it twice.
+        self._tasks.append(
+            ScheduledTask(
+                name="site_refresh",
+                func=self._run_site_refresh,
+                interval=SITE_REFRESH_INTERVAL,
             )
         )
 
@@ -175,6 +186,20 @@ class TaskScheduler:
             )
         )
 
+        # Asked often; the tick itself runs a check only when the last one, here or
+        # on another replica, is an interval old. A skip still counts as a run
+        # here, so asking at the full interval would let a check slip by up to one.
+        if self.config.supervisory_enabled:
+            from core.supervisory.worker import poll_seconds
+
+            self._tasks.append(
+                ScheduledTask(
+                    name="supervisory_check",
+                    func=self._run_supervisory_check,
+                    interval=poll_seconds(self.config.supervisory_interval),
+                )
+            )
+
     def set_processor_queue(self, queue: asyncio.Queue):
         """Set the processor's input queue that probe sweeps inject onto."""
         self._processor_queue = queue
@@ -209,8 +234,10 @@ class TaskScheduler:
                     _last_scheduled_at, queued[task.name]
                 )
 
-        # Main scheduling loop
+        # Main scheduling loop. A task that blocks holds the counter.
         while not shutdown_event.is_set():
+            if self.note_pass is not None:
+                self.note_pass()
             now = utcnow()
 
             for task in self._tasks:
@@ -256,7 +283,7 @@ class TaskScheduler:
         self.stats["threat_hunts"] += 1
 
         hypothesis = self._hunt_hypothesis()
-        from services.daemon.orchestrator import insert_intake_trigger
+        from core.storage.intake_queue import insert_intake_trigger
 
         insert_intake_trigger(
             kind="schedule",
@@ -274,78 +301,36 @@ class TaskScheduler:
         )
 
     async def _run_detection_gaps(self):
-        """Queue a mitre_analyst run on the gaps identify_gaps lists over the last
-        WINDOW_DAYS, counting only evidence no earlier run raised, at or above the
-        floor and not already carried by an open Case, biggest first; none when there
-        are none. With OpenCTI configured, the techniques its newest intrusion sets
-        and reports name are checked here too, in code, and each one with no proven
-        rule is a gap raised once.
+        """The daily detection gaps run (``services.daemon.gaps.start_gaps_run``)."""
+        from services.daemon.gaps import NOT_QUEUED, QUEUED, start_gaps_run
 
-        A schedule intake with no case_id mints a Case, so a day with no new gaps
-        queues nothing. What was raised is remembered only once the run has queued,
-        or found nothing to queue.
-        """
-        if not is_enabled(DETECTION_GAPS_WORKFLOW):
+        outcome = await start_gaps_run()
+        if outcome.blind_spots:
+            # Not handed to the run, so this line is where a new one shows.
             logger.info(
-                "Daily detection gaps run skipped: %s is turned off",
-                DETECTION_GAPS_WORKFLOW,
+                "Daily detection gaps run: new blind spots, no rule drafted: %s",
+                "; ".join(outcome.blind_spots),
             )
-            return
-        from core.detections import gap_run
-        from core.detections.tools import get_security_detection_tools
+        if outcome.status == NOT_QUEUED:
+            logger.error("Daily detection gaps run: %s", outcome.message)
+        elif outcome.status == QUEUED:
+            logger.info("Queued the daily detection gaps run: %s", outcome.message)
+        else:
+            logger.info("Daily detection gaps run: %s", outcome.message)
 
-        started = datetime.now(timezone.utc)
-        window_start = started - timedelta(days=gap_run.WINDOW_DAYS)
-        before = gap_run.read_raised()
-        intel = await gap_run.recent_intel()
-        # Off the loop: the report reads the ledger and Findings synchronously.
-        report = await asyncio.to_thread(
-            asyncio.run,
-            get_security_detection_tools().identify_gaps(
-                since_days=gap_run.WINDOW_DAYS,
-                since=window_start,
-                techniques=sorted(intel) or None,
-            ),
-        )
-        alerts = await asyncio.to_thread(gap_run.alert_ids, window_start)
-        gaps = gap_run.gaps_in(report, alerts, before, intel)
-        raised, held = gap_run.to_raise(
-            gaps, before, gap_run.open_case_techniques(), window_start=window_start
-        )
-        after = gap_run.after_run(before, started, window_start, gaps, raised, held)
-        if not raised:
+    async def _run_site_refresh(self):
+        """The daily site refresh (``core.site_proposal.start_refresh``)."""
+        from core.site_proposal import NOT_QUEUED, QUEUED, start_refresh
+
+        outcome = await start_refresh()
+        if outcome["status"] == NOT_QUEUED:
+            logger.error("Daily site refresh: %s", outcome["message"])
+        elif outcome["status"] == QUEUED:
             logger.info(
-                "Daily detection gaps run: no new gaps at or above %d, nothing queued",
-                gap_run.GAP_FLOOR,
+                "Queued the daily site refresh (intake row %s)", outcome["intake_id"]
             )
-            gap_run.write_raised(after)
-            return
-
-        hypothesis = (
-            "Turn the detection gaps identify_gaps lists into Cases with checked "
-            "rule drafts, so each real gap is tracked and has a rule in shadow."
-        )
-        hypothesis += " New gaps, biggest first: " + "; ".join(g.line() for g in raised)
-        from services.daemon.orchestrator import insert_intake_trigger
-
-        queued = insert_intake_trigger(
-            kind="schedule",
-            priority="low",
-            payload={
-                "workflow_id": DETECTION_GAPS_WORKFLOW,
-                "trigger_type": "scheduled",
-                "finding_ids": [],
-                "hypothesis": hypothesis,
-                # The minted Case carries them, so the next run sees them covered.
-                "case_techniques": gap_run.case_techniques(raised),
-            },
-        )
-        if queued is None:
-            # Nothing was queued: remember nothing, so the next run raises it again.
-            logger.error("Daily detection gaps run: the intake row was not queued")
-            return
-        gap_run.write_raised(after)
-        logger.info("Queued the daily detection gaps run: %s", hypothesis)
+        else:
+            logger.info("Daily site refresh: %s", outcome["message"])
 
     # What this hunt is out to test, read off the techniques the estate is showing, so
     # a nightly hunt follows it rather than repeating one fixed question.
@@ -414,18 +399,33 @@ class TaskScheduler:
         if reads:
             logger.info("Cleanup removed %d episodic read log rows", reads)
 
+        # Entity facts past their time to live, or whose Case closed (#4741).
+        from core.integrations import entity_facts
+
+        facts = await asyncio.to_thread(entity_facts.sweep)
+
         logger.info(
             "Cleanup complete: expired %d unanswered approvals, removed %d "
-            "episodic read log rows",
+            "episodic read log rows, removed %d entity facts",
             expired,
             reads,
+            sum(facts.values()),
         )
 
         return {
             "cutoff_date": cutoff.isoformat(),
             "approvals_expired": expired,
             "read_log_removed": reads,
+            "entity_facts_removed": facts,
         }
+
+    async def _run_supervisory_check(self):
+        """The supervisory model's check: hold and release, then run each check."""
+        from core.supervisory import worker
+
+        done = await asyncio.to_thread(worker.tick)
+        if done is not None:
+            logger.info("Supervisory check: %s", done)
 
     async def _run_mfa_coverage(self):
         """Today's count of people who can sign in without MFA, on the trail."""
@@ -469,22 +469,25 @@ class TaskScheduler:
         return stats
 
     async def _run_threat_feed_poll(self):
-        """Pull Cloudforce One STIX/TAXII indicators into threat_indicators."""
+        """Pull every declared TAXII feed's indicators into threat_indicators."""
         return await ThreatFeedPoller().run_once()
 
     async def _run_detection_rules_sync(self):
         """Run the overlay copies (rollout), record new, changed and removed rules
-        from every configured repo, then move the copies' stages.
+        from every configured repo, judge the repo versions the import check
+        holds, then move the copies' stages.
 
         The copies search first, so Sees spends only what they leave of each
         SIEM's hourly budget (decision 13)."""
-        from core.detections.inventory import rollout
+        from core.detections.inventory import import_check, rollout
         from core.detections.inventory.sync import sync_repos
 
         queue = self._processor_queue
         report = await asyncio.to_thread(rollout.run_copies, queue is not None)
         try:
             await asyncio.to_thread(sync_repos)
+            # Field lists only: no replay, and Splunk's one search from its budget.
+            await asyncio.to_thread(import_check.sweep)
         finally:
             # The runs already moved last_success: their findings go out regardless.
             await asyncio.to_thread(rollout.run_sweep, report)

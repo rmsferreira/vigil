@@ -1,4 +1,4 @@
-"""`python -m services.medic run | check`."""
+"""`python -m services.medic run | check | section`."""
 
 from __future__ import annotations
 
@@ -31,6 +31,7 @@ from services.medic.app.heartbeat import (
 from services.medic.app.pack_admin import PackAdmin
 from services.medic.app.policy_probe import Policy, PolicyCheck, Verdict
 from services.medic.app.policy_probe import probe as policy_probe
+from services.medic.app.section import section_main
 from services.medic.app.trace import TraceCapture, pack_of, start_capture
 from services.medic.app.watchdog import Watchdog
 from services.medic.app.wiring import (
@@ -49,6 +50,7 @@ from services.medic.app.wiring import (
     store_head,
 )
 from services.medic.engine.core import iso
+from services.medic.fix import Fixer
 from services.medic.redact import install_log_redaction
 from services.medic.sensors import Sensor
 from services.medic.sensors.containers import docker_containers
@@ -57,6 +59,7 @@ from services.medic.sensors.federation import federation_sources
 from services.medic.sensors.gateway import address as gateway_address
 from services.medic.sensors.gateway import gateway_session
 from services.medic.sensors.http_ready import agent_serve_ready, agent_worker_ready
+from services.medic.sensors.integration_health import integration_health
 from services.medic.sensors.kube import agent_worker_pods, kube_pods
 from services.medic.sensors.logtail import compose_log_sensors, helm_log_sensors
 from services.medic.sensors.providers import llm_providers
@@ -65,7 +68,7 @@ from services.medic.store import RecordHeld, StoreError, open_writer
 
 log = logging.getLogger("services.medic")
 
-USAGE = "usage: python -m services.medic {run|check [--ready]}"
+USAGE = "usage: python -m services.medic {run|check [--ready]|section [--since-days N]}"
 
 # httpcore's DEBUG trace logs raw response headers (Set-Cookie and the like) in a
 # shape K2's patterns miss, and httpx logs every request at INFO. A sensor's
@@ -114,6 +117,9 @@ def main(
     to real time and a real exit."""
     # Medic reads its own env: it may not import core.config (A3-1).
     env = os.environ if env is None else env  # noqa: ENV001
+    # Read-only export. Before `run`: no writer, no heartbeat, no API key.
+    if argv and argv[0] == "section":
+        return section_main(argv[1:], env, USAGE)
     if list(argv) not in (["run"], ["check"], ["check", "--ready"]):
         print(USAGE, file=sys.stderr)
         return 2
@@ -222,6 +228,7 @@ def run(
             policy_check=policy_check,
             policy_refused_at=refused_at,
             trace_id=config.trace_id(env),
+            persistence=config.persistence_on(env),
         )
     finally:
         os.umask(old_umask)
@@ -259,6 +266,7 @@ def sensors_for(
     if gateway is not None:
         sensors.append(gateway_session(host=gateway[0], port=gateway[1]))
         sensors.append(federation_sources(host=gateway[0], port=gateway[1]))
+        sensors.append(integration_health(host=gateway[0], port=gateway[1]))
         sensors.append(llm_providers(host=gateway[0], port=gateway[1]))
         sensors.extend(work_sensors(host=gateway[0], port=gateway[1]))
         sensors.extend(backend_status_sensors(host=gateway[0], port=gateway[1]))
@@ -356,6 +364,7 @@ def _run(
     policy_check: Callable[[], PolicyCheck] | None = None,
     policy_refused_at: float | None = None,
     trace_id: str | None = None,
+    persistence: bool = True,
 ) -> int:
     started_at = clock.wall()
     try:
@@ -445,6 +454,9 @@ def _run(
             log.error("cannot write to the data dir %s: %s", data_dir, exc)
             return 1
         log.info("Medic running; data dir %s, shape %s", data_dir, shape)
+        fixer = Fixer(medic, persistence=persistence)
+        fixer.settle()
+        fixer.reconcile()  # a pack or store change since the last run
         # Dev mode, and a start whose lifecycle failed, have none.
         admin = (
             PackAdmin(pack, shape=shape, data_dir=data_dir, clock=clock)
@@ -460,6 +472,7 @@ def _run(
             record_start(data_dir, now=started_at, previous_beat=previous_beat),
             dev_mode=vigil_dev_mode,
             admin=admin,
+            fixer=fixer,
         )
         status.publish(cycle=0)
         watchdog = Watchdog(
@@ -482,6 +495,7 @@ def _run(
                     max_cycles,
                     status.publish,
                     admin,
+                    fixer,
                 )
             )
         # Logged here, through Medic's redaction, rather than as Python's own
@@ -491,6 +505,7 @@ def _run(
             log.exception("Medic stopped on an error: %s", type(exc).__name__)
             code = 1
         finally:
+            fixer.stop()
             watchdog.stop()
             status.stop()
             medic.capture.close(clock.wall())  # the manifest, on a clean stop
@@ -589,6 +604,7 @@ async def _loop(
     max_cycles: int | None,
     after_cycle: Callable[..., None] = lambda **_: None,
     admin: PackAdmin | None = None,
+    fixer: Fixer | None = None,
 ) -> int:
     """Run 15 s cycles until stopped; return the last completed cycle number."""
     stop = asyncio.Event()
@@ -599,7 +615,9 @@ async def _loop(
     cycle = 0
     while not stop.is_set() and (max_cycles is None or cycle < max_cycles):
         # One cycle: sensors → K2 choke → engine tick → router → store.
-        await medic.cycle()
+        stored = await medic.cycle()
+        if fixer is not None:
+            fixer.on_stored(stored)
         cycle += 1
         try:
             save_engine_state(data_dir, medic.state())
@@ -619,6 +637,8 @@ async def _loop(
             log.error("cannot write the heartbeat: %s", exc)
         if admin is not None:  # the cycle boundary: the one place the pack swaps
             admin.apply_pending(medic)
+        if fixer is not None:  # after a swap, so GET /v1/pack shows a pack change
+            fixer.reconcile()
         try:
             after_cycle(cycle=cycle)
         finally:
@@ -652,10 +672,20 @@ class _Status:
     retries on its own."""
 
     def __init__(
-        self, medic, data_dir, api, clock, started_at, history, *, dev_mode, admin
+        self,
+        medic,
+        data_dir,
+        api,
+        clock,
+        started_at,
+        history,
+        *,
+        dev_mode,
+        admin,
+        fixer=None,
     ) -> None:
         self.medic, self.data_dir, self.clock = medic, data_dir, clock
-        self.dev_mode, self.admin = dev_mode, admin
+        self.dev_mode, self.admin, self.fixer = dev_mode, admin, fixer
         self.started_at, self.history = started_at, history
         self.board = StatusBoard()
         self.api = None
@@ -669,6 +699,7 @@ class _Status:
                 data_dir=data_dir,
                 writer=medic.writer,
                 bridge=admin.bridge if admin else None,
+                fixer=fixer,
                 bind_peer=api.bind_peer,
             )
         self._failing = self._api_failed = self._pack_failing = False
@@ -707,6 +738,7 @@ class _Status:
                 trace=self.medic.capture.status(),
                 dev_mode=self.dev_mode,
                 pack=self.admin.facts if self.admin else None,
+                upgrade_hold_until=self.medic.engine.upgrade.end,
             )
             sensors = build_sensors(
                 self.medic.scheduler.sensor_states(),

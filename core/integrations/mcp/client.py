@@ -29,8 +29,9 @@ except ImportError:
 
 from core.integrations._base.config import missing as missing_fields
 from core.integrations._base.config import resolve
+from core.integrations.crowdstrike.descriptor import CROWDSTRIKE
 from core.integrations.elastic.descriptor import ELASTIC, ELASTIC_REQUIRED
-from core.integrations.mcp.child_env import ca_bundle_env
+from core.integrations.mcp.child_env import stdio_env
 from core.integrations.mcp.runner import (
     RunnerError,
     RunnerServer,
@@ -56,6 +57,27 @@ _DESCRIPTOR_GATED = {
     "wazuh": (WAZUH, WAZUH_REQUIRED),
     "opencti": (OPENCTI, OPENCTI_REQUIRED),
 }
+
+
+def _missing_crowdstrike() -> List[str]:
+    """Which of falcon-mcp's credentials are absent, under the names it reads.
+
+    A Client ID saved in Settings sits on the integration row (or
+    ``CROWDSTRIKE_CLIENT_ID``). The secret is already ``FALCON_CLIENT_SECRET``.
+    ``FALCON_CLIENT_ID`` set on the process still counts. The region is not a
+    credential: unset stays the catalog's US-1 URL.
+    """
+    fields: Dict[str, Any] = {}
+    try:
+        fields = resolve(CROWDSTRIKE)
+    except Exception as exc:  # noqa: BLE001 - a lookup failure is not configured
+        logger.warning("Config lookup for crowdstrike failed: %s", type(exc).__name__)
+    missing: List[str] = []
+    if not (fields.get("client_id") or get_secret("FALCON_CLIENT_ID")):
+        missing.append("FALCON_CLIENT_ID")
+    if not (fields.get("client_secret") or get_secret("FALCON_CLIENT_SECRET")):
+        missing.append("FALCON_CLIENT_SECRET")
+    return missing
 
 
 @asynccontextmanager
@@ -364,17 +386,21 @@ class MCPClient:
             return False
 
         try:
-            # Create stdio server parameters. stdio_client narrows the child
-            # environment to a six-name allowlist, so a CA bundle set in the
-            # backend's environment has to be forwarded rather than inherited.
-            server_params = StdioServerParameters(
-                command=server.command,
-                args=server.args,
-                env={**ca_bundle_env(), **(server.env or {})},
-            )
-
             # In the runner when MCP_RUNNER_URL is set; server_params then unused.
             runner = self._runner_for(server_name)
+
+            # Create stdio server parameters. stdio_client merges this env over
+            # a six-name allowlist (HOME, PATH, ...), so the child gets exactly
+            # what stdio_env builds and nothing else from the backend. Built here
+            # so a setting changed since the catalog loaded is picked up.
+            server_params = None
+            if runner is None:
+                env = await asyncio.to_thread(
+                    stdio_env, server, str(self.mcp_service.project_root)
+                )
+                server_params = StdioServerParameters(
+                    command=server.command, args=server.args, env=env
+                )
 
             if persistent:
                 # Create persistent session
@@ -382,6 +408,9 @@ class MCPClient:
                     self.persistent_sessions[server_name] = PersistentServerSession(
                         server_name, server_params, runner
                     )
+                elif runner is None:
+                    # A reconnect spawns with the env as resolved now.
+                    self.persistent_sessions[server_name].server_params = server_params
 
                 # Connect. The session logs and swallows the spawn error;
                 # keep it on last_errors so a probe can report it.
@@ -473,6 +502,8 @@ class MCPClient:
     def _missing_credentials_for(self, server) -> List[str]:
         # Resolves through get_secret, so a credential saved via the integration
         # wizard (encrypted store, not the process env) does not read as dormant.
+        if getattr(server, "name", None) == CROWDSTRIKE.id:
+            return _missing_crowdstrike()
         gated = _DESCRIPTOR_GATED.get(getattr(server, "name", None))
         if gated:
             descriptor, required = gated

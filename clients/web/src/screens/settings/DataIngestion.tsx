@@ -16,6 +16,7 @@ import {
 } from '../../shared/ui'
 import {
   configApi,
+  day1Api,
   federationApi,
   importsApi,
   ingestionApi,
@@ -23,6 +24,7 @@ import {
   type HistoryImport,
   type IngestionJob,
 } from '../../services/api'
+import { stepUpDetailOf } from '../../services/stepUp'
 import {
   useDarktrace,
   useIngestionJob,
@@ -191,10 +193,12 @@ export function SampleAlertsCard({ notify }: SectionProps) {
       const res = await ingestionApi.clearSampleAlerts()
       setLoaded(0)
       const cases = res.data.cases_deleted
+      const kept = res.data.restricted_cases_kept ?? 0
       notify(
         'ok',
         `Removed ${res.data.findings_deleted} sample alerts` +
-          (cases ? ` and ${cases} case${cases === 1 ? '' : 's'} made from them.` : '.'),
+          (cases ? ` and ${cases} case${cases === 1 ? '' : 's'} made from them.` : '.') +
+          (kept ? ` ${kept} restricted case${kept === 1 ? '' : 's'} kept.` : ''),
       )
     } catch (e) {
       notify('err', errorDetail(e, 'Could not clear sample alerts.'))
@@ -342,34 +346,41 @@ const CONNECTED_SOURCES: { value: ConnectedHistorySource; label: string }[] = [
   { value: 'azure_sentinel', label: 'Azure Sentinel' },
 ]
 
-/** Reads a configured Defender's or Sentinel's closed records; shown only when one is. */
-function ConnectedHistoryImport({
-  running,
-  attaching,
-  onImport,
-}: {
-  running: boolean
-  attaching: boolean
-  onImport: (source: ConnectedHistorySource, label: string, days: number) => Promise<void>
-}) {
-  const [configured, setConfigured] = useState<typeof CONNECTED_SOURCES>([])
-  const [source, setSource] = useState<ConnectedHistorySource | ''>('')
-  const [days, setDays] = useState('90')
-  const [submitting, setSubmitting] = useState(false)
-
+/** The Defender and Sentinel sources that are configured; null while loading. */
+function useConnectedHistorySources() {
+  const [configured, setConfigured] = useState<typeof CONNECTED_SOURCES | null>(null)
   useEffect(() => {
     federationApi
       .listSources()
       .then((res) => {
         const ready = new Set(res.data.sources.filter((s) => s.is_configured).map((s) => s.source_id))
-        const offered = CONNECTED_SOURCES.filter((s) => ready.has(s.value))
-        setConfigured(offered)
-        setSource(offered[0]?.value ?? '')
+        setConfigured(CONNECTED_SOURCES.filter((s) => ready.has(s.value)))
       })
       .catch(() => setConfigured([])) // no integrations.read, or no sources: nothing to offer
   }, [])
+  return configured
+}
 
-  if (!configured.length || !source) return null
+/** Reads a configured Defender's or Sentinel's closed records; shown only when one is. */
+function ConnectedHistoryImport({
+  configured,
+  lead,
+  running,
+  attaching,
+  onImport,
+}: {
+  configured: typeof CONNECTED_SOURCES
+  lead: boolean
+  running: boolean
+  attaching: boolean
+  onImport: (source: ConnectedHistorySource, label: string, days: number) => Promise<void>
+}) {
+  const [picked, setSource] = useState<ConnectedHistorySource | ''>('')
+  const [days, setDays] = useState('90')
+  const [submitting, setSubmitting] = useState(false)
+
+  const source = picked || configured[0]?.value
+  if (!source) return null
   const n = Number(days)
   const valid = Number.isInteger(n) && n >= 1 && n <= 180
   const label = configured.find((s) => s.value === source)?.label ?? source
@@ -384,7 +395,7 @@ function ConnectedHistoryImport({
   }
 
   return (
-    <div className="data-connected">
+    <div className={`data-connected${lead ? ' lead' : ''}`}>
       <span className="data-drop-title">From a connected source</span>
       <span className="data-drop-sub">
         {configured.length > 1
@@ -418,14 +429,205 @@ function ConnectedHistoryImport({
   )
 }
 
-export function HistoryImportCard({ notify }: SectionProps) {
+const IMPORT_STATUS: Record<HistoryImport['status'], { level: string; text: string }> = {
+  running: { level: 'idle', text: 'Importing' },
+  done: { level: 'good', text: 'Done' },
+  failed: { level: 'poor', text: 'Failed' },
+  incomplete: { level: 'fair', text: 'Didn’t complete' },
+}
+
+const LEFT_OUT_KIND: Record<string, string> = { tickets: 'Tickets', alerts: 'Alerts', rows: 'Rows' }
+
+// the API's reason keys, in words; an unknown key reads with its underscores dropped
+const LEFT_OUT_REASON: Record<string, string> = {
+  duplicate: 'duplicate',
+  no_closed_at: 'no close time',
+  unmapped_disposition: 'unmapped disposition',
+  bulk_close: 'bulk-closed',
+  auto_closed: 'auto-closed',
+  no_timestamp: 'no timestamp',
+  no_entities: 'no entities',
+  unreadable: 'unreadable',
+}
+
+const UNMAPPED_SHOWN = 20
+
+const sourceLabel = (row: HistoryImport) =>
+  CONNECTED_SOURCES.find((s) => s.value === row.source_system)?.label ?? (row.source_system || 'file')
+
+const stopped = (row: HistoryImport) => row.status === 'failed' || row.status === 'incomplete'
+
+// a connected pull can be repeated as it was; a file has to be uploaded again
+const connectedPull = (row: HistoryImport) =>
+  row.pull_days != null && CONNECTED_SOURCES.some((s) => s.value === row.source_system)
+
+// opened by default: the rows someone has something to do about
+const needsAttention = (row: HistoryImport) => stopped(row) || row.unmapped.length > 0 || !row.has_ticket_detail
+
+// rerun: a stopped connected pull's Re-run; absent without findings.write or once its source is unconfigured
+function ReportAgain({
+  exists,
+  canRun,
+  busy,
+  onRun,
+}: {
+  exists: boolean | null
+  canRun: boolean
+  busy: boolean
+  onRun: () => void
+}) {
+  if (exists === null) return null
+  if (!exists) return <p className="data-history-line">The Day 1 Report will include this history.</p>
+  if (!canRun) {
+    return <p className="data-history-line">Ask someone who can run the Day 1 Report to re-run it.</p>
+  }
+  return (
+    <p className="data-history-line">
+      <button type="button" className="data-link" disabled={busy} onClick={onRun}>
+        {busy ? 'Running…' : 'Run the Day 1 Report again'}
+      </button>
+    </p>
+  )
+}
+
+function ImportDetails({ row, canWrite, rerun }: { row: HistoryImport; canWrite: boolean; rerun?: ReactNode }) {
+  const window = row.pull_days != null
+    ? `Last ${row.pull_days} days${row.status === 'done' && row.pulled_at ? `, pulled ${utcDayClock(row.pulled_at)}` : ''}`
+    : row.concluded_at ? `Through ${utcDay(row.concluded_at)}` : '—'
+  const leftOut = Object.entries(row.left_out)
+  const more = row.unmapped.length - UNMAPPED_SHOWN
+  const droppedMore = row.dropped_columns.length - UNMAPPED_SHOWN
+  const facts: [string, ReactNode][] = [
+    ['Started', utcDayClock(row.started_at) ?? '—'],
+    ['Finished', utcDayClock(row.finished_at) ?? (row.status === 'running' ? 'Still importing' : '—')],
+    ['Window', window],
+    ['Tickets kept', row.tickets_kept],
+  ]
+  return (
+    <div className="data-history-detail">
+      {stopped(row) && (
+        <p className={`data-history-warn ${row.status}`}>
+          {(row.error || 'The import stopped before it finished').replace(/([^.!?])$/, '$1.')}
+          {!connectedPull(row) && ' Upload the file again to import it whole.'}
+          {connectedPull(row) && canWrite && !rerun && ' Re-run it once its source is connected again.'}
+          {rerun}
+        </p>
+      )}
+      <dl className="data-history-facts">
+        {facts.map(([k, v]) => (
+          <div key={k}><dt>{k}</dt><dd>{v}</dd></div>
+        ))}
+      </dl>
+      {/* nothing recorded is not "nothing left out" while it runs, or for an import from before ticket detail */}
+      {(leftOut.length > 0 || (row.status === 'done' && row.has_ticket_detail)) && (
+      <div className="data-history-line">
+        <b>Left out</b>{' '}
+        {leftOut.length === 0
+          ? 'Nothing.'
+          : leftOut.map(([kind, reasons], i) => (
+            <span key={kind}>
+              {i > 0 && ' · '}
+              {LEFT_OUT_KIND[kind] ?? kind}:{' '}
+              {Object.entries(reasons)
+                .map(([reason, n]) => `${n} ${LEFT_OUT_REASON[reason] ?? reason.replace(/_/g, ' ')}`)
+                .join(', ')}
+            </span>
+          ))}
+        {leftOut.length > 0 && '.'}
+        {row.bulk_not_tested > 0 && ` ${row.bulk_not_tested} tickets name no closer, so they were not tested for bulk closes.`}
+        {row.severity_unknown > 0 && ` ${row.severity_unknown} tickets have no severity.`}
+      </div>
+      )}
+      {row.unmapped.length > 0 && (
+        <div className="data-history-line">
+          <b>Unmapped dispositions</b>{' '}
+          {row.unmapped.slice(0, UNMAPPED_SHOWN).map((u, i) => (
+            <span key={u.value}>
+              {i > 0 && ', '}
+              <code className="data-history-value">{u.value}</code> ({u.count})
+            </span>
+          ))}
+          {more > 0 && ` and ${more} more`}. Rename them in the export to a listed value and import again.
+        </div>
+      )}
+      {row.dropped_columns.length > 0 && (
+        <div className="data-history-line">
+          <b>Dropped columns</b>{' '}
+          {row.dropped_columns.slice(0, UNMAPPED_SHOWN).map((column, i) => (
+            <span key={column.name}>
+              {i > 0 && ', '}
+              <code className="data-history-value">{column.name}</code> ({column.count})
+            </span>
+          ))}
+          {droppedMore > 0 && ` and ${droppedMore} more`}. Not stored.
+        </div>
+      )}
+      {!row.has_ticket_detail && (
+        <div className="data-history-line">
+          Imported before this release; import again to add severity and bulk-closed tickets.
+        </div>
+      )}
+    </div>
+  )
+}
+
+function deleteImportBody(
+  row: HistoryImport | null,
+  ledgers: number | null,
+  ledgerError: string | null,
+  queued: number | null,
+): string {
+  const verdicts = row?.verdicts_written ?? 0
+  const sightings = row?.sightings_written ?? 0
+  const source = row ? sourceLabel(row) : ''
+  const sentences = [
+    `Deletes the ${verdicts} Verdicts and ${sightings} Sightings this ${source} import wrote to agent memory. Agents stop recalling them.`,
+  ]
+  if (ledgerError) sentences.push(ledgerError)
+  else if (ledgers === null) sentences.push('Counting re-decision ledgers…')
+  else if (ledgers === 0) sentences.push('No re-decision ledgers stay.')
+  else if (ledgers === 1) sentences.push('1 re-decision ledger stays.')
+  else sentences.push(`${ledgers} re-decision ledgers stay.`)
+  if (queued === 0) sentences.push('No queued review leaves the queue.')
+  else if (queued === 1) sentences.push('1 queued review leaves the queue.')
+  else if (queued !== null) sentences.push(`${queued} queued reviews leave the queue.`)
+  return sentences.join(' ')
+}
+
+function eraseLedgersBody(count: number): string {
+  const ledgers = count === 1 ? '1 re-decision ledger' : `${count} re-decision ledgers`
+  return `Erases ${ledgers}. This cannot be undone.`
+}
+
+export function HistoryImportCard({
+  notify,
+  title = 'Alert and ticket history',
+  desc = HISTORY_DESC,
+  leadConnected = false,
+}: SectionProps & {
+  title?: string
+  desc?: string
+  /** the setup wizard: a configured Defender or Sentinel pull comes before the file drop */
+  leadConnected?: boolean
+}) {
   const { job, attaching, upload, start } = useIngestionJob('history')
-  const canWrite = useAuth().hasPermission('findings.write')
+  const { hasPermission } = useAuth()
+  const canWrite = hasPermission('findings.write')
+  const canRunReport = hasPermission('platform.write')
+  const [reportExists, setReportExists] = useState<boolean | null>(null)
+  const [runningReport, setRunningReport] = useState(false)
+  const configured = useConnectedHistorySources()
   const [imports, setImports] = useState<HistoryImport[] | null>(null)
   const [loadError, setLoadError] = useState<string | null>(null)
   const [source, setSource] = useState('')
   const [removing, setRemoving] = useState<HistoryImport | null>(null)
+  const [ledgerCount, setLedgerCount] = useState<number | null>(null)
+  const [queuedReviews, setQueuedReviews] = useState<number | null>(null)
+  const [ledgerError, setLedgerError] = useState<string | null>(null)
+  const [erasing, setErasing] = useState<{ importId: string; runIds: string[]; count: number } | null>(null)
   const [busy, setBusy] = useState(false)
+  // ids whose details were toggled away from their default (open when they need attention)
+  const [toggled, setToggled] = useState<Set<string>>(new Set())
   const running = job?.status === 'running'
 
   const load = useCallback(() => {
@@ -436,14 +638,70 @@ export function HistoryImportCard({ notify }: SectionProps) {
   }, [])
   // on open, and again when an import finishes, so it lists without a reload
   useEffect(load, [load, job?.job_id, running])
+  // The list has no ledger count. Read it when the dialog opens, and leave a
+  // sentence free for a later count of queued reviews.
+  useEffect(() => {
+    if (!removing) return
+    let live = true
+    setLedgerCount(null)
+    setQueuedReviews(null)
+    setLedgerError(null)
+    importsApi.ledgers(removing.import_id).then(
+      (res) => {
+        if (!live) return
+        setLedgerCount(res.data.count)
+        setQueuedReviews(res.data.queued_reviews)
+      },
+      (e) => { if (live) setLedgerError(errorText(e, 'Could not count re-decision ledgers.')) },
+    )
+    return () => { live = false }
+  }, [removing])
+  useEffect(() => {
+    let cancelled = false
+    day1Api.status().then(
+      (res) => { if (!cancelled) setReportExists(Boolean(res.data.latest_id)) },
+      () => { if (!cancelled) setReportExists(null) },
+    )
+    return () => { cancelled = true }
+  }, [imports])
+
+  const runReport = async () => {
+    setRunningReport(true)
+    try {
+      await day1Api.run()
+      setReportExists(true)
+      notify('ok', 'Day 1 Report is ready.')
+    } catch (err) {
+      if (!stepUpDetailOf(err)) notify('err', errorText(err, 'Could not run the Day 1 Report'))
+    } finally {
+      setRunningReport(false)
+    }
+  }
+
+  const toggle = (id: string) =>
+    setToggled((s) => {
+      const next = new Set(s)
+      if (!next.delete(id)) next.add(id)
+      return next
+    })
 
   const remove = async () => {
     if (!removing) return
+    const name = sourceLabel(removing)
     setBusy(true)
     try {
-      await importsApi.remove(removing.import_id)
-      notify('ok', `Deleted the ${removing.source_system} import.`)
+      const res = await importsApi.remove(removing.import_id)
+      const kept = res.data.ledgers_kept
+      const keptText = kept === 0
+        ? 'No re-decision ledgers were kept.'
+        : kept === 1
+          ? `1 re-decision ledger was kept. An admin with ${res.data.erase_permission} can erase it.`
+          : `${kept} re-decision ledgers were kept. An admin with ${res.data.erase_permission} can erase them.`
+      notify('ok', `Deleted the ${name} import. ${keptText}`)
       setRemoving(null)
+      if (kept > 0 && hasPermission(res.data.erase_permission)) {
+        setErasing({ importId: res.data.import_id, runIds: res.data.run_ids, count: kept })
+      }
       load()
     } catch (e) {
       notify('err', errorText(e, 'Could not delete the import.'))
@@ -452,10 +710,53 @@ export function HistoryImportCard({ notify }: SectionProps) {
     }
   }
 
+  const erase = async () => {
+    if (!erasing) return
+    setBusy(true)
+    try {
+      const res = await importsApi.eraseLedgers(erasing.importId, erasing.runIds)
+      const n = res.data.erased
+      const spared = (res.data.cases ?? []).map((row) => row.case_id)
+      const kept = spared.length === 0
+        ? ''
+        : spared.length === 1
+          ? ` Left ${spared[0]}. That run was not erased.`
+          : ` Left ${spared.join(', ')}. Those runs were not erased.`
+      notify('ok', (n === 1 ? 'Erased 1 re-decision ledger.' : `Erased ${n} re-decision ledgers.`) + kept)
+      setErasing(null)
+    } catch (e) {
+      if (!stepUpDetailOf(e)) notify('err', errorText(e, 'Could not erase the ledgers.'))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const importConnected = async (src: ConnectedHistorySource, label: string, days: number) => {
+    try {
+      await start(ingestionApi.importConnectedHistory(src, days))
+      notify('ok', `Importing ${label} history into agent memory in the background.`)
+    } catch (e) {
+      // a 409 names the import that holds the lock
+      notify('err', errorText(e, 'Could not start the import.'))
+    }
+  }
+
+  const connected = configured && configured.length > 0 && (
+    <ConnectedHistoryImport
+      configured={configured}
+      lead={leadConnected}
+      running={running}
+      attaching={attaching}
+      onImport={importConnected}
+    />
+  )
+
   return (
-    <SettingsCard title="Alert and ticket history" desc={HISTORY_DESC}>
+    <SettingsCard title={title} desc={desc}>
       {canWrite && (
         <>
+          {leadConnected && connected}
+          {leadConnected && connected && <span className="data-drop-title data-history-file">From a file</span>}
           <div className="data-history-source">
             <Field label="Source system" hint="Optional. Names the import; left blank, Vigil reads it from the file.">
               <TextInput
@@ -477,18 +778,7 @@ export function HistoryImportCard({ notify }: SectionProps) {
             }}
             notify={notify}
           />
-          <ConnectedHistoryImport
-            running={running}
-            attaching={attaching}
-            onImport={async (src, label, days) => {
-              try {
-                await start(ingestionApi.importConnectedHistory(src, days))
-                notify('ok', `Importing ${label} history into agent memory in the background.`)
-              } catch (e) {
-                notify('err', errorText(e, 'Could not start the import.'))
-              }
-            }}
-          />
+          {!leadConnected && connected}
           {job && <IngestionJobStatus job={job} wrap />}
         </>
       )}
@@ -507,34 +797,82 @@ export function HistoryImportCard({ notify }: SectionProps) {
             <thead>
               <tr>
                 <th>Source</th>
+                <th>Status</th>
+                <th className="num">Rows read</th>
                 <th className="num">Verdicts</th>
                 <th className="num">Sightings</th>
-                <th>Latest record</th>
                 <th>Imported</th>
                 {canWrite && <th className="col-act" aria-label="Action" />}
               </tr>
             </thead>
             <tbody>
-              {imports.map((row) => (
-                <tr key={row.import_id}>
-                  <td title={row.import_id}><b>{row.source_system || 'file'}</b></td>
-                  <td className="num">{row.verdicts_written}</td>
-                  <td className="num">{row.sightings_written}</td>
-                  <td className="muted">{utcDay(row.concluded_at)}</td>
-                  <td className="muted">{utcDayClock(row.imported_at)}</td>
-                  {canWrite && (
-                    <td className="data-act col-act">
+              {imports.flatMap((row) => {
+                const open = needsAttention(row) !== toggled.has(row.import_id)
+                const status = IMPORT_STATUS[row.status]
+                const name = sourceLabel(row)
+                return [
+                  <tr key={row.import_id} className={open ? 'open' : undefined}>
+                    <td title={row.import_id}>
                       <button
-                        className="data-link"
-                        aria-label={`Delete the ${row.source_system} import`}
-                        onClick={() => setRemoving(row)}
+                        className="data-history-toggle"
+                        aria-expanded={open}
+                        aria-label={`${open ? 'Hide' : 'Show'} details of the ${name} import`}
+                        onClick={() => toggle(row.import_id)}
                       >
-                        Delete
+                        <Icon name={open ? 'chevD' : 'chevR'} size={13} />
+                        <b>{name}</b>
                       </button>
+                      {row.status === 'done' && (
+                        <ReportAgain
+                          exists={reportExists}
+                          canRun={canRunReport}
+                          busy={runningReport}
+                          onRun={() => void runReport()}
+                        />
+                      )}
                     </td>
-                  )}
-                </tr>
-              ))}
+                    <td><span className={`level-pill ${status.level}`}>{status.text}</span></td>
+                    <td className="num">{row.rows_read}</td>
+                    <td className="num">{row.verdicts_written}</td>
+                    <td className="num">{row.sightings_written}</td>
+                    <td className="muted">{utcDayClock(row.imported_at)}</td>
+                    {canWrite && (
+                      <td className="data-act col-act">
+                        <button
+                          className="data-link"
+                          aria-label={`Delete the ${name} import`}
+                          onClick={() => {
+                            setLedgerCount(null)
+                            setQueuedReviews(null)
+                            setLedgerError(null)
+                            setRemoving(row)
+                          }}
+                        >
+                          Delete
+                        </button>
+                      </td>
+                    )}
+                  </tr>,
+                  <tr key={`${row.import_id}-detail`} className="data-expand" hidden={!open}>
+                    <td colSpan={canWrite ? 7 : 6}>
+                      <ImportDetails
+                        row={row}
+                        canWrite={canWrite}
+                        rerun={canWrite && connectedPull(row) && configured?.some((c) => c.value === row.source_system) && (
+                          <button
+                            className="data-link data-history-rerun"
+                            disabled={running || attaching}
+                            aria-label={`Re-run the ${name} import`}
+                            onClick={() => importConnected(row.source_system as ConnectedHistorySource, name, row.pull_days!)}
+                          >
+                            Re-run
+                          </button>
+                        )}
+                      />
+                    </td>
+                  </tr>,
+                ]
+              })}
             </tbody>
           </table>
         </div>
@@ -542,11 +880,21 @@ export function HistoryImportCard({ notify }: SectionProps) {
       <ConfirmDialog
         open={removing !== null}
         title="Delete import"
-        body={`Deletes the ${removing?.verdicts_written ?? 0} Verdicts and ${removing?.sightings_written ?? 0} Sightings this ${removing?.source_system ?? ''} import wrote to agent memory. Agents stop recalling them.`}
+        body={deleteImportBody(removing, ledgerCount, ledgerError, queuedReviews)}
         confirmLabel="Delete"
         busy={busy}
+        confirmDisabled={ledgerCount === null || ledgerError !== null}
         onConfirm={remove}
-        onClose={() => setRemoving(null)}
+        onClose={() => { if (!busy) setRemoving(null) }}
+      />
+      <ConfirmDialog
+        open={erasing !== null}
+        title="Erase re-decision ledgers"
+        body={erasing ? eraseLedgersBody(erasing.count) : ''}
+        confirmLabel="Erase"
+        busy={busy}
+        onConfirm={erase}
+        onClose={() => { if (!busy) setErasing(null) }}
       />
     </SettingsCard>
   )

@@ -1,4 +1,5 @@
 import axios from 'axios'
+import type { SelectionDraft, SelectionView } from '../screens/settings/selectionForm'
 import { basePath } from '../config/basePath'
 import type { Schema } from './apiTypes'
 import type { operations } from './generated/schema'
@@ -75,6 +76,7 @@ api.interceptors.response.use(
 
     const isAuthEndpoint =
       originalRequest?.url?.startsWith('/auth/login') ||
+      originalRequest?.url?.startsWith('/auth/sso/finish') ||
       originalRequest?.url?.startsWith('/auth/refresh')
 
     if (isAuthEndpoint) {
@@ -142,6 +144,7 @@ export async function streamFetch(path: string, init: RequestInit = {}): Promise
 }
 
 export type NeedsYouItem = Schema<'NeedsYouItem'>
+export type ApprovalAction = Schema<'PendingActionResponse'>
 
 // The shell and the screen under it poll some reads together; callers that overlap share one
 // request. Only in-flight reads are shared, so a read that starts after one lands is always fresh.
@@ -162,8 +165,9 @@ export const approvalsApi = {
   list: (params?: {
     status?: string
     workflow_run_id?: string
+    case_id?: string
     limit?: number
-  }) => api.get('/approvals', { params }),
+  }) => api.get<{ count: number; actions: ApprovalAction[] }>('/approvals', { params }),
 
   listPending: () => api.get('/approvals/pending'),
 
@@ -172,8 +176,14 @@ export const approvalsApi = {
       ? api.get<{ count: number; items: NeedsYouItem[] }>('/approvals/needs-you', { params: { case_id: caseId } })
       : coalesce('needs-you', () => api.get<{ count: number; items: NeedsYouItem[] }>('/approvals/needs-you')),
 
-  approve: (actionId: string, approved_by?: string) =>
-    afterWrite('needs-you', api.post(`/approvals/${actionId}/approve`, { approved_by })),
+  /** An isolation or account disable names the resolved candidate it acts on when there are several. */
+  approve: (actionId: string, candidate?: string) =>
+    afterWrite('needs-you', api.post(`/approvals/${actionId}/approve`, candidate ? { candidate } : {})),
+
+  /** Release an executed isolation or enable a disabled account (#5060): runs at once, as you.
+   *  The reason goes into an analyst note the next run reads (#5273). */
+  undo: (actionId: string, reason?: string) =>
+    afterWrite('needs-you', api.post(`/approvals/${actionId}/undo`, reason ? { reason } : {})),
 
   reject: (actionId: string, reason: string, rejected_by?: string) =>
     afterWrite('needs-you', api.post(`/approvals/${actionId}/reject`, { reason, rejected_by })),
@@ -200,19 +210,14 @@ export const findingsApi = {
   getSummary: (params?: { exclusions?: ExclusionView }) =>
     api.get('/findings/stats/summary', { params }),
   
-  getEnrichment: (id: string, force_regenerate: boolean = false) =>
-    // May restart the Bifrost gateway, then wait on the configured model. A local
-    // model can take minutes and the server bounds the call, so wait for its answer:
-    // giving up first reports a summary it goes on to write and cache as failed.
-    api.post(`/findings/${id}/enrich`, null, {
-      params: { force_regenerate },
-      timeout: 0,
-    }),
-
   deleteAll: () => api.delete('/findings/all'),
 
-  markNoise: (id: string) =>
-    api.post(`/findings/${encodeURIComponent(id)}/noise`),
+  // A body only when a cause was chosen. No body stores no cause, and the mark still lands.
+  markNoise: (id: string, cause?: string) =>
+    api.post(
+      `/findings/${encodeURIComponent(id)}/noise`,
+      cause ? { noise_cause: cause } : undefined,
+    ),
 
   clearNoise: (id: string) =>
     api.delete(`/findings/${encodeURIComponent(id)}/noise`),
@@ -268,11 +273,21 @@ export const notesApi = {
 }
 
 export type HistoryImport = Schema<'ImportOut'>
+export type ImportDelete = Schema<'ImportDeleteOut'>
 
 /** Alert and ticket history imported into agent memory (#3965); an id holds a ':'. */
 export const importsApi = {
   list: () => api.get<Schema<'ImportListResponse'>>('/memory/imports'),
-  remove: (id: string) => api.delete<HistoryImport>(`/memory/imports/${encodeURIComponent(id)}`),
+  /** Marked re-decision ledgers this import would keep. Read when the delete dialog opens. */
+  ledgers: (id: string) =>
+    api.get<Schema<'LedgerCountOut'> & { queued_reviews: number }>(
+      `/memory/imports/ledgers/${encodeURIComponent(id)}`,
+    ),
+  remove: (id: string) => api.delete<ImportDelete>(`/memory/imports/${encodeURIComponent(id)}`),
+  eraseLedgers: (id: string, runIds: string[]) =>
+    api.post<Schema<'LedgerEraseOut'>>(`/memory/imports/ledgers/${encodeURIComponent(id)}`, {
+      run_ids: runIds,
+    }),
 }
 
 export interface CaseRecordRow {
@@ -292,6 +307,54 @@ export interface CaseRecordResponse {
   rows: CaseRecordRow[]
 }
 
+export type RecheckCall = 'real' | 'not real' | "can't tell"
+
+export interface RecheckQueueItem {
+  id: number
+  batch_id: string
+  source: string
+  closed_at: string
+  ticket_id: string
+  title: string | null
+  recorded: boolean
+  call: RecheckCall | null
+  reviewers_differ: boolean
+  can_open: boolean
+  case_id: string | null
+}
+
+export interface RecheckAlert {
+  time: string
+  title: string
+  rule: string
+  severity: string
+  entity_keys: string[]
+  description: string
+}
+
+export interface RecheckTicket extends RecheckQueueItem {
+  removed: boolean
+  notice: string | null
+  alerts: RecheckAlert[] | null
+  alerts_hidden: boolean
+  evidence: { tool: string; result: string }[] | null
+  evidence_hidden: boolean
+  closure_verdict: string | null
+  vigil_verdict: string | null
+  summary: string | null
+  proposed_actions: { action_type: string; target: string; reason: string }[] | null
+  run_id: string | null
+}
+
+/** Blind review of a finished capped re-check (#5095). */
+export const recheckReviewApi = {
+  queue: () => api.get<{ pending: RecheckQueueItem[]; reviewed: RecheckQueueItem[] }>('/recheck-review'),
+  get: (id: number) => api.get<RecheckTicket>(`/recheck-review/${id}`),
+  confirm: (id: number, call: RecheckCall) =>
+    api.post<RecheckTicket>(`/recheck-review/${id}/confirm`, { call }),
+  openCase: (id: number) => api.post<{ case_id: string }>(`/recheck-review/${id}/case`),
+}
+
 export const casesApi = {
   getAll: (params?: {
     state?: string
@@ -300,25 +363,51 @@ export const casesApi = {
     data_source?: string
     sla_at_risk?: boolean
     assignee?: string
+    unassigned?: boolean
     closed?: boolean
     query?: string
     needs_you?: boolean
     working?: boolean
-    closed_by?: 'agent' | 'person'
+    closed_by?: 'agent' | 'person' | 'draw'
     alerts_from?: 'today' | 'all'
     kind?: string
+    /** Owning-team ids. Repeated as `team=`. Omitted returns every readable case. */
+    team?: string[]
     limit?: number
     offset?: number
-  }) => api.get<Schema<'CaseListResponse'>>('/cases', { params }),
+  }) =>
+    api.get<Schema<'CaseListResponse'>>('/cases', {
+      params,
+      paramsSerializer: { indexes: null },
+    }),
 
   getById: (id: string, signal?: AbortSignal) =>
     api.get<Schema<'CaseDetailResponse'>>(`/cases/${id}`, { signal }),
+
+  /** The owner filter's values: owners stored on readable cases, with their state. */
+  getOwners: () => api.get<Schema<'CaseOwnersResponse'>>('/cases/owners'),
 
   create: (data: Schema<'CaseCreate'>) =>
     api.post<Schema<'CaseSchema'>>('/cases', data),
 
   update: (id: string, data: Schema<'CaseUpdate'>) =>
     api.patch<Schema<'CaseSuccessResponse'>>(`/cases/${id}`, data),
+
+  /** Assign to me. The case is unowned, or its owner is not a current account. */
+  claim: (id: string) => api.post<Schema<'CaseSchema'>>(`/cases/${id}/claim`),
+
+  /** Move the case onto another team. A person sends a reason. */
+  move: (id: string, data: Schema<'CaseMove'>) =>
+    api.post<Schema<'CaseSchema'>>(`/cases/${id}/move`, data),
+
+  /** Restrict an open case: the whole reader list in one act. */
+  restrict: (id: string, data: Schema<'CaseRestrict'>) =>
+    api.post<Schema<'CaseSchema'>>(`/cases/${id}/restrict`, data),
+  /** Add or remove readers and teams on a restricted case. */
+  changeReaders: (id: string, data: Schema<'CaseReadersChange'>) =>
+    api.patch<Schema<'CaseSchema'>>(`/cases/${id}/readers`, data),
+  /** Lift the restriction: the case is open to everyone again. */
+  liftRestriction: (id: string) => api.delete<Schema<'CaseSchema'>>(`/cases/${id}/restrict`),
 
   delete: (id: string) =>
     api.delete<Schema<'CaseSuccessResponse'>>(`/cases/${id}`),
@@ -353,6 +442,9 @@ export const casesApi = {
   addIOC: (id: string, data: Schema<'IOCAdd'>) =>
     api.post<Schema<'CaseIOCSchema'>>(`/cases/${id}/iocs`, data),
 
+  markIOCFalsePositive: (id: string, data: Schema<'IOCMark'>) =>
+    api.put<Schema<'CaseIOCListResponse'>>(`/cases/${id}/iocs/false-positive`, data),
+
   getTasks: (id: string) =>
     api.get<Schema<'CaseTasksResponse'>>(`/cases/${id}/tasks`),
   addTask: (id: string, data: Schema<'TaskAdd'>) =>
@@ -367,11 +459,9 @@ export const casesApi = {
   getRules: (id: string) =>
     api.get<Schema<'CaseRulesResponse'>>(`/cases/${id}/rules`),
 
-  closeCase: (id: string, data: Schema<'ClosureInfo'>) =>
+  // take_ownership defaults to true on the server; only the edit dialog sends it.
+  closeCase: (id: string, data: Omit<Schema<'ClosureInfo'>, 'take_ownership'> & { take_ownership?: boolean }) =>
     api.post<Schema<'CaseCloseResponse'>>(`/cases/${id}/close`, data),
-
-  escalate: (id: string, data: Schema<'EscalationAdd'>) =>
-    api.post<Schema<'CaseSuccessResponse'>>(`/cases/${id}/escalate`, data),
 
   getEscalations: (id: string) =>
     api.get<Schema<'CaseEscalationsResponse'>>(`/cases/${id}/escalations`),
@@ -502,6 +592,18 @@ export const mcpApi = {
   getSurface: () => api.get('/mcp/surface'),
 
   setSurfaceEnabled: (enabled: boolean) => api.put('/mcp/surface', { enabled }),
+
+  setSurfaceOAuthEnabled: (enabled: boolean) => api.put('/mcp/surface/oauth', { enabled }),
+
+  // Redirect URIs registration allows beyond loopback, and ones it refused lately (#4789).
+  getRedirectAllowlist: () => api.get<RedirectAllowlist>('/mcp/surface/oauth/redirects'),
+  setRedirectAllowlist: (uris: string[]) => api.put<RedirectAllowlist>('/mcp/surface/oauth/redirects', { uris }),
+}
+
+export interface RedirectAllowlist {
+  uris: string[]
+  // from the trail, newest first, not yet allowed; `at` is ISO with its zone
+  refused: { uri: string; at: string }[]
 }
 
 export interface ApiTokenHolder {
@@ -521,24 +623,38 @@ export interface ApiToken {
   expires_at: string | null
   revoked_at: string | null
   status: ApiTokenStatus
+  // An OAuth grant: an app connected through the consent page. Revoked, never rotated.
+  connected_app: boolean
+  client_name: string | null
   holder: ApiTokenHolder
+}
+
+// What a token for its holder may last. `max_days` is null when the stored policy can't be
+// read (a mint is then refused). `fixed`: a service account's token has no choice of length.
+export interface ApiTokenLimits {
+  max_days: number | null
+  default_days: number | null
+  fixed: boolean
 }
 
 // A minted or rotated token is in the response and nowhere else.
 export interface MintedApiToken {
   token: string
   credential: ApiToken
+  // When the token is revoked if it is never used; null when the rule is off or doesn't reach it.
+  unused_rule: string | null
 }
 
 export const tokensApi = {
-  listOwn: () => api.get<{ tokens: ApiToken[] }>('/tokens'),
+  listOwn: () => api.get<{ tokens: ApiToken[]; limits: ApiTokenLimits }>('/tokens'),
 
   // users.write. The filter is the server's.
   listAll: (params: { holder?: string; status?: ApiTokenStatus }) =>
-    api.get<{ tokens: ApiToken[]; holders: ApiTokenHolder[] }>('/tokens/all', { params }),
+    api.get<{ tokens: ApiToken[]; holders: ApiTokenHolder[]; limits: ApiTokenLimits }>('/tokens/all', { params }),
 
-  mint: (label: string, expiresInDays: number) =>
-    api.post<MintedApiToken>('/tokens', { label, expires_in_days: expiresInDays }),
+  // userId: a service account's, for a users.write holder; its token lasts its maximum.
+  mint: (label: string, expiresInDays: number | undefined, userId?: string) =>
+    api.post<MintedApiToken>('/tokens', { label, expires_in_days: expiresInDays, user_id: userId }),
 
   rotate: (credentialId: string, suspectedCompromise: boolean) =>
     api.post<MintedApiToken>(`/tokens/${credentialId}/rotate`, {
@@ -586,13 +702,21 @@ export const consoleApi = {
 }
 
 export interface IntegrationTestResult {
-  success: boolean
+  /** null is "not checked": neither a pass nor a fail, and nothing was stored */
+  success: boolean | null
   message?: string
-  // "not_testable": a catalog-only entry with no MCP server behind it
+  // "not_testable": nothing to probe or check.
+  // "not_checked": no read-only call, no credential saved, or the read did not run.
   reason?: string
   servers?: { name: string; success: boolean; error?: string; missing_credentials?: string[] }[]
-  /** the read-only check of the saved URL and credentials, for integrations that have one */
-  credentials?: { success: boolean; message: string }
+  /** the read-only check of the saved URL and credentials. success null: it did not run. */
+  credentials?: { success: boolean | null; message: string }
+}
+
+export interface OperatorInstructions {
+  text: string
+  /** the UTF-8 byte cap the server enforces */
+  max_bytes: number
 }
 
 export const configApi = {
@@ -613,6 +737,7 @@ export const configApi = {
   setDemoMode: (enabled: boolean) => api.post('/config/demo-mode', { enabled }),
   getSetupSteps: () =>
     coalesce('setup-steps', () => api.get<Schema<'SetupStepsResponse'>>('/config/setup-steps')),
+  getInstallReadiness: () => api.get<Schema<'InstallReadiness'>>('/install-readiness'),
   getSetupState: () => api.get<Schema<'SetupState'>>('/config/setup-state'),
   putSetupState: (update: Schema<'SetupStateUpdate'>) =>
     afterWrite('setup-steps', api.put<Schema<'SetupState'>>('/config/setup-state', update)),
@@ -650,8 +775,15 @@ export const configApi = {
     proxy_password?: string
     ssh_private_key_path?: string
     ssh_key_passphrase?: string
+    ssh_host_key?: string
     verify_proxy_tls?: boolean
+    database_password?: string
   }) => api.post('/config/platform-database', data),
+
+  // Deployment-wide text every agent run appends to its system prompt (#4918).
+  getOperatorInstructions: () => api.get<OperatorInstructions>('/config/operator-instructions'),
+  setOperatorInstructions: (text: string) =>
+    api.post<OperatorInstructions>('/config/operator-instructions', { text }),
 
   getAIOperations: () => api.get('/config/ai-operations'),
   setAIOperations: (data: {
@@ -669,7 +801,12 @@ export const configApi = {
   }) => api.post('/config/darktrace', data),
 
   getOrchestrator: () => coalesce('orchestrator', () => api.get('/config/orchestrator')),
-  getIntent: () => api.get('/config/intent'),
+  getIntent: () => api.get<Schema<'IntentReportResponse'>>('/config/intent'),
+  // The applied site/ revision, read-only (#5214); a hunt may start on one of its zones (#5212).
+  getSite: () => api.get<Schema<'SiteContextResponse'>>('/config/site'),
+  // A person's accept of the applied revision's pending loosenings (#5069)
+  acceptIntent: (data: Schema<'IntentAcceptBody'>) =>
+    api.post<Schema<'IntentReportResponse'>>('/config/intent/accept', data),
   setOrchestrator: (data: {
     enabled: boolean
     dry_run: boolean
@@ -689,12 +826,49 @@ export const configApi = {
   },
 }
 
+export const productionStartApi = {
+  get: () => api.get<Schema<'ProductionStart'>>('/production-start'),
+  set: (started_at: string | null) =>
+    api.put<Schema<'ProductionStart'>>('/production-start', { started_at }),
+}
+
+export const productionReportApi = {
+  status: () => api.get<Schema<'ProductionReportStatus'>>('/production-report/status'),
+  get: (record?: string) =>
+    api.get<Schema<'ProductionReport'>>('/production-report', { params: record ? { record } : {} }),
+  run: () => api.post<Schema<'ProductionReport'>>('/production-report'),
+}
+
+export const day1Api = {
+  status: () => api.get<Schema<'Day1Status'>>('/day1-report/status'),
+  get: (record?: string) =>
+    api.get<Schema<'Day1Report'>>('/day1-report', { params: record ? { record } : {} }),
+  run: () => api.post<Schema<'Day1Report'>>('/day1-report'),
+  modules: () => api.get<Schema<'Day1Module'>[]>('/day1-report/modules'),
+  setModule: (id: string, enabled: boolean) =>
+    api.put<Schema<'Day1Module'>>(`/day1-report/modules/${encodeURIComponent(id)}`, { enabled }),
+  // Whole days between automatic re-runs; 0 is off (#5045).
+  recurring: () => api.get<Schema<'Day1Recurring'>>('/day1-report/recurring'),
+  setRecurring: (days: number) => api.put<Schema<'Day1Recurring'>>('/day1-report/recurring', { days }),
+  // Jurisdictions and data or organisation kinds (#5010). The catalogue in the
+  // response is the only copy of the closure rules the form uses.
+  selection: () => api.get<SelectionView>('/day1-report/selection'),
+  setSelection: (data: SelectionDraft) =>
+    api.put<SelectionView>('/day1-report/selection', data),
+}
+
+export const cappedRecheckApi = {
+  latest: () => api.get<Schema<'Projection'>>('/day1-report/capped-recheck'),
+  start: () => api.post<Schema<'Projection'>>('/day1-report/capped-recheck'),
+}
+
 export interface PlatformDatabaseProxyConfig {
   proxy_type: string
   proxy_host: string
   proxy_port: number
   proxy_username: string
   ssh_private_key_path: string
+  ssh_host_key: string
   verify_proxy_tls: boolean
   // Booleans only — secret values are never returned by the API.
   has_proxy_password: boolean
@@ -734,10 +908,19 @@ export interface LLMProvider {
   last_error: string | null
   created_at: string | null
   updated_at: string | null
+  /** where its calls go, as the server classifies it (shared/residency.ts labels it) */
+  residency: Schema<'ProviderResidency'>
+  /** the type's Provider Statements, by name (core/llm/statements.py) */
+  statements: Record<string, StatementView>
 }
+
+export type StatementView = Schema<'StatementView'>
 
 export const llmProviderApi = {
   list: () => api.get<LLMProvider[]>('/llm/providers/'),
+  /** Records statements onto every active row of the provider's type. */
+  state: (providerId: string, statements: Record<string, string>) =>
+    api.put<LLMProvider>(`/llm/providers/${encodeURIComponent(providerId)}`, { statements }),
 }
 
 export interface AIModelInfo {
@@ -767,6 +950,9 @@ export interface AIConfigResponse {
   assignments: Record<string, ComponentAssignment>
 }
 
+export type InvestigationReplayResponse = Schema<'InvestigationReplayResponse'>
+export type WorkflowReplayTally = Schema<'WorkflowReplayTally'>
+
 export const aiConfigApi = {
   getConfig: () => api.get<AIConfigResponse>('/ai/config'),
   setComponent: (
@@ -776,6 +962,10 @@ export const aiConfigApi = {
   clearComponent: (component: string) =>
     api.delete<{ component: string; cleared: boolean }>(`/ai/config/${component}`),
   listModels: () => api.get<{ models: AIModelInfo[] }>('/ai/models'),
+  // The one investigation replay (#4389). A 404 is "no investigation replay".
+  getInvestigationReplay: () => api.get<InvestigationReplayResponse>('/ai/investigation-replay'),
+  startInvestigationReplay: (body: Schema<'InvestigationReplayStart'>) =>
+    api.post<InvestigationReplayResponse>('/ai/investigation-replay', body),
 }
 
 export interface IngestionJob {
@@ -868,23 +1058,50 @@ export const budgetsApi = {
   getQuota: () => api.get<BudgetQuotaResponse>('/analytics/budget/quota'),
 }
 
-/** One workflow's tally in `agent_agreement` (core/reporting/analytics_service.py). */
-export interface WorkflowAgreement {
-  workflow_id: string
+/** One tally in `agent_agreement` (core/reporting/analytics_service.py): overall, or one workflow. Rates are fractions from 0 to 1. */
+export interface AgreementTally {
   agreed: number
   disagreed: number
   agreement_rate: number | null
   abstained: number
   closed_without_determination: number
   closed_by_agent_alone: number
+  agreed_unchecked: number
+  answered: number
+  false_closes: number
+  false_close_rate: number | null
+  wilson_low: number | null
+  wilson_high: number | null
+}
+
+/** One model's tally within a workflow: the model its investigate runs' spend recorded. */
+export interface ModelAgreement extends AgreementTally {
+  model: string
+}
+
+/** One workflow's tally. `overall` is the same shape without a workflow id. */
+export interface WorkflowAgreement extends AgreementTally {
+  workflow_id: string
+  /** The same tally split by the model that ran each investigation. */
+  by_model: ModelAgreement[]
+  /** Closes and draws whose run used more than one model, or recorded none. */
+  unattributed: number
+}
+
+export interface AgentAgreement {
+  overall?: AgreementTally
+  by_workflow: WorkflowAgreement[]
 }
 
 export const analyticsApi = {
   /** The agent_agreement block of GET /analytics; the route returns an untyped dict, so only this part is typed. */
   getAgreement: (timeRange: '24h' | '7d' | '30d' | 'all' = '30d') =>
     api
-      .get<{ agent_agreement?: { by_workflow?: WorkflowAgreement[] } }>('/analytics', { params: { time_range: timeRange } })
-      .then((res) => res.data.agent_agreement?.by_workflow ?? []),
+      .get<{ agent_agreement?: { overall?: AgreementTally; by_workflow?: WorkflowAgreement[] } }>('/analytics', { params: { time_range: timeRange } })
+      .then((res): AgentAgreement => ({
+        overall: res.data.agent_agreement?.overall,
+        by_workflow: res.data.agent_agreement?.by_workflow ?? [],
+      })),
 }
 
 export const storageApi = {
@@ -968,6 +1185,8 @@ interface MetricNotes { source: string; unknown: string[] }
 export interface CoverageSiem {
   copies: number
   proven: number
+  /** Copies whose latest version caught a real attack step. */
+  caught: number
   failing: number
   state: 'proven' | 'unproven'
 }
@@ -983,9 +1202,95 @@ export interface CoverageCell {
   state: CoverageState
   rules: number
   disabled: number
+  /** Active rules declaring it that the import check holds from coverage. */
+  held: number
   seen: number
   replayed: number
+  /** Active rules whose latest version caught a real attack step, counted once across copies. */
+  caught: number
   siems: Partial<Record<CoverageSiemName, CoverageSiem>>
+}
+
+export type LayerState = 'validated' | 'partial' | 'present' | 'no_detection' | 'not_checked'
+export type LayerMark = 'tested_missed' | 'shadow' | 'not_observable'
+
+/** A compose emulation run in a cell's evidence; run_id is null when it ran on a Case the reader can't read. */
+export interface LayerRun {
+  run_id: string | null
+  restricted?: boolean
+  finished_at: string
+  hosts: string[]
+  steps_caught: number
+  steps_run: number
+}
+
+/** A SIEM rule declaring the technique, with its checks. */
+export interface LayerRule {
+  rule_id: number
+  name: string
+  runs: string | null
+  sees: string | null
+  caught: string | null
+  caught_at: string | null
+  shadow?: boolean
+}
+
+/** One layer's answer for one technique. */
+export interface LayerCell {
+  state: LayerState
+  marks?: LayerMark[]
+  reason?: string
+  evidence?: {
+    rules?: LayerRule[]
+    blind_spot?: string[]
+    labelled?: number
+    loglm_flags?: number
+    newest_run?: LayerRun
+    older_runs?: LayerRun[]
+  }
+}
+
+/** A row of the by-layer map: a SIEM, an alert source, LogLM, or every layer together (last). */
+export interface CoverageLayer {
+  layer: string
+  kind: 'siem' | 'alerts' | 'loglm' | 'combined'
+  reads: string
+  rules?: number
+  observable?: string
+  state?: 'not_checked'
+  reason?: string
+}
+
+export interface LayerTechnique {
+  technique: string
+  name: string
+  tactic: string
+  layers: Record<string, LayerCell>
+}
+
+export type CoverageScope = 'all' | 'emulated' | 'intel'
+
+/** by_layer on GET /detection-rules/coverage (#5135): each technique's state per detection layer. With no
+ * threat intelligence connected, an intel scope carries intel.connected false and a note, and no map. */
+export interface CoverageByLayer {
+  scope: CoverageScope | 'techniques'
+  intel?: { connected: boolean; named_by?: Record<string, unknown> }
+  note?: string
+  window_days?: number
+  layers?: CoverageLayer[]
+  unlabelled?: string[]
+  emulation?: { runs: number; error?: string; note?: string }
+  techniques?: LayerTechnique[]
+  tactics?: string[]
+  measures?: {
+    techniques: number
+    validated: Record<string, number>
+    validated_by_one_layer: number
+    present_never_validated: number
+    not_observable: number
+    loglm_lift?: number
+  }
+  source: string
 }
 
 /** GET /detection-rules/coverage: ATT&CK coverage by technique and SIEM (#4103). */
@@ -995,9 +1300,15 @@ export interface DetectionCoverage {
   /** Every SIEM with a listed (active or disabled) rule, in order, whether or not its rules declare a technique. */
   siems: CoverageSiemName[]
   summary: Record<CoverageState, number>
+  /** Techniques with any caught rule. */
+  caught_techniques: number
+  /** Technique ids in the order to emulate next: no rule, unproven, proven with nothing caught, then the rest. */
+  emulate_next: string[]
   rule_total: number
   mapped: number
   source: string
+  /** Only when asked for with by_layer, a scope or techniques. */
+  by_layer?: CoverageByLayer
 }
 
 /** GET /detection-rules/metrics: the rollout's success metrics from stored data. */
@@ -1086,6 +1397,176 @@ export interface RuleStageChange {
   hold: boolean
 }
 
+/** One stored check on a rule version, as the sync and sweeps wrote it. */
+export interface RuleCheck {
+  result?: 'pass' | 'fail' | 'unknown' | string
+  reason?: string | null
+  checked_at?: string
+  [key: string]: unknown
+}
+
+/** GET /detection-rules/rules/{id}: one listed rule copy with its query and stored checks. */
+export interface RuleDetail {
+  rule_id: number
+  title: string
+  /** The copy's language: splunk, elastic, wazuh or sigma. */
+  source: string
+  /** 'overlay' for Vigil's own rules. */
+  tool: string
+  version: number
+  description: string
+  query: string
+  checks: Record<string, RuleCheck | undefined>
+  stage: 'shadow' | 'live' | 'off' | null
+  /** Oldest first, each with the proof the move was made on. */
+  stages: { version: number; stage: 'shadow' | 'live' | 'off'; proof: Record<string, unknown>; actor: string; reason: string; at: string }[]
+  /** The import check holds its latest version from coverage (checks.import says why). */
+  held: boolean
+  /** The latest version's parsed content (a Sigma rule's YAML as an object). */
+  content: Record<string, unknown>
+}
+
+/** checks['import'] on a repo rule version: whether it counts as coverage yet. */
+export interface ImportCheck {
+  result: 'pending' | 'passed' | 'flagged' | 'failed' | 'approved' | 'unchecked'
+  reason?: string
+  /** Flagged for absent fields: the fields each SIEM lacks. */
+  absent_fields?: Record<string, string[]>
+  /** Approved: who, when, and the state it was approved from. */
+  by?: string
+  at?: string
+  was?: { result?: string; reason?: string }
+}
+
+/** The gap a gaps-run proposal answers, as the run recorded it. */
+export interface ProposalGap {
+  kind: 'missed' | 'paper' | 'intel' | 'blind'
+  technique: string
+  count: number
+  confirmed: number
+  /** Missed runs by key: "hunt:<id>", "case:<id>". */
+  runs: string[]
+  /** Alerts on a paper-only technique, by finding id. */
+  alerts: string[]
+  /** The intrusion sets and reports that name an intel gap's technique. */
+  sources: string[]
+  /** How many of its Cases this reader can't read. */
+  runs_withheld?: number
+  /** Its alerts are hidden: the reader can't read findings. */
+  alerts_withheld?: boolean
+}
+
+/** One detection proposal as GET /detection-engineering/proposals lists it. */
+export interface ProposalRow {
+  proposal_id: string
+  title: string
+  technique: string | null
+  case_id: string | null
+  state: string
+  origin: { source?: string; rollout?: string; gap?: ProposalGap; [key: string]: unknown }
+  created_by: string
+  created_at: string
+  updated_at: string
+  /** The run the proposal was handed to, and the rule copies attached to it. */
+  run_id: string | null
+  rule_ids: number[]
+  /** The copy its stages follow: a SIEM's, else the Sigma form. */
+  rule_id: number | null
+  /** Its run's status: running, paused, completed, failed or cancelled. */
+  run_status: string | null
+  /** Its run still working as the backend counts it, which can outlast ``run_status``. */
+  run_working: boolean
+}
+
+export interface ProposalEvent {
+  id: number
+  from_state: string | null
+  to_state: string
+  actor: string
+  actor_kind: string
+  reason: string
+  at: string
+  evidence: { step?: string; run_id?: string; rule_ids?: number[]; [key: string]: unknown }
+  /** Whether the step judged the proposal's current text. */
+  judges_current_text?: boolean
+}
+
+/** GET /detection-engineering/proposals/{id}: the proposal with its text, copies and events. */
+export interface Proposal extends ProposalRow {
+  sigma: string
+  copies: Record<string, string>
+  events: ProposalEvent[]
+  /** The attached copies' stage rows, oldest first; kept after a copy is removed. */
+  stages: { rule_id: number; version: number; stage: 'shadow' | 'live' | 'off'; actor: string; reason: string; at: string }[]
+  /** Each "hunt:<id>" in its evidence, by hunt id; a hunt with no distil marker is absent. */
+  hunts: Record<string, HuntRunLink>
+}
+
+/** A hunt's run, from its distil marker; withheld when it ran on a Case the reader can't read. */
+export interface HuntRunLink {
+  run_id: string | null
+  withheld: boolean
+}
+
+/** A gaps-run proposal in brief, as a hunt or a rule reads the ones it led to or answers. */
+export interface LinkedProposal {
+  proposal_id: string
+  title: string
+  technique: string | null
+  state: string
+  created_at: string
+  run_id: string | null
+  run_status: string | null
+  run_working: boolean
+  rule_id: number | null
+  rule_ids: number[]
+  /** Each attached copy and its current stage; a removed one has ``status: 'removed'``. */
+  rules: { rule_id: number; name: string | null; language: string | null; status: string; version: number | null; stage: 'shadow' | 'live' | 'off' | null }[]
+  hunts: Record<string, HuntRunLink>
+}
+
+/** Why a proven hypothesis got no proposal, in the order the backend checks them. */
+export type NoProposalReason = 'outside_window' | 'no_technique' | 'unknown' | 'caught' | 'workflow_off' | 'held' | 'waiting' | 'below_floor'
+
+/** What a hunt run led to for detection (GET /detection-engineering/hunts/{run_id}). */
+export interface HuntDetections {
+  run_id: string
+  hunt_ids: string[]
+  proposals: LinkedProposal[]
+  /** Each proven hypothesis on a technique none of the proposals covers, and why. */
+  without: {
+    hunt_id: string
+    hypothesis_id: string
+    statement: string
+    techniques: string[]
+    trust: string
+    concluded_at: string
+    reason: NoProposalReason
+    detail: string
+  }[]
+}
+
+/** Detection proposals: rules Vigil or a person drafted, with every step on the record. */
+export const detectionEngineeringApi = {
+  /** Newest first. */
+  proposals: () => api.get<{ proposals: ProposalRow[] }>('/detection-engineering/proposals'),
+
+  proposal: (proposalId: string) => api.get<Proposal>(`/detection-engineering/proposals/${encodeURIComponent(proposalId)}`),
+
+  /** A proposal to prove an inventory Sigma rule, or its open one if it has one. */
+  fromRule: (ruleId: number) => api.post<Proposal>('/detection-engineering/proposals/from-rule', { rule_id: ruleId }),
+
+  /** Rejects a proposal; the reason is required and stays on its record. */
+  reject: (proposalId: string, reason: string) =>
+    api.post<Proposal>(`/detection-engineering/proposals/${encodeURIComponent(proposalId)}/reject`, { reason }),
+
+  /** What a hunt run led to: its proposals and their rules, and why a proven hypothesis got none. */
+  hunt: (runId: string) => api.get<HuntDetections>(`/detection-engineering/hunts/${encodeURIComponent(runId)}`),
+
+  /** The gaps-run proposals a rule copy answers, oldest first, each with its hunts. */
+  ruleProposals: (ruleId: number) => api.get<{ proposals: LinkedProposal[] }>(`/detection-engineering/rules/${ruleId}/proposals`),
+}
+
 /** The signed-in person's notices and live conditions (the bell's second source). */
 export const noticesApi = {
   list: () => api.get<Notices>('/notices'),
@@ -1093,6 +1574,43 @@ export const noticesApi = {
   /** Marks these of the person's own notices read, or all of them; returns the list. */
   markRead: (ids: number[] | 'all') =>
     api.post<Notices>('/notices/read', ids === 'all' ? { all: true } : { ids }),
+}
+
+/** One rule file a repo read found: its rules' language and techniques, and why it can't be picked. */
+export interface RuleLibraryFile {
+  path: string
+  name: string
+  language: string | null
+  techniques: string[]
+  keys: string[]
+  problem: string | null
+  /** A proposal adopted this rule at an earlier version: that version */
+  adopted_version?: number
+}
+
+export interface RuleLibraryChange {
+  path: string
+  name: string
+  problem?: string | null
+}
+
+export interface RuleLibraryRead {
+  repo: string
+  url: string
+  ref: string
+  path: string
+  commit: string
+  format: string
+  rule_files: number
+  folders: { folder: string; rules: RuleLibraryFile[] }[]
+  library: {
+    id: string
+    name: string | null
+    commit: string | null
+    changed: RuleLibraryChange[]
+    gone: RuleLibraryChange[]
+    new: RuleLibraryChange[]
+  } | null
 }
 
 export const detectionRulesApi = {
@@ -1112,6 +1630,17 @@ export const detectionRulesApi = {
   revertRule: (ruleId: number, reason: string) =>
     api.post<RuleStageChange>(`/detection-rules/rules/${ruleId}/revert`, { reason }),
 
+  /** One rule copy: its latest version's query, description and stored checks. */
+  rule: (ruleId: number) => api.get<RuleDetail>(`/detection-rules/rules/${ruleId}`),
+
+  /** Switches a shadow rule off and holds it there; a signed-in person only. */
+  switchOffRule: (ruleId: number, reason: string) =>
+    api.post<RuleStageChange>(`/detection-rules/rules/${ruleId}/switch-off`, { reason }),
+
+  /** Makes a held repo rule's latest version count as coverage; 409 when lint fails or it is not held. */
+  approveRule: (ruleId: number, reason: string) =>
+    api.post<{ success: boolean; rule_id: number; version: number; import: ImportCheck }>(`/detection-rules/rules/${ruleId}/approve`, { reason }),
+
   /** Lifts a person's hold: the normal rollout applies to the rule again. */
   releaseRule: (ruleId: number, reason: string) =>
     api.post<RuleStageChange>(`/detection-rules/rules/${ruleId}/release`, { reason }),
@@ -1125,6 +1654,12 @@ export const detectionRulesApi = {
 
   /** ATT&CK coverage by technique and SIEM: the heat map. */
   coverage: () => api.get<DetectionCoverage>('/detection-rules/coverage'),
+  /** The same, with by_layer for a scope or these technique ids; a bad id is a 422. */
+  coverageByLayer: (scope: CoverageScope, techniques?: string[]) =>
+    api.get<DetectionCoverage>('/detection-rules/coverage', {
+      params: { by_layer: true, ...(techniques?.length ? { techniques } : { scope }) },
+      paramsSerializer: { indexes: null },
+    }),
 
   /** Marks these entries read for the signed-in person, or every open one; returns the inbox. */
   markHealthRead: (changeIds: number[] | 'all') =>
@@ -1162,6 +1697,17 @@ export const detectionRulesApi = {
       ...(githubEnterprise === undefined ? {} : { github_enterprise: githubEnterprise }),
     }),
   
+  /** Read a repo (new library) or a library (with its update diff) at the commit it is at now. A clone runs long. */
+  readLibrary: (data: { repo: string; format: string } | { source_id: string }) =>
+    api.post<RuleLibraryRead>('/detection-rules/libraries/read', data, { timeout: 0 }),
+
+  /** Import picked rule files at the commit read: a new library from repo, or an update to source_id. */
+  importLibrary: (data: { commit: string; picks: string[]; repo?: string; source_id?: string; name?: string; format?: string }) =>
+    api.post('/detection-rules/libraries/import', data, { timeout: 0 }),
+
+  /** Remove a rule library and its files (step-up gated). */
+  removeLibrary: (sourceId: string) => api.delete(`/detection-rules/libraries/${sourceId}`),
+
   removeSource: (sourceId: string, deleteFiles: boolean = false) =>
     api.delete(`/detection-rules/sources/${sourceId}`, { params: { delete_files: deleteFiles } }),
   
@@ -1274,11 +1820,17 @@ interface HuntDocument {
   condensed: boolean
 }
 
+export type InsiderLeads = Required<Schema<'InsiderLeadsBody'>>
+
 export const workflowApi = {
   listAll: () => api.get('/workflows'),
   get: (id: string) => api.get(`/workflows/${id}`),
   /** Who runs it, its model, what it may do, where it stops and pauses; a hunt kind adds capabilities and pricing. */
   preflight: (id: string) => api.get(`/workflows/${id}/preflight`),
+  /** The insider lead list: which findings count as leads, and who reads the cases they open (#4778). */
+  insiderLeads: () => api.get<InsiderLeads>('/workflows/threat-hunt/insider-leads'),
+  /** Replaces the list. Adding anything needs a person's own session; a refusal carries its reason. */
+  setInsiderLeads: (body: InsiderLeads) => api.put<InsiderLeads>('/workflows/threat-hunt/insider-leads', body),
   /** Turns a workflow on or off. A 409 carries the reason it cannot be turned off. */
   setEnabled: (id: string, enabled: boolean) => api.put(`/workflows/${id}/enabled`, { enabled }),
   execute: (id: string, params: {
@@ -1291,6 +1843,10 @@ export const workflowApi = {
     hypothesis_subjects?: Record<string, string[]>
     iterations?: number
     approve_hypotheses?: boolean
+    /** Run on a restricted case: the named one, or a new one only the starter reads. */
+    restricted?: boolean
+    /** A zone the applied site revision declares: the hunt's scope is its selectors. */
+    zone?: string
   }) => api.post<{ run_id?: string; case_id?: string }>(`/workflows/${id}/execute`, params, { timeout: LLM_TIMEOUT }),
   /** Reads an attached file on the server and keeps nothing. Over 64 KB it is condensed, and says so on line one. */
   readHuntDocument: (file: File) => {
@@ -1305,6 +1861,11 @@ export const workflowApi = {
   // with a `proposal` body execute() accepts as-is. Never starts anything.
   checkCoverage: (body: { report?: string; entity_keys?: string[]; techniques?: string[] }) =>
     api.post('/workflows/threat-hunt/coverage', body, { timeout: LLM_TIMEOUT }),
+  // Read-only: a hunt on the data movement of each account the finding names, as an
+  // execute body on a restricted case. 400 with the reason when it names no account.
+  leadProposal: (findingId: string) =>
+    api.get<{ accounts: string[]; proposal: { hypothesis: string; hypothesis_subjects: Record<string, string[]>; approve_hypotheses?: boolean; restricted?: boolean; finding_id: string } }>(
+      '/workflows/threat-hunt/lead-proposal', { params: { finding_id: findingId } }),
 
   // persisted to workflow_runs, so History lists past runs without retrieving
   // every prompt transcript
@@ -1368,10 +1929,20 @@ export const workflowApi = {
 export type Ceiling = Schema<'CeilingResponse'>
 export type ToolClass = Schema<'ToolClassEntry'>
 export type EffectClass = NonNullable<ToolClass['effect_class']>
+// What Vigil holds from Entra, Okta and Falcon (#4743): read only, findings.read.
+export type EntityFacts = Schema<'EntityFactsResponse'>
+export const entityFactsApi = {
+  get: (limit = 100) => api.get<EntityFacts>('/v1/entity-facts', { params: { limit } }),
+}
+
 // The rule-rollout limits (#4058): promotion cap, days in shadow, hits a day. The SIEM
 // Quiet/Noisy/Silent thresholds ride along read only; they are edited on the integration.
 export type RolloutLimits = Schema<'RolloutLimitsResponse'>
+// Which outside tools are emulators, and the one host list they run on (#5061).
+export type Emulation = Schema<'EmulationResponse'>
 export const autonomyApi = {
+  emulation: () => api.get<Emulation>('/autonomy/emulation'),
+  updateEmulation: (body: Schema<'EmulationBody'>) => api.put<Emulation>('/autonomy/emulation', body),
   rolloutLimits: () => api.get<RolloutLimits>('/autonomy/rollout-limits'),
   updateRolloutLimits: (body: Schema<'RolloutLimitsBody'>) =>
     api.put<RolloutLimits>('/autonomy/rollout-limits', body),
@@ -1384,7 +1955,15 @@ export const autonomyApi = {
   // tier null follows the fleet; the server decides whether the change is a raise
   setWorkflow: (id: string, body: Schema<'WorkflowAutonomyBody'>) =>
     api.put<Ceiling>(`/autonomy/workflows/${encodeURIComponent(id)}`, body),
+  // Clears the stop's hold and runs the row at once, as the person releasing it.
+  releaseHeld: (actionId: string) =>
+    api.post<Ceiling>(`/autonomy/held/${encodeURIComponent(actionId)}/release`),
+  releaseAllHeld: () => api.post<Ceiling>('/autonomy/held/release'),
+  // What saving component as provider/model would do to Act workflows; the save's own judgement, nothing stored.
+  previewModelChange: (component: string, provider_id: string, model_id: string) =>
+    api.get<ModelChangePreview>('/autonomy/model-change', { params: { component, provider_id, model_id } }),
 }
+export type ModelChangePreview = Schema<'ModelChangePreview'>
 
 export interface OrchestratorStatus {
   enabled?: boolean
@@ -1400,6 +1979,9 @@ export const orchestratorApi = {
   getStatus: () => api.get<OrchestratorStatus>('/orchestrator/status'),
   kill: () => api.post('/orchestrator/kill'),
   purgeAll: () => api.post('/orchestrator/investigations/purge'),
+  // Queues a run as a Human Ask. no_case is only for the MITRE analyst (Emulate).
+  investigate: (body: { workflow_id: string; hypothesis: string; no_case?: boolean }) =>
+    api.post<{ success: boolean; message: string }>('/orchestrator/investigations', body),
 }
 
 /** The trail filter (core.audit.trail.make_query): the list and the export send the same one. */
@@ -1423,15 +2005,18 @@ export interface AuditEntry {
   late: boolean
   entry_hash: string
   payload: Record<string, unknown>
-  source_ip: string | null
+  // A narrowed entry (restricted) leaves these off.
+  source_ip?: string | null
   actor_text: string | null
-  operator_text: string | null
-  attempted_name: string | null
-  personal: unknown
+  operator_text?: string | null
+  attempted_name?: string | null
+  personal?: unknown
   actor?: AuditPrincipal | null
   on_behalf_of?: AuditPrincipal | null
   /** What the entry was, in words, from the server. */
   sentence?: string
+  /** About a restricted case the reader can't read: who and when only (#4362). */
+  restricted?: boolean
 }
 
 export interface AuditTip { seq: number; hash: string }
@@ -1447,6 +2032,10 @@ export interface AuditFeedHealth {
   unconfirmed: number | null
   /** New entries are refused until the push carries it, for up to 30 seconds. */
   paused: boolean
+  /** Entries waiting to be recorded late. Open collapse windows are not counted. */
+  held: number | null
+  /** When the oldest waiting entry happened. Null when none is waiting. */
+  held_since: string | null
 }
 
 export interface AuditVerify {
@@ -1469,6 +2058,8 @@ export interface AuditRetention {
   pending_on: string | null
   unconfirmed: boolean
   erasure_unconfirmed: boolean
+  /** Why a due erasure is waiting (the list can't be written); null when fine. */
+  blocked: string | null
   erasures: AuditErasure[]
 }
 
@@ -1566,6 +2157,64 @@ export const auditFeedApi = {
   test: () => api.post<{ ok: boolean }>('/audit/feed/test'),
 }
 
+/** States from core/integrations/health.py judge. The client does not derive one. */
+export type IntegrationHealthState =
+  | 'healthy'
+  | 'no_attempt'
+  | 'unhealthy'
+  | 'failing_once'
+  | 'requires_test'
+  | 'not_checked'
+  | 'switched_off'
+  | 'unknown'
+
+/** One source from GET /api/integration-health. `record` is not read: state, reason and since are the judgement. */
+export interface IntegrationHealthSource {
+  source_id: string
+  kind: string
+  switched_on: boolean
+  state: IntegrationHealthState
+  reason: string | null
+  since: string | null
+  /** The stored record; window counts read null when expired or not yet counted. */
+  record?: IntegrationHealthRecord | null
+}
+
+export interface IntegrationHealthRecord {
+  dropped_window_start: string | null
+  returned_window: number | null
+  stored_window: number | null
+  filtered_window: number | null
+  dropped_window: number | null
+  /** returned − stored − filtered − dropped; negative is an accounting error */
+  duplicate_window: number | null
+  dropped_total: number
+  /** What a collector read from the source itself; OpenCTI only (services/api/opencti_facts.py). */
+  facts?: SourceFacts | null
+  [key: string]: unknown
+}
+
+export interface SourceFacts {
+  collected_at: string
+  /** the collector's interval: older than two of these and the facts are unknown */
+  interval_seconds: number
+  version: string | null
+  newest_intel_at: string | null
+  queue_messages_total: number | null
+  connectors: { name: string; active: boolean; queue_messages: number }[] | null
+  /** facts the token could not read, each with a plain reason */
+  missing: { fact: string; reason: string }[]
+}
+
+export interface IntegrationHealthResponse {
+  checked_at: string
+  sources: IntegrationHealthSource[]
+}
+
+export const integrationHealthApi = {
+  get: () => api.get<IntegrationHealthResponse>('/integration-health'),
+}
+
 export const federationApi = {
   setSettings: (enabled: boolean) =>
     api.put<{ enabled: boolean }>('/federation/settings', { enabled }),
@@ -1584,19 +2233,6 @@ export const federationApi = {
       `/federation/sources/${sourceId}/poll-now`,
     ),
   getHealth: () => api.get('/federation/health'),
-}
-
-export const reasoningApi = {
-  getSessionSummary: (sessionId: string) =>
-    api.get(`/reasoning/${encodeURIComponent(sessionId)}`).then(r => r.data),
-
-  listInteractions: (sessionId: string, params?: { limit?: number; offset?: number }) =>
-    api.get(`/reasoning/${encodeURIComponent(sessionId)}/interactions`, { params }).then(r => r.data),
-
-  getInteraction: (sessionId: string, interactionId: string) =>
-    api
-      .get(`/reasoning/${encodeURIComponent(sessionId)}/interactions/${encodeURIComponent(interactionId)}`)
-      .then(r => r.data),
 }
 
 // returns raw axios responses (read `res.data`), matching casesApi
@@ -1667,6 +2303,9 @@ export const kafkaApi = {
 
 interface BootstrapStatus {
   required: boolean
+  // single sign-on is on: the login page offers "Sign in with SSO"
+  sso_enabled?: boolean
+  require_sso?: boolean
 }
 
 interface BootstrapPayload {
@@ -1718,6 +2357,8 @@ export interface OverviewFeedItem {
   source_evidence: Record<string, unknown> | null
   source_link: string | null
   case_id: string | null
+  /** in a restricted case the reader can't see: case_id is withheld */
+  case_restricted?: boolean
   noise_marked: boolean
 }
 
@@ -1749,6 +2390,18 @@ export const overviewApi = {
     api.get<OverviewFeedItem>(`/overview/alerts/${encodeURIComponent(findingId)}`),
 }
 
+export type TriageRaisedBy =
+  | {
+      source: 'crown_jewel'
+      name: string
+      file: string
+      line: number
+      revision: string | null
+      selector: string
+      key: string
+    }
+  | { source: 'enrichment'; criticality: 'critical' }
+
 export interface TriageRow {
   id: number
   kind: string
@@ -1762,6 +2415,8 @@ export interface TriageRow {
   age_seconds: number
   ttl_seconds: number
   last_quarter: boolean
+  /** What launches it ahead of older rows in its band; null when nothing does. */
+  raised_by: TriageRaisedBy | null
   pickup_seconds: number | null
   workflow_id: string
   case_door: string | null
@@ -1777,9 +2432,16 @@ export interface TriageRow {
   description: string | null
   /** What the daemon's triage saved; null on rows that are not alerts. */
   triage: TriageVerdict | null
+  /** What the threat-intel feed said at enrichment; null when no outcome was recorded. */
+  threat_intel_check: ThreatIntelCheck | null
   finding_id: string | null
   created_at: string | null
   decided_at: string | null
+}
+
+export interface ThreatIntelCheck {
+  outcome: 'hit' | 'no_hit' | 'nothing_to_check' | 'could_not_check'
+  detail: string | null
 }
 
 /** A saved verdict reads as stored: a field triage did not give is null, never defaulted. */
@@ -1858,6 +2520,50 @@ export const bootstrapApi = {
   create: (payload: BootstrapPayload) => api.post('/auth/bootstrap', payload),
 }
 
+// Invites: a person sets up their own account through a single-use link.
+export const invitesApi = {
+  list: () => api.get<Schema<'InviteList'>>('/users/invites'),
+  create: (body: Schema<'InviteRequest'>) => api.post<Schema<'InviteIssued'>>('/users/invites', body),
+  resend: (linkId: string, channel: Schema<'ResendRequest'>['channel']) =>
+    api.post<Schema<'InviteIssued'>>(`/users/invites/${encodeURIComponent(linkId)}/resend`, { channel }),
+  revoke: (linkId: string) => api.delete(`/users/invites/${encodeURIComponent(linkId)}`),
+  // Public. The value rides in a header so no log line carries it; opening a link uses nothing up.
+  check: (token: string) => api.get<Schema<'InviteCheck'>>('/auth/invite', { headers: { 'X-Invite-Token': token } }),
+  accept: (body: Schema<'AcceptInvite'>) => api.post<{ message: string }>('/auth/accept-invite', body),
+}
+
+// Directory pushes that wait for a link, and undoing a window of sync deactivations (#4507).
+export const directoryPushesApi = {
+  pending: () => api.get<Schema<'PendingPushes'>>('/users/sync/pending'),
+  link: (pendingId: string, userId: string) =>
+    api.post(`/users/sync/pending/${encodeURIComponent(pendingId)}/link`, { user_id: userId } satisfies Schema<'LinkRequest'>),
+  countWindow: (since: string, until: string) =>
+    api.get<Schema<'SyncWindowCount'>>('/users/sync/window', { params: { since, until } }),
+  reactivateWindow: (since: string, until: string) =>
+    api.post<Schema<'SyncWindowResult'>>('/users/sync/window', { since, until } satisfies Schema<'SyncWindow'>),
+  removeUnused: (userId: string) => api.post(`/users/${encodeURIComponent(userId)}/remove-unused`),
+}
+
+// Teams on Team & access. Reads need users.read; changes need teams.manage.
+export const teamsApi = {
+  list: () => api.get<Schema<'TeamOut'>[]>('/users/teams'),
+  get: (id: string) => api.get<Schema<'TeamDetail'>>(`/users/teams/${encodeURIComponent(id)}`),
+  create: (name: string) =>
+    api.post<Schema<'TeamOut'>>('/users/teams', { name } satisfies Schema<'TeamName'>),
+  rename: (id: string, name: string) =>
+    api.post<Schema<'TeamOut'>>(`/users/teams/${encodeURIComponent(id)}/rename`, { name } satisfies Schema<'TeamName'>),
+  archive: (id: string) => api.post<Schema<'TeamOut'>>(`/users/teams/${encodeURIComponent(id)}/archive`),
+  unarchive: (id: string) => api.post<Schema<'TeamOut'>>(`/users/teams/${encodeURIComponent(id)}/unarchive`),
+  addMember: (id: string, userId: string) =>
+    api.post<Schema<'TeamDetail'>>(`/users/teams/${encodeURIComponent(id)}/members`, {
+      user_id: userId,
+    } satisfies Schema<'TeamMemberAdd'>),
+  removeMember: (id: string, userId: string) =>
+    api.delete<Schema<'TeamMemberRemoved'>>(
+      `/users/teams/${encodeURIComponent(id)}/members/${encodeURIComponent(userId)}`,
+    ),
+}
+
 export const authApi = {
   // Public password reset. `request` answers the same whether or not the email
   // matches an account; the emailed link lands on /reset-password?token=…
@@ -1866,7 +2572,10 @@ export const authApi = {
       email,
     } satisfies Schema<'PasswordResetRequest'>),
   confirmPasswordReset: (payload: Schema<'PasswordResetConfirm'>) =>
-    api.post<{ message: string }>('/auth/password-reset/confirm', payload),
+    api.post<{ message: string; recovery_codes_removed?: boolean }>('/auth/password-reset/confirm', payload),
+  // Public. Opening /confirm-email does not send this; the button does.
+  confirmEmail: (token: string) =>
+    api.post<{ message: string }>('/auth/email-confirmation/confirm', { token }),
   /** Revokes every token the user holds and clears the auth cookies, so the
    *  caller is signed out once this resolves. */
   changePassword: (body: Schema<'ChangePasswordRequest'>) =>
@@ -1900,16 +2609,30 @@ export const signInsApi = {
     api.post<Schema<'EndedSignIns'>>(`/users/${encodeURIComponent(userId)}/sign-ins/end`, {
       reason,
     } satisfies Schema<'EndSignInsRequest'>),
-  // End a lock; how the manager confirmed the person's identity goes to the audit trail.
-  unlock: (userId: string, identityConfirmedBy: string) =>
+  // End a lock and the person's sign-ins. The reason and how they were confirmed go to the trail.
+  unlock: (userId: string, identityConfirmedBy: string, reason: string, suspectedCompromise = false) =>
     api.post(`/users/${encodeURIComponent(userId)}/unlock`, {
       identity_confirmed_by: identityConfirmedBy as Schema<'UnlockRequest'>['identity_confirmed_by'],
-    }),
+      reason,
+      suspected_compromise: suspectedCompromise,
+    } satisfies Schema<'UnlockRequest'>),
+  // Recovery: a reset link (emailed, or copied once) and a reset of two-step sign-in.
+  resetLink: (userId: string) => api.get<Schema<'ResetLinkState'>>(`/users/${encodeURIComponent(userId)}/reset-link`),
+  issueResetLink: (userId: string, body: Schema<'ResetLinkRequest'>) =>
+    api.post<Schema<'ResetLinkIssued'>>(`/users/${encodeURIComponent(userId)}/reset-link`, body),
+  revokeResetLink: (userId: string) => api.delete(`/users/${encodeURIComponent(userId)}/reset-link`),
+  resetMfa: (userId: string, body: Schema<'MfaResetRequest'>) =>
+    api.post<Schema<'MfaResetResult'>>(`/users/${encodeURIComponent(userId)}/mfa/reset`, body),
   // The whole install, the caller's own sign-in included.
   endEveryone: (reason: string) =>
     api.post<Schema<'EndedSignIns'>>('/users/sign-ins/end-all', {
       reason,
     } satisfies Schema<'EndSignInsRequest'>),
+}
+
+// Current people, for the owner and assignee pickers: a person sign-in with cases.assign or cases.write.
+export const peopleApi = {
+  list: () => api.get<Schema<'Person'>[]>('/users/people'),
 }
 
 // The session policy: how long a sign-in lasts. A save needs the version from the read.
@@ -1925,6 +2648,72 @@ export const sessionPolicyApi = {
       params: { dry_run: true },
       headers: { 'If-Match': `"${version}"` },
     }),
+}
+
+// Single sign-on settings. The client secret is sent on a save and never comes back.
+export type SsoSettings = Schema<'SsoSettingsOut'> & {
+  sync_enabled?: boolean
+  directory_id_claim?: string
+}
+export type SsoSettingsBody = Schema<'SsoSettingsIn'>
+export const ssoApi = {
+  get: () => api.get<SsoSettings>('/auth/sso/settings'),
+  put: (body: SsoSettingsBody, version: number) =>
+    api.put<SsoSettings>('/auth/sso/settings', body, { headers: { 'If-Match': `"${version}"` } }),
+}
+
+/** Directory sync status. `token` is present only in the response that minted it. */
+export type DirectorySync = {
+  sync_enabled: boolean
+  directory_id_claim: string
+  last_push: string | null
+  token_expires_at: string | null
+  /** while sync is off: when its token's first unused-token reminder would come */
+  first_reminder_at?: string | null
+  failed_authentications: number
+  last_manager_refusals: string[]
+  skipped_joins: number
+  /** pushes refused for a username or email in use, waiting for a link on Team & access */
+  pending_links: number
+  broken_lines: { external_id: string; on: string }[]
+  mapping_note: string | null
+  role_refusals: string[]
+  scim_path: string
+  token?: string | null
+}
+export const directorySyncApi = {
+  get: () => api.get<DirectorySync>('/auth/sso/sync'),
+  save: (directory_id_claim: string, mint = false) =>
+    api.post<DirectorySync>('/auth/sso/sync', { directory_id_claim, mint }),
+  mapping: () => api.get<DirectoryMapping>('/auth/sso/mapping'),
+  saveMapping: (
+    body: { group_roles: { group: string; role_id: string }[]; team_lines: TeamLine[] },
+    version: number,
+    dryRun = false,
+  ) =>
+    api.post<MappingEffect>('/auth/sso/mapping', body, {
+      params: dryRun ? { dry_run: true } : undefined,
+      headers: { 'If-Match': `"${version}"` },
+    }),
+}
+
+export type PushedGroup = { id: string; external_id: string; display_name: string }
+export type TeamLine = { group: string; team_id: string }
+export type DirectoryMapping = {
+  group_roles: { group: string; role_id: string }[]
+  team_lines: TeamLine[]
+  groups: PushedGroup[]
+  version: number
+  mapping_author: string | null
+}
+export type MappingEffect = {
+  roles_rise: number
+  roles_fall: number
+  roles_default: number
+  memberships_added: number
+  memberships_removed: number
+  applied: boolean
+  version: number
 }
 
 // The shipped breached-password list and what an administrator has imported onto it.
@@ -1944,25 +2733,29 @@ export const breachedListApi = {
 
 /** The factor of a method change: a current code, or a security key's assertion and the challenge it signed. */
 export type Factor = { code?: string; assertion?: Record<string, unknown>; challenge?: string }
+// The first half of a method-change check: the password, or for a person who signs in only
+// through SSO the proof from confirming at the provider.
+export type Answer = { password?: string; sso_proof?: string }
 
 // Self-service two-step sign-in (TOTP + recovery codes + security keys) for the signed-in user.
 export const mfaApi = {
   setup: () => api.post<Schema<'MFASetupResponse'>>('/auth/mfa/setup'),
-  // the first method needs the password; a change to one that exists, the password and a code
-  verify: (code: string, password: string) =>
+  // the first method sends the answer alone; adding the app beside a key also sends that key
+  verify: (code: string, answer: Answer, factor: Factor = {}) =>
     api.post<Schema<'RecoveryCodesResponse'>>('/auth/mfa/verify', {
       code,
-      password,
+      ...answer,
+      ...factor,
     } satisfies Schema<'MFAVerifyRequest'>),
-  regenerateRecoveryCodes: (password: string, factor: Factor) =>
+  regenerateRecoveryCodes: (answer: Answer, factor: Factor) =>
     api.post<Schema<'RecoveryCodesResponse'>>('/auth/mfa/recovery-codes', {
-      password,
+      ...answer,
       ...factor,
     } satisfies Schema<'MFAVerifyRequest'>),
   // axios sends a DELETE body only through `data`
-  disable: (password: string, factor: Factor) =>
+  disable: (answer: Answer, factor: Factor) =>
     api.delete<{ message: string }>('/auth/mfa', {
-      data: { password, ...factor } satisfies Schema<'MFAVerifyRequest'>,
+      data: { ...answer, ...factor } satisfies Schema<'MFAVerifyRequest'>,
     }),
   methods: () => api.get<Schema<'MfaMethod'>[]>('/auth/mfa-methods'),
   // Another person's, read-only, for managers (users.write over the account).
@@ -1973,12 +2766,28 @@ export const mfaApi = {
 export const keysApi = {
   registrationOptions: () => api.post<Schema<'WebAuthnOptions'>>('/auth/mfa/keys/options'),
   assertionOptions: () => api.post<Schema<'WebAuthnOptions'>>('/auth/mfa/keys/assertion-options'),
-  // a person with no MFA yet sends the password alone; the first key then returns recovery codes
+  // a person with no MFA yet sends the answer alone; the first key then returns recovery codes
   add: (body: Schema<'RegisterKeyRequest'>) => api.post<Schema<'SecurityKeyAdded'>>('/auth/mfa/keys', body),
-  remove: (keyId: string, password: string, factor: Factor) =>
+  remove: (keyId: string, answer: Answer, factor: Factor) =>
     api.delete<{ message: string }>(`/auth/mfa/keys/${encodeURIComponent(keyId)}`, {
-      data: { password, ...factor } satisfies Schema<'MFAVerifyRequest'>,
+      data: { ...answer, ...factor } satisfies Schema<'MFAVerifyRequest'>,
     }),
 }
 
 export default api
+
+// An app's request to connect (#4788): what the consent page shows, and the answer.
+export interface OAuthRequest {
+  client_id: string
+  client_name: string | null
+  redirect_host: string
+  resource: string
+  expires_at: string
+}
+
+export const oauthApi = {
+  read: (requestId: string) => api.get<OAuthRequest>(`/oauth/authorizations/${encodeURIComponent(requestId)}`),
+  // Approve asks "Confirm it's you" first; the answer is the client's redirect, to follow.
+  decide: (requestId: string, decision: 'approve' | 'deny') =>
+    api.post<{ redirect_to: string }>(`/oauth/authorizations/${encodeURIComponent(requestId)}`, { decision }),
+}

@@ -29,10 +29,12 @@
 
     "loglm": {
       "command": "npx",
-      "args": ["-y", "mcp-remote@0.16.1", "${LOGLM_MCP_URL}", "--header", "Authorization: Bearer ${LOGLM_MCP_TOKEN}"],
+      "args": ["-y", "mcp-remote@0.16.7", "${LOGLM_MCP_URL}", "--header", "Authorization:$${LOGLM_AUTH_HEADER}"],
       "env": {
-        "_security_note": "mcp-remote pinned to exactly 0.16.1. CVE-2025-6514 (GHSA-6xpm-ggf7-wc3p, affects >=0.0.5 <0.1.16) is fixed in 0.1.16; keep an exact pin at or above it.",
-        "LOGLM_MCP_URL": "${LOGLM_MCP_URL}"
+        "_security_note": "mcp-remote pinned to exactly 0.16.7. CVE-2025-6514 (GHSA-6xpm-ggf7-wc3p, affects >=0.0.5 <0.1.16) is fixed in 0.1.16; keep an exact pin at or above it.",
+        "_header_note": "$$ is a literal $: mcp-remote expands ${LOGLM_AUTH_HEADER} from its own env, keeping the token off the command line, which other server uids in the runner can read.",
+        "LOGLM_MCP_URL": "${LOGLM_MCP_URL}",
+        "LOGLM_AUTH_HEADER": "Bearer ${LOGLM_MCP_TOKEN}"
       }
     },
 
@@ -59,19 +61,19 @@
 
     "azure-sentinel": {
       "command": "npx",
-      "args": ["-y", "mcp-remote@0.16.1", "https://sentinelmcp.microsoft.com/v1/mcp"],
+      "args": ["-y", "mcp-remote@0.16.7", "https://sentinelmcp.microsoft.com/v1/mcp"],
       "env": {
         "_setup_note": "Microsoft Sentinel MCP (GA Nov 2025). Requires: (1) Onboarding to Microsoft Sentinel data lake, (2) Microsoft Entra OAuth. See: https://learn.microsoft.com/en-us/azure/sentinel/datalake/sentinel-mcp-get-started",
-        "_security_note": "mcp-remote pinned to exactly 0.16.1. CVE-2025-6514 (GHSA-6xpm-ggf7-wc3p, affects >=0.0.5 <0.1.16) is fixed in 0.1.16; keep an exact pin at or above it."
+        "_security_note": "mcp-remote pinned to exactly 0.16.7. CVE-2025-6514 (GHSA-6xpm-ggf7-wc3p, affects >=0.0.5 <0.1.16) is fixed in 0.1.16; keep an exact pin at or above it."
       }
     },
 
     "splunk": {
       "command": "npx",
-      "args": ["-y", "mcp-remote@0.16.1", "${SPLUNK_MCP_URL}"],
+      "args": ["-y", "mcp-remote@0.16.7", "${SPLUNK_MCP_URL}"],
       "env": {
         "_setup_note": "Splunk Official MCP Server. Deploy via Azure Marketplace (Splunk-hosted) or self-managed. See: https://www.splunk.com/en_us/blog/artificial-intelligence/unlocking-ai-driven-operations-with-splunk-mcp-server-on-azure-marketplace.html",
-        "_security_note": "mcp-remote pinned to exactly 0.16.1. CVE-2025-6514 (GHSA-6xpm-ggf7-wc3p, affects >=0.0.5 <0.1.16) is fixed in 0.1.16; keep an exact pin at or above it.",
+        "_security_note": "mcp-remote pinned to exactly 0.16.7. CVE-2025-6514 (GHSA-6xpm-ggf7-wc3p, affects >=0.0.5 <0.1.16) is fixed in 0.1.16; keep an exact pin at or above it.",
         "SPLUNK_MCP_URL": "${SPLUNK_MCP_URL}"
       }
     },
@@ -100,6 +102,15 @@
       "cwd": "${workspaceFolder}",
       "env": {
         "_setup_note": "OpenSearch SIEM via the OpenSearch REST API. Configure in Settings (OpenSearch URL, username/password, optional OpenSearch Dashboards URL). The tool reads via resolve(); there is no required env placeholder, so the server stays dormant until the OpenSearch URL resolves."
+      }
+    },
+
+    "amazon-security-lake": {
+      "command": "python3",
+      "args": ["core/integrations/amazon_security_lake/tool.py"],
+      "cwd": "${workspaceFolder}",
+      "env": {
+        "_setup_note": "Amazon Security Lake: read-only Athena SQL over the OCSF sources Security Lake keeps in Glue, one region per call. Configure in Settings (optional role ARN and external ID, Athena workgroup, regions returning rows). Credentials come from the default AWS chain of the process the server runs in (instance role, ECS task role, IRSA or Pod Identity, or a mounted shared config named by AWS_CONFIG_FILE / AWS_SHARED_CREDENTIALS_FILE with AWS_PROFILE: under the MCP runner each server has its own HOME, so ~/.aws is not read); there is no access-key field, and raw AWS keys in the environment are never forwarded. Under the runner, a file a pointer names (IRSA or Pod Identity token, mounted config) is read by the root runner and copied as this server's uid into its own 0700 HOME, refreshed every 60 s, so mount it root-owned and read-only (docs/security-lake-aws.md). The backend runs the Settings test on its own chain, so the backend and the MCP runner must share a credential source: on Helm the same service account, on Compose the same instance role or the same mounted config. A backend signing in with static keys from its environment gets a test line saying the server cannot use them. Allowed regions control what Vigil receives: a region not listed answers each query with its query id, row count and bytes scanned, and no rows. The query still runs in that region and Athena writes its results there. Athena writes every query's results to the workgroup's output location in each region. That location, its lifecycle and the workgroup's data-scan limit are the operator's, and the scan limit is the only cap on Athena spend. Sources are found by Security Lake naming (amazon_security_lake_glue_db_*, amazon_security_lake_table_*); a resource link renamed away from it is not found. Result rows pass the credential redaction every tool result gets, which masks known credential field names (password, secretAccessKey, sessionToken, ...) and token shapes only: a secret under any other name, such as an SSM parameter value or EC2 user data inside CloudTrail requestParameters or responseElements, can reach a run."
       }
     },
 
@@ -133,10 +144,10 @@
 
     "jira": {
       "command": "npx",
-      "args": ["-y", "mcp-remote@0.16.1", "https://mcp.atlassian.com/v1/mcp"],
+      "args": ["-y", "mcp-remote@0.16.7", "https://mcp.atlassian.com/v1/mcp"],
       "env": {
         "_setup_note": "Atlassian Rovo MCP Server (official). Covers Jira + Confluence + Compass. Uses OAuth 2.1 via browser flow. See: https://github.com/atlassian/atlassian-mcp-server",
-        "_security_note": "mcp-remote pinned to exactly 0.16.1. CVE-2025-6514 (GHSA-6xpm-ggf7-wc3p, affects >=0.0.5 <0.1.16) is fixed in 0.1.16; keep an exact pin at or above it."
+        "_security_note": "mcp-remote pinned to exactly 0.16.7. CVE-2025-6514 (GHSA-6xpm-ggf7-wc3p, affects >=0.0.5 <0.1.16) is fixed in 0.1.16; keep an exact pin at or above it."
       }
     },
 
@@ -154,7 +165,7 @@
 
     "virustotal": {
       "command": "npx",
-      "args": ["-y", "@burtthecoder/mcp-virustotal@1.0.38"],
+      "args": ["-y", "@burtthecoder/mcp-virustotal@1.0.40"],
       "env": {
         "VIRUSTOTAL_API_KEY": "${VIRUSTOTAL_API_KEY}"
       }
@@ -162,14 +173,14 @@
 
     "shodan": {
       "command": "npx",
-      "args": ["-y", "@burtthecoder/mcp-shodan@1.0.37"],
+      "args": ["-y", "@burtthecoder/mcp-shodan@1.0.41"],
       "env": {
         "SHODAN_API_KEY": "${SHODAN_API_KEY}"
       }
     },
     "firecrawl": {
       "command": "npx",
-      "args": ["-y", "firecrawl-mcp@3.37.0"],
+      "args": ["-y", "firecrawl-mcp@3.41.0"],
       "env": {
         "FIRECRAWL_API_KEY": "${FIRECRAWL_API_KEY}"
       }
@@ -346,7 +357,7 @@
       "args": ["core/integrations/atomic_red_team/tool.py"],
       "cwd": "${workspaceFolder}",
       "env": {
-        "_setup_note": "Operator-installed Atomic Red Team runner. Configure runner_path (and optional atomics_path) in Settings → Integrations. The execute tool refuses without environment_id. Disabled by default; saving config does not invoke the runner."
+        "_setup_note": "Operator-installed Atomic Red Team runner. Configure runner_path (and optional atomics_path) in Settings → Integrations. Vigil refuses any host not listed under Settings → Limits & autonomy → Emulators, and everything while that list is empty. Disabled by default; saving config does not invoke the runner."
       }
     },
 

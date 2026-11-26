@@ -68,6 +68,59 @@ export function costOf(events: readonly { kind: string; seq?: number; payload: u
   }, 0);
 }
 
+// One run's spend events, for every run kind. Null when the run journaled none:
+// that is not a priced zero. A call nobody could price is counted and adds nothing.
+// Token totals sum each event's TokenCounts. A missing field is zero.
+export interface SpendAccount {
+  calls: number;
+  unpriced_calls: number;
+  cost_usd: number;
+  input: number;
+  output: number;
+  cache_read: number;
+  cache_write: number;
+}
+
+function tokenCount(tokens: unknown, key: keyof TokenCounts): number {
+  if (typeof tokens !== "object" || tokens === null) return 0;
+  const value = (tokens as Partial<TokenCounts>)[key];
+  return typeof value === "number" && Number.isFinite(value) ? value : 0;
+}
+
+export function spendOf(events: readonly { kind: string; payload: unknown }[]): SpendAccount | null {
+  let calls = 0;
+  let unpriced = 0;
+  let cost = 0;
+  let input = 0;
+  let output = 0;
+  let cacheRead = 0;
+  let cacheWrite = 0;
+  for (const event of events) {
+    if (event.kind !== "spend") continue;
+    calls += 1;
+    const payload = event.payload;
+    const record =
+      typeof payload === "object" && payload !== null ? (payload as SpendPayload) : null;
+    const priced = record ? record.cost_usd : null;
+    if (typeof priced === "number") cost += priced;
+    else unpriced += 1;
+    input += tokenCount(record?.tokens, "input");
+    output += tokenCount(record?.tokens, "output");
+    cacheRead += tokenCount(record?.tokens, "cache_read");
+    cacheWrite += tokenCount(record?.tokens, "cache_write");
+  }
+  if (calls === 0) return null;
+  return {
+    calls,
+    unpriced_calls: unpriced,
+    cost_usd: roundCost(cost),
+    input,
+    output,
+    cache_read: cacheRead,
+    cache_write: cacheWrite,
+  };
+}
+
 // A value, never a throw: the exhaustiveness argument applies here or nowhere.
 // unpriced is a ceiling that cannot be measured rather than one that was reached.
 export type Refusal =
@@ -88,7 +141,19 @@ export interface Quota {
 }
 
 // Calls and wall are the harness's to count, dollars the gateway's to enforce.
-// Checked once per call, so an exhausted run parks before paying for another.
+// The dollar ceiling is soft: checked before each call, while a call's cost is known only
+// after it returns. This rests on a run making one model call at a time. A run can end
+// above the ceiling by:
+//  - the call running when it was reached, retries of an empty reply and fallback
+//    requests of a structured answer included, all counted to that call;
+//  - up to UNPRICED_TOLERANCE calls that could not be priced, counted as $0;
+//  - calls whose usage the gateway did not report, counted from an estimate that leaves
+//    out reasoning;
+//  - requests a provider billed that were recorded as nothing: retried attempts, and
+//    calls that failed before usage was reported;
+//  - a call cut off by a crash, whose spend is never journaled.
+// The unpriced allowance and the call in flight start again on each resume. A change that
+// runs one run's model calls concurrently has to revisit this bound.
 export interface Budget {
   readonly limits: BudgetLimits;
   readonly spent: Spend;

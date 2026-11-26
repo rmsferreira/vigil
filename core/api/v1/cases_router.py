@@ -25,31 +25,57 @@ from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from core.audit import outside, trail
 from core.auth.current_user import get_current_user
-from core.auth.permissions import deny_unless, permission_gate
-from core.cases import case_journal_service, case_records_service
-from core.cases.assignee import resolve_assignee
+from core.auth.permissions import deny_unless, may_read_case, permission_gate
+from core.cases import (
+    case_journal_service,
+    case_readers,
+    case_records_service,
+    case_trail,
+)
+from core.cases.agent_closure import title_edited_activities
+from core.cases.assignee import (
+    owner_states,
+    require_current_owner,
+    require_owner_reads,
+    resolve_assignee,
+    with_owner_state,
+)
 from core.cases.case_evidence_service import CaseEvidenceService
+from core.cases.case_handoff import (
+    assignee_needs_assign,
+    claim_case,
+)
+from core.cases.case_handoff import move_case as move_case_row
+from core.cases.case_handoff import (
+    newly_set_owner,
+    note_owner,
+    require_case_owner_on_team,
+    require_owner_can_write,
+)
 from core.cases.case_ioc_service import CaseIOCService
 from core.cases.case_sla_service import open_case
-from core.cases.case_state import detail_fields
-from core.cases.case_status import CaseStatus, record_status_change, status_change
-from core.cases.closure import PERSON_CHANNELS, ClosureCategory
-from core.cases.combined_state import queue_item
-from core.cases.linked_entities import (
-    LINKED_SOURCE,
-    finding_entities,
-    linked_iocs,
+from core.cases.case_state import detail_fields, run_ids
+from core.cases.case_status import (
+    CLOSED,
+    CaseStatus,
+    record_status_change,
+    status_change,
 )
+from core.cases.closure import PERSON_CHANNELS, ClosureCategory, FalsePositiveCause
+from core.cases.combined_state import queue_item
+from core.cases.linked_entities import finding_entities
 from core.deps import provide_workflows
 from core.detections.inventory import catalog
 from core.findings.arrival_counts import utc_day_bounds
 from core.findings.source_link import resolve_source_link
-from core.integrations.elastic.ingestion import ElasticIngestion
+from core.integrations.elastic.ingestion import ElasticIngestion, elastic_alert_status
 from core.memory.entity_keys import finding_entity_keys
+from core.reporting.recheck_review import case_recheck
 from core.response.approval_service import needs_you_case_ids
 from core.routing import Auth, OptionalUnitOfWorkSession, RouterMeta, UnitOfWorkSession
-from core.storage.case_repository import PAGE_LIMIT, CaseRepository
+from core.storage.case_repository import PAGE_LIMIT, CaseRepository, first_finding_id
 from core.storage.database_data_service import DatabaseDataService
 from core.storage.models import Case, CaseClosureInfo, Finding, User, case_findings
 from core.storage.schemas import (
@@ -70,6 +96,7 @@ from core.storage.schemas.case_api import (
     CaseLinkedFinding,
     CaseListResponse,
     CaseMergeResponse,
+    CaseOwnersResponse,
     CaseRulesResponse,
     CaseSearchResponse,
     CaseSuccessResponse,
@@ -85,6 +112,8 @@ router = APIRouter()
 router.dependencies.append(permission_gate("cases.read"))
 
 _CASES_WRITE = [permission_gate("cases.write")]
+# Versioned, not frozen: the contract snapshot skips x-vigil-beta.
+_BETA = {"openapi_extra": {"x-vigil-beta": True}}
 
 ROUTER_META = RouterMeta(
     prefix="/api/v1/cases",
@@ -96,17 +125,126 @@ ROUTER_META = RouterMeta(
 data_service = DatabaseDataService()
 
 
-async def _sync_upstream_status(case_id: str, new_status: str) -> None:
+def _sync_actor(session, username: str) -> tuple:
+    """Who this request is. The background task has no request user."""
+    try:
+        return case_trail._actor(session, username)
+    except Exception:
+        logger.exception("could not name who changed case status")
+        return (None, username, None)
+
+
+def _elastic_alert_ids(findings, *, linked: bool) -> list[str]:
+    """Alert ids the sync visits.
+
+    The loop has always read ``metadata.elastic_alert_id``. A stored finding
+    has no metadata column; the id ingest keeps is ``external_id``. That link
+    is followed only when the trail is recording the call, so an install
+    without the trail still syncs only what it synced before.
+    """
+    ids = []
+    for finding in findings:
+        alert_id = (finding.get("metadata") or {}).get("elastic_alert_id")
+        if (
+            not alert_id
+            and linked
+            and finding.get("data_source") == "elastic"
+            and finding.get("external_id")
+        ):
+            alert_id = finding["external_id"]
+        if alert_id:
+            ids.append(str(alert_id))
+    return ids
+
+
+async def _sync_one(svc: ElasticIngestion, alert_id: str, new_status: str) -> None:
+    """Today's sync: the result is an application log line."""
+    try:
+        synced = await svc.update_upstream_alert_status(alert_id, new_status)
+    except Exception as exc:
+        logger.warning("Failed to sync status to elastic alert %s: %s", alert_id, exc)
+        return
+    if synced:
+        logger.info("Synced status '%s' to elastic alert %s", new_status, alert_id)
+    else:
+        logger.warning(
+            "Elastic did not accept status '%s' for alert %s", new_status, alert_id
+        )
+
+
+async def _sync_recorded(
+    svc: ElasticIngestion,
+    case_id: str,
+    alert_id: str,
+    new_status: str,
+    actor: tuple,
+) -> None:
+    """One intent, then the call, then an outcome. No intent means no call."""
+    status = elastic_alert_status(new_status)
+    try:
+        seq = outside.commit_intent(
+            actor,
+            outside.ELASTIC_INTENT,
+            case_id=case_id,
+            elastic_alert_id=alert_id,
+            status=status,
+        )
+    except Exception as exc:
+        logger.warning(
+            "skipping elastic alert %s: intent was not recorded: %s", alert_id, exc
+        )
+        return
+    if seq is None:
+        await _sync_one(svc, alert_id, new_status)
+        return
+    outcome = trail.OUTCOME_FAILED
+    try:
+        code = await svc.push_alert_status(alert_id, new_status)
+    except Exception as exc:
+        logger.warning("Failed to sync status to elastic alert %s: %s", alert_id, exc)
+    else:
+        if code is None:
+            logger.warning(
+                "Elastic did not accept status '%s' for alert %s", new_status, alert_id
+            )
+        else:
+            outcome = outside.http_outcome(code)
+            if outcome == trail.OUTCOME_DONE:
+                logger.info(
+                    "Synced status '%s' to elastic alert %s", new_status, alert_id
+                )
+            else:
+                logger.warning(
+                    "Elastic did not accept status '%s' for alert %s",
+                    new_status,
+                    alert_id,
+                )
+    # The case row committed, with its own trail entry, before this task ran.
+    outside.commit_outcome(
+        actor,
+        outside.ELASTIC_OUTCOME,
+        intent=seq,
+        outcome=outcome,
+        case_id=case_id,
+        elastic_alert_id=alert_id,
+        status=status,
+        local_committed=True,
+    )
+
+
+async def _sync_upstream_status(case_id: str, new_status: str, actor: tuple) -> None:
     try:
         findings = data_service.get_findings_by_case(case_id)
     except Exception as exc:
         logger.warning("Upstream status sync error for case %s: %s", case_id, exc)
         return
-    alert_ids = [
-        alert_id
-        for finding in findings
-        if (alert_id := (finding.get("metadata") or {}).get("elastic_alert_id"))
-    ]
+    try:
+        record = outside.recording()
+    except Exception as exc:
+        # Can't tell whether the call would be unrecorded, so it is not made.
+        logger.warning("Upstream status sync skipped for case %s: %s", case_id, exc)
+        return
+    alert_ids = _elastic_alert_ids(findings, linked=record)
     if not alert_ids:
         return
     try:
@@ -114,30 +252,67 @@ async def _sync_upstream_status(case_id: str, new_status: str) -> None:
     except Exception as exc:
         logger.warning("Upstream status sync error for case %s: %s", case_id, exc)
         return
-    for alert_id in alert_ids:
-        try:
-            synced = await svc.update_upstream_alert_status(alert_id, new_status)
-        except Exception as exc:
-            logger.warning(
-                "Failed to sync status to elastic alert %s: %s", alert_id, exc
-            )
-            continue
-        if synced:
-            logger.info("Synced status '%s' to elastic alert %s", new_status, alert_id)
-        else:
+    if not record:
+        for alert_id in alert_ids:
+            await _sync_one(svc, alert_id, new_status)
+        return
+    # A missing Kibana URL returns before any call: no intent for it.
+    try:
+        ready = svc.calls_kibana()
+    except Exception as exc:
+        logger.warning("Upstream status sync error for case %s: %s", case_id, exc)
+        return
+    if not ready:
+        for alert_id in alert_ids:
             logger.warning(
                 "Elastic did not accept status '%s' for alert %s", new_status, alert_id
             )
+        return
+    for alert_id in alert_ids:
+        await _sync_recorded(svc, case_id, alert_id, new_status, actor)
 
 
 class CaseCreate(BaseModel):
-    """Case creation request."""
+    """Case creation request.
+
+    ``restricted`` (or a ``readers`` or ``reader_teams`` list) creates the case
+    restricted in the same insert, so its content is never open. ``readers`` are
+    principal ids; left out, the list is the defaults (you, when you are a person
+    or service account). ``reader_teams`` are team ids whose members read it:
+    naming one is a person's own act and needs users.read; never the default team.
+    """
 
     title: str
     description: str = ""
     finding_ids: List[str]
     priority: str = "medium"
     status: CaseStatus = "open"
+    restricted: Optional[bool] = None
+    readers: Optional[List[str]] = None
+    reader_teams: Optional[List[str]] = None
+
+
+class CaseRestrict(BaseModel):
+    """Restrict an open case. ``readers`` (principal ids) is the whole list in one
+    act; left out, it is the owner, the task assignees, and you. ``reader_teams``
+    (team ids) adds teams whose members read it, a person's own act."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    readers: Optional[List[str]] = None
+    reader_teams: Optional[List[str]] = None
+
+
+class CaseReadersChange(BaseModel):
+    """Change a restricted case's readers and reader teams. Removing narrows;
+    adding widens and needs a person acting directly."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    add: List[str] = []
+    remove: List[str] = []
+    add_teams: List[str] = []
+    remove_teams: List[str] = []
 
 
 class CaseExpected(BaseModel):
@@ -155,6 +330,20 @@ class CaseExpected(BaseModel):
     status: Optional[str] = None
     priority: Optional[str] = None
     assignee: Optional[str] = None
+
+
+class CaseMove(BaseModel):
+    """Move a case to another team. Beta: the shape may still change.
+
+    ``source_team_id`` is the team the caller showed. No ``expected`` object.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    source_team_id: str = Field(min_length=1)
+    destination_team_id: str = Field(min_length=1)
+    reason: Optional[str] = None
+    owner: Optional[str] = None
 
 
 class CaseUpdate(BaseModel):
@@ -196,6 +385,17 @@ class IOCAdd(BaseModel):
     context: Optional[str] = None
 
 
+class IOCMark(BaseModel):
+    """Mark or clear an indicator as a false positive on this case.
+
+    Named by type and value, not id: an indicator a linked alert names has none.
+    """
+
+    ioc_type: str
+    value: str
+    is_false_positive: bool = True
+
+
 class IOCBulkAdd(BaseModel):
     """Bulk add IOCs."""
 
@@ -216,8 +416,17 @@ class ClosureInfo(BaseModel):
     recommendations: Optional[str] = None
     executive_summary: Optional[str] = None
     false_positive_reason: Optional[str] = None
+    # Stated, including null, stores that on a false-positive close. Omitted
+    # leaves a standing cause. Any other category drops a value in the set.
+    false_positive_cause: Optional[FalsePositiveCause] = None
     closure_notes: Optional[str] = None
+    # Whether this person opened the evidence. Absent stores null. An agent
+    # close stores null even when the field is sent.
+    evidence_opened: Optional[bool] = None
     expected: Optional[CaseExpected] = None
+    # False when the same save already named an owner: the close then leaves
+    # it. Can only narrow (#4983).
+    take_ownership: bool = True
 
 
 class MergeRequest(BaseModel):
@@ -234,12 +443,31 @@ class SearchRequest(BaseModel):
     status: Optional[List[str]] = None
     priority: Optional[List[str]] = None
     assignee: Optional[List[str]] = None
+    # Cases with no owner (NULL or ""), alongside any named in ``assignee``.
+    unassigned: bool = False
     tags: Optional[List[str]] = None
     mitre_techniques: Optional[List[str]] = None
     created_after: Optional[datetime] = None
     created_before: Optional[datetime] = None
     limit: int = 100
     offset: int = 0
+
+
+def _team_ids(values: Optional[List[str]]) -> Optional[List[str]]:
+    """Blank team ids are no filter. Duplicates are dropped, order kept."""
+    if not values:
+        return None
+    ids: List[str] = []
+    for value in values:
+        text = (value or "").strip()
+        if text and text not in ids:
+            ids.append(text)
+    return ids or None
+
+
+def _owner(value: Optional[str]) -> Optional[str]:
+    """An owner filter is exact: blank is no filter, anything else is kept as sent."""
+    return value if value and value.strip() else None
 
 
 def _blank(value: Optional[str]) -> Optional[str]:
@@ -263,6 +491,7 @@ def _empty_queue(limit: int, offset: int) -> dict:
             "closed_today": 0,
             "agent_closure_share": 0.0,
             "needs_you": 0,
+            "waiting": 0,
         },
     }
 
@@ -275,16 +504,20 @@ def get_cases(
     data_source: Optional[str] = None,
     sla_at_risk: bool = False,
     assignee: Optional[str] = None,
+    team: Optional[List[str]] = Query(default=None),
+    unassigned: bool = False,
     closed: Optional[bool] = None,
     query: Optional[str] = None,
     needs_you_only: bool = Query(default=False, alias="needs_you"),
     working: bool = False,
-    closed_by: Optional[Literal["agent", "person"]] = None,
+    closed_by: Optional[Literal["agent", "person", "draw"]] = None,
     alerts_from: Optional[Literal["today", "all"]] = None,
     kind: Optional[str] = None,
     limit: int = Query(default=PAGE_LIMIT, ge=1, le=1000),
     offset: int = Query(default=0, ge=0),
     workflows: WorkflowsService = Depends(provide_workflows),
+    # The caller the restricted-case rule reads as (#4354).
+    current_user: User = Depends(get_current_user),
 ):
     """One page of the case queue, plus the strip.
 
@@ -295,11 +528,20 @@ def get_cases(
     ``needs_you=true`` keeps just those cases, and ``kind`` keeps cases whose
     latest investigation ran a workflow of that ``run_kind`` (none when no
     workflow has it); both compose with the other filters. ``working=true``
-    keeps open cases that do not need you, ``closed_by=agent|person`` keeps
-    closed cases by who closed them, and ``alerts_from=today|all`` keeps cases
-    holding an alert created that UTC day (or any alert). The strip follows
-    ``alerts_from`` and ignores the other filters.
+    keeps open cases that do not need you, ``closed_by=agent|person|draw`` keeps
+    closed cases by who closed them (``draw`` is a sampled dismissal still on
+    the agent channel), and ``alerts_from=today|all`` keeps cases holding an
+    alert created that UTC day (or any alert). The strip follows
+    ``alerts_from`` and ``team``, and ignores the other filters. ``team`` is
+    the owning team's id, repeated for several; omitting it returns every
+    readable case. ``assignee`` is an exact stored owner; ``unassigned=true``
+    adds cases with no owner (NULL or "").
+
+    Restricted cases the caller may not read are left out of the page, the
+    total and the strip; ``restricted_not_counted`` says how many there are,
+    whatever the filters, so a filter can't probe what they hold.
     """
+    team_ids = _team_ids(team)
     # Demo cases live in memory. The database being down is a different empty.
     if data_service.is_demo_mode():
         from core.findings.demo_reads import case_queue, load_demo
@@ -313,7 +555,8 @@ def get_cases(
             offset=offset,
             query=_blank(query),
             priority=_blank(priority),
-            assignee=_blank(assignee),
+            assignee=_owner(assignee),
+            unassigned=unassigned,
             state=_blank(state),
             closed=closed,
             sla_at_risk=sla_at_risk,
@@ -323,6 +566,7 @@ def get_cases(
             alerts_from=alerts_from,
             workflow_constrained=bool(_blank(workflow) or _blank(kind)),
             data_source=_blank(data_source),
+            teams=team_ids,
         )
     if not data_service.is_using_database():
         return _empty_queue(limit, offset)
@@ -342,12 +586,13 @@ def get_cases(
     )
     with unit_of_work() as session:
         repo = CaseRepository(session)
-        rows, total = repo.queue(
+        rows, total, hidden = repo.queue(
             limit=limit,
             offset=offset,
             query_text=_blank(query),
             priority=_blank(priority),
-            assignee=_blank(assignee),
+            assignee=_owner(assignee),
+            unassigned=unassigned,
             workflow=_blank(workflow),
             data_source=_blank(data_source),
             sla_at_risk=sla_at_risk,
@@ -361,21 +606,55 @@ def get_cases(
             closed_by=closed_by,
             person_channels=PERSON_CHANNELS,
             alerts_span=alerts_span,
+            team_ids=team_ids,
         )
         strip = repo.strip(
-            now=now, needs_you_ids=needs_you_ids, alerts_span=alerts_span
+            now=now,
+            needs_you_ids=needs_you_ids,
+            alerts_span=alerts_span,
+            team_ids=team_ids,
         )
-    return {
-        "cases": [
-            asdict(queue_item(row, now, needs_you=row.case_id in needs_you_ids))
+        cases = [
+            asdict(
+                queue_item(
+                    row,
+                    now,
+                    needs_you=row.case_id in needs_you_ids,
+                )
+            )
             for row in rows
-        ],
+        ]
+        # owner_state and owner_on_team, from one membership lookup.
+        with_owner_state(session, cases)
+    return {
+        "cases": cases,
         "total": total,
         "limit": limit,
         "offset": offset,
         "has_more": offset + len(rows) < total,
         "strip": asdict(strip),
+        "restricted_not_counted": hidden,
     }
+
+
+@router.get("/owners", response_model=CaseOwnersResponse)
+def get_case_owners():
+    """The Cases list's owner filter values.
+
+    Each distinct non-blank owner stored on a case the reader can list, closed
+    included, with its owner state. Unassigned is the ``unassigned`` filter,
+    not a value here.
+    """
+    if data_service.is_demo_mode():
+        from core.findings.demo_reads import case_owners, load_demo
+
+        return {"owners": case_owners(load_demo()[1])}
+    if not data_service.is_using_database():
+        return {"owners": []}
+    with unit_of_work() as session:
+        names = CaseRepository(session).owners()
+        states = owner_states(session, names)
+    return {"owners": [{"owner": n, "owner_state": states[n]} for n in names]}
 
 
 def _linked_findings(session, finding_ids: object) -> List[CaseLinkedFinding]:
@@ -438,6 +717,7 @@ def get_case(case_id: str, session: OptionalUnitOfWorkSession):
     are newest first; the audit run is ``run_id_for`` of the latest, never the
     shadow adjudication. ``linked_findings`` is one entry per linked finding
     that still exists, with ``source_link`` when the resolver can fill one.
+    ``opened_from`` is the first finding linked to the case.
 
     Args:
         case_id: The case ID
@@ -453,7 +733,7 @@ def get_case(case_id: str, session: OptionalUnitOfWorkSession):
     # Copy: a demo-mode case is the stored dict, and this read must not write it.
     case = dict(loaded)
     if session is None:
-        investigations, closure, runs, steps = [], None, [], {}
+        investigations, closure, runs, steps, facts = [], None, [], {}, {}
     else:
         investigations = case_records_service.list_case_investigations(session, case_id)
         closure = session.get(CaseClosureInfo, case_id)
@@ -461,7 +741,13 @@ def get_case(case_id: str, session: OptionalUnitOfWorkSession):
         steps = case_records_service.run_step_counts(
             session, [run.run_id for run in runs]
         )
-    case.update(detail_fields(case.get("status"), investigations, closure, runs, steps))
+        facts = case_records_service.list_run_facts(
+            session, run_ids(investigations, runs)
+        )
+    case.update(
+        detail_fields(case.get("status"), investigations, closure, runs, steps, facts)
+    )
+    with_owner_state(session, [case])
     if session is not None:
         case["alerts_since_last_run"] = case_records_service.alerts_since_last_run(
             session, case_id
@@ -473,13 +759,24 @@ def get_case(case_id: str, session: OptionalUnitOfWorkSession):
         case["linked_findings"] = linked_findings(case.get("finding_ids"), findings)
     else:
         case["linked_findings"] = _linked_findings(session, case.get("finding_ids"))
+    case["opened_from"] = (
+        first_finding_id(session, case_id) if session is not None else None
+    )
+    if session is not None:
+        case.update(case_recheck(session, case_id))
+    else:
+        case["recheck"] = None
+        case["reviewers_differ"] = False
     return case
 
 
 @router.post("", dependencies=_CASES_WRITE, response_model=CaseSchema)
-def create_case(case_data: CaseCreate):
+def create_case(
+    case_data: CaseCreate,
+    current_user: User = Depends(get_current_user),
+):
     """
-    Create a new case.
+    Create a new case, open or restricted.
 
     Args:
         case_data: Case creation data
@@ -487,6 +784,20 @@ def create_case(case_data: CaseCreate):
     Returns:
         Created case
     """
+    readers = reader_teams = None
+    # ``restricted`` decides when sent; a reader or team list alone also restricts.
+    restricted = case_data.restricted
+    if restricted is None:
+        restricted = case_data.readers is not None or case_data.reader_teams is not None
+    if restricted:
+        _refuse_demo_restrict()
+        with unit_of_work() as session:
+            readers, reader_teams = case_readers.readers_for_new_case(
+                session,
+                case_data.readers,
+                case_readers.http_restricter(session, current_user),
+                case_data.reader_teams,
+            )
     case = open_case(
         data_service,
         title=case_data.title,
@@ -494,6 +805,8 @@ def create_case(case_data: CaseCreate):
         priority=case_data.priority,
         description=case_data.description,
         status=case_data.status,
+        readers=readers,
+        reader_teams=reader_teams,
     )
 
     if not case:
@@ -511,7 +824,101 @@ def _case_to_edit(session: Session, case_id: str) -> Optional[dict]:
     if data_service.is_demo_mode():
         return data_service.get_case(case_id)
     case = session.get(Case, case_id, with_for_update=True)
-    return CaseSchema.dump(case) if case else None
+    # A restricted case the caller may not read is not there (#4354).
+    return CaseSchema.dump(case) if case and may_read_case(case) else None
+
+
+def _refuse_demo_restrict() -> None:
+    """Demo mode holds no restricted cases."""
+    if data_service.is_demo_mode():
+        raise HTTPException(status_code=409, detail="Demo cases can't be restricted")
+
+
+def _case_for_readers(session: Session, case_id: str) -> Case:
+    """The case row, locked, if the caller may read it; else 404."""
+    _refuse_demo_restrict()
+    case = session.get(Case, case_id, with_for_update=True)
+    if case is None or not may_read_case(case):
+        raise HTTPException(status_code=404, detail="Case not found")
+    return case
+
+
+@router.post(
+    "/{case_id}/restrict",
+    dependencies=_CASES_WRITE,
+    response_model=CaseSchema,
+    openapi_extra=_BETA["openapi_extra"],
+)
+def restrict_case(
+    case_id: str,
+    body: CaseRestrict,
+    session: UnitOfWorkSession,
+    current_user: User = Depends(get_current_user),
+):
+    """Restrict an open case to the named readers. Beta.
+
+    Any principal holding cases.write that can read the case may restrict it.
+    The list is taken whole; an empty one is refused. A service account is
+    named only by itself, when it is the one restricting.
+    """
+    case = _case_for_readers(session, case_id)
+    case_readers.restrict(
+        session,
+        case,
+        body.readers,
+        case_readers.http_restricter(session, current_user),
+        body.reader_teams,
+    )
+    return CaseSchema.dump(case)
+
+
+@router.patch(
+    "/{case_id}/readers",
+    dependencies=_CASES_WRITE,
+    response_model=CaseSchema,
+    openapi_extra=_BETA["openapi_extra"],
+)
+def change_case_readers(
+    case_id: str,
+    body: CaseReadersChange,
+    session: UnitOfWorkSession,
+    current_user: User = Depends(get_current_user),
+):
+    """Add or remove readers on a restricted case. Beta.
+
+    Removing is open to any principal holding cases.write. Adding needs a person
+    acting directly (a person must do this). The list may not end empty.
+    """
+    case = _case_for_readers(session, case_id)
+    case_readers.change_readers(
+        session,
+        case,
+        case_readers.http_restricter(session, current_user),
+        add=body.add,
+        remove=body.remove,
+        add_teams=body.add_teams,
+        remove_teams=body.remove_teams,
+    )
+    return CaseSchema.dump(case)
+
+
+@router.delete(
+    "/{case_id}/restrict",
+    dependencies=_CASES_WRITE,
+    response_model=CaseSchema,
+    openapi_extra=_BETA["openapi_extra"],
+)
+def lift_case_restriction(
+    case_id: str,
+    session: UnitOfWorkSession,
+    current_user: User = Depends(get_current_user),
+):
+    """Open a restricted case to everyone again: a person's own act. Beta."""
+    case = _case_for_readers(session, case_id)
+    case_readers.lift(
+        session, case, case_readers.http_restricter(session, current_user)
+    )
+    return CaseSchema.dump(case)
 
 
 def _stale_fields(case: dict, expected: CaseExpected) -> List[CaseFieldConflict]:
@@ -570,10 +977,6 @@ def update_case(
     Returns:
         Success status
     """
-    if case_data.assignee is not None:
-        # The case owner. Task assignee stays cases.write.
-        deny_unless(current_user.user_id, "cases.assign", session)
-
     case = _case_to_edit(session, case_id)
     if not case:
         raise HTTPException(status_code=404, detail="Case not found")
@@ -584,6 +987,8 @@ def update_case(
     updates = {}
     if case_data.title is not None:
         updates["title"] = case_data.title
+        if edited := title_edited_activities(case, case_data.title):
+            updates["activities"] = edited
     if case_data.description is not None:
         updates["description"] = case_data.description
     if case_data.status is not None:
@@ -592,9 +997,20 @@ def update_case(
         updates["priority"] = case_data.priority
     if case_data.assignee is not None:
         # Empty or whitespace unassigns; anything else must name one person.
+        stored_owner = case.get("assignee")
         updates["assignee"] = resolve_assignee(
-            session, case_data.assignee, current=case.get("assignee")
+            session, case_data.assignee, current=stored_owner
         )
+        # An echo needs nothing extra. Clearing your own needs cases.write,
+        # which this route already required. Anyone else's owner needs assign.
+        if assignee_needs_assign(
+            stored_owner, updates["assignee"], current_user.username
+        ):
+            deny_unless(current_user.user_id, "cases.assign", session)
+        if named := newly_set_owner(stored_owner, updates["assignee"]):
+            require_owner_can_write(session, named)
+            require_case_owner_on_team(session, case, named, case_id)
+            require_owner_reads(session, case, named)
     if case_data.notes is not None:
         updates["notes"] = [
             *(case.get("notes") or []),
@@ -604,6 +1020,13 @@ def update_case(
             },
         ]
 
+    # Open work keeps a current owner or none, whatever this save changed.
+    require_current_owner(
+        session,
+        updates["assignee"] if "assignee" in updates else case.get("assignee"),
+        is_open=updates.get("status", case.get("status")) != CLOSED,
+    )
+
     change = status_change(case.get("status"), case_data.status)
 
     # The write and a close share this session: a refused trail append raises
@@ -611,19 +1034,84 @@ def update_case(
     if not data_service.update_case(case_id, session=session, **updates):
         raise HTTPException(status_code=500, detail="Failed to update case")
 
+    if "assignee" in updates:
+        note_owner(
+            session,
+            case_id=case_id,
+            previous=case.get("assignee"),
+            new=updates["assignee"],
+        )
+
     if change:
         record_status_change(
             session,
             case_id,
             change,
             closed_by=current_user.username,
+            take_ownership="assignee" not in updates,
         )
 
     # Fire upstream SIEM status sync when status changes
     if case_data.status is not None:
-        background_tasks.add_task(_sync_upstream_status, case_id, case_data.status)
+        background_tasks.add_task(
+            _sync_upstream_status,
+            case_id,
+            case_data.status,
+            _sync_actor(session, current_user.username),
+        )
 
     return {"success": True}
+
+
+@router.post(
+    "/{case_id}/move",
+    dependencies=_CASES_WRITE,
+    response_model=CaseSchema,
+    openapi_extra=_BETA["openapi_extra"],
+)
+def move_case(
+    case_id: str,
+    body: CaseMove,
+    session: UnitOfWorkSession,
+    current_user: User = Depends(get_current_user),
+):
+    """Move the case to another team. Beta, and left out of the frozen snapshot.
+
+    A person sends a reason. The owner stays only when they are a current
+    member of the destination; otherwise the case arrives unowned.
+    """
+    case = move_case_row(
+        session,
+        case_id,
+        source_team_id=body.source_team_id,
+        destination_team_id=body.destination_team_id,
+        reason=body.reason,
+        owner=body.owner,
+        username=current_user.username,
+        user_id=current_user.user_id,
+        http=True,
+    )
+    return CaseSchema.dump(case)
+
+
+@router.post(
+    "/{case_id}/claim",
+    dependencies=_CASES_WRITE,
+    response_model=CaseSchema,
+    openapi_extra=_BETA["openapi_extra"],
+)
+def claim_case_route(
+    case_id: str,
+    session: UnitOfWorkSession,
+    current_user: User = Depends(get_current_user),
+):
+    """Assign to me. Beta, and left out of the frozen snapshot.
+
+    A current member of the case's team takes it when it is unowned or the
+    stored owner is not a current account.
+    """
+    case = claim_case(session, case_id, current_user)
+    return CaseSchema.dump(case)
 
 
 @router.post(
@@ -660,6 +1148,8 @@ def remove_finding_from_case(case_id: str, finding_id: str):
     """
     Remove a finding from a case.
 
+    Removing an alert that intake merged into this Case sends it back to intake.
+
     Args:
         case_id: The case ID
         finding_id: The finding ID to remove
@@ -682,7 +1172,8 @@ def get_cases_summary():
     Get summary statistics for cases.
 
     Counted and grouped in SQL over every case, so ``total`` is not capped by
-    a row limit (#1438).
+    a row limit (#1438). Restricted cases the caller may not read are not
+    counted; ``restricted_not_counted`` says how many.
 
     Returns:
         Summary statistics
@@ -735,7 +1226,8 @@ def get_case_rules(case_id: str, session: UnitOfWorkSession):
     worst problem and (overlay) stage, worst first. Alerts traced to no rule are
     counted in ``unresolved``, each with why.
     """
-    if session.get(Case, case_id) is None:
+    case = session.get(Case, case_id)
+    if case is None or not may_read_case(case):
         raise HTTPException(status_code=404, detail="Case not found")
     rows = session.execute(
         select(
@@ -785,29 +1277,45 @@ def add_ioc(
     return CaseIOCSchema.dump(ioc)
 
 
+@router.put(
+    "/{case_id}/iocs/false-positive",
+    dependencies=_CASES_WRITE,
+    response_model=CaseIOCListResponse,
+)
+def mark_ioc_false_positive(
+    case_id: str,
+    data: IOCMark,
+    session: UnitOfWorkSession,
+    current_user: User = Depends(get_current_user),
+):
+    """Mark or clear an indicator as a false positive on this case.
+
+    While marked, no alert joins the case or links to it on that value. It
+    covers the value under any spelling, and a value a linked alert names gets
+    a recorded, marked row.
+    """
+    try:
+        rows, _ = CaseIOCService().set_false_positive(
+            case_id,
+            data.ioc_type,
+            data.value,
+            data.is_false_positive,
+            session=session,
+            added_by=current_user.username,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    session.flush()
+    return {"iocs": CaseIOCSchema.dump_many(rows)}
+
+
 @router.get("/{case_id}/iocs", response_model=CaseIOCListResponse)
 def get_iocs(case_id: str, session: UnitOfWorkSession, ioc_type: Optional[str] = None):
     """Get all IOCs for case: the ones recorded, then those its linked alerts name.
 
-    The alerts' are read from their ``entity_context`` and carry no ``ioc_id``;
-    one already recorded is not listed twice.
+    Each says what intake does with it and whether the index holds it yet.
     """
-    ioc_service = CaseIOCService()
-    recorded = ioc_service.get_case_iocs(case_id, session=session)
-    iocs = [i for i in recorded if not ioc_type or i.ioc_type == ioc_type]
-    contexts = session.scalars(
-        select(Finding.entity_context)
-        .join(case_findings, case_findings.c.finding_id == Finding.finding_id)
-        .where(case_findings.c.case_id == case_id)
-        .order_by(Finding.finding_id)
-    ).all()
-    held = [(ioc.ioc_type or "", ioc.value or "") for ioc in recorded]
-    derived = [
-        {"case_id": case_id, "ioc_type": kind, "value": value, "source": LINKED_SOURCE}
-        for kind, value in linked_iocs(contexts, held)
-        if not ioc_type or kind == ioc_type.lower()
-    ]
-    return {"iocs": [*CaseIOCSchema.dump_many(iocs), *derived]}
+    return {"iocs": CaseIOCService().list_iocs(case_id, ioc_type, session=session)}
 
 
 @router.post(
@@ -882,6 +1390,19 @@ def close_case(
         executive_summary=data.executive_summary,
         false_positive_reason=data.false_positive_reason,
         closure_notes=data.closure_notes,
+        evidence_opened=data.evidence_opened,
+        take_ownership=data.take_ownership,
+        **(
+            {
+                "false_positive_cause": (
+                    data.false_positive_cause.value
+                    if data.false_positive_cause
+                    else None
+                )
+            }
+            if "false_positive_cause" in data.model_fields_set
+            else {}
+        ),
     )
     if not closure:
         raise HTTPException(status_code=404, detail="Case not found")
@@ -890,7 +1411,12 @@ def close_case(
     # this one never did: a Case closed here, by either MCP tool or by a merge,
     # stayed open in the SIEM that raised it. Best-effort and fire-and-forget, as
     # it is there -- the close is recorded either way.
-    background_tasks.add_task(_sync_upstream_status, case_id, "closed")
+    background_tasks.add_task(
+        _sync_upstream_status,
+        case_id,
+        "closed",
+        _sync_actor(session, current_user.username),
+    )
     return {"success": True, "closure": CaseClosureInfoSchema.dump(closure)}
 
 
@@ -916,7 +1442,7 @@ def merge_cases(
     # A missing case surfaces as NotFoundError, which the shared handler
     # renders as a 404 naming which of the two it was.
     moved_findings = CaseWorkflowService().merge_cases(
-        case_id, data.source_case_id, current_user.username
+        case_id, data.source_case_id, current_user.username, current_user
     )
 
     result_case = data_service.get_case(case_id)
@@ -941,6 +1467,7 @@ def search_cases(data: SearchRequest):
         status=data.status,
         priority=data.priority,
         assignee=data.assignee,
+        unassigned=data.unassigned,
         tags=data.tags,
         mitre_techniques=data.mitre_techniques,
         created_after=data.created_after,

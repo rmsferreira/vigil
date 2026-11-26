@@ -297,10 +297,62 @@ function ActorCell({ entry }: { entry: AuditEntry }) {
 
 function Marks({ entry }: { entry: AuditEntry }) {
   const marks: string[] = []
+  if (entry.restricted) marks.push('Restricted case')
   if (entry.late) marks.push('Recorded late')
   if (entry.payload.attribution != null) marks.push('Copied')
   if (entry.payload.awaiting === true) marks.push('Intent')
   return <>{marks.map((m) => <span key={m} className="ag-mark">{m}</span>)}</>
+}
+
+const VERIFIED_BY: Record<string, string> = {
+  in_person: 'In person',
+  video_call: 'On a video call',
+  phone_call_back: 'By calling them back on a known number',
+  other_verified_channel: 'Another verified channel',
+}
+
+const HOST_DETAIL: { key: string; label: string }[] = [
+  { key: 'reason', label: 'Reason' },
+  { key: 'identity_confirmed_by', label: 'Verified by' },
+  { key: 'verification_note', label: 'Note' },
+  { key: 'os_user', label: 'OS account' },
+  { key: 'invoking_user', label: 'Invoking user' },
+  { key: 'host', label: 'Host' },
+]
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+  if (typeof value === 'string') {
+    try {
+      value = JSON.parse(value) as unknown
+    } catch {
+      return null
+    }
+  }
+  if (value !== null && typeof value === 'object' && !Array.isArray(value)) {
+    return value as Record<string, unknown>
+  }
+  return null
+}
+
+/** Host recovery writes who ran it into personal. Other actions keep an email there. */
+function hostDetail(entry: AuditEntry): [string, string][] {
+  if (entry.restricted) return []
+  const personal = asRecord(entry.personal)
+  if (!personal) return []
+  if (typeof personal.os_user !== 'string' && typeof personal.identity_confirmed_by !== 'string') {
+    return []
+  }
+  const rows: [string, string][] = []
+  for (const field of HOST_DETAIL) {
+    const value = personal[field.key]
+    if (typeof value !== 'string' || value === '') continue
+    const shown = field.key === 'identity_confirmed_by' ? (VERIFIED_BY[value] ?? value) : value
+    rows.push([field.label, shown])
+  }
+  if (entry.payload.suspected_compromise === true) {
+    rows.push(['Suspected compromise', 'Yes'])
+  }
+  return rows
 }
 
 /** Entry detail, laid out like the case Record tab's card. */
@@ -324,10 +376,12 @@ function EntryDetail({ entry }: { entry: AuditEntry }) {
     ['Occurred (UTC)', utcDayClock(entry.occurred_at) ?? entry.occurred_at],
     ['Actor', [nameOf(entry.actor, entry.actor_text ?? ''), kindLine(entry.actor), entry.actor?.label ? entry.actor.id : ''].filter(Boolean).join(' · ')],
     ['On behalf of', [nameOf(entry.on_behalf_of, str(p.on_behalf_of)), entry.on_behalf_of?.erased ? 'erased' : '', entry.on_behalf_of?.deleted ? 'deleted' : ''].filter(Boolean).join(' · ')],
-    ['Operator text', entry.operator_text ?? ''],
+    // A narrowed entry has no operator text to show, not an empty one.
+    ...(entry.restricted ? [] : [['Operator text', entry.operator_text ?? ''] as [string, string]]),
+    ...hostDetail(entry),
     ['What it was', entry.sentence ?? ''],
     ['Action', str(p.action)],
-    ['Object', str(p.object)],
+    ...(entry.restricted ? [['Case', str(p.case_id)] as [string, string]] : [['Object', str(p.object)] as [string, string]]),
     ...(p.target != null ? [['Target', str(p.target)] as [string, string]] : []),
     ['Outcome', str(p.outcome) || (unknown ? 'outcome unknown' : '')],
     ['Hash', entry.entry_hash],
@@ -336,8 +390,14 @@ function EntryDetail({ entry }: { entry: AuditEntry }) {
   return (
     <div className="ag-detail" role="row">
       <div role="cell" className="ag-detail-card">
-        {(entry.late || unknown || p.attribution != null) && (
+        {(entry.restricted || entry.late || unknown || p.attribution != null) && (
           <div className="ag-notes">
+            {entry.restricted && (
+              <p>
+                <b>Restricted case.</b> You are not on this case’s reader list, so this entry shows who did what and when. Its
+                text and details show in the case’s own history, to its readers.
+              </p>
+            )}
             {entry.late && <p><b>Recorded late.</b> The trail could not take this entry when it happened; it was written afterwards with its original time.</p>}
             {unknown && <p><b>Outcome unknown.</b> This intent was recorded, and no result entry names it.</p>}
             {p.attribution != null && (
@@ -357,7 +417,7 @@ function EntryDetail({ entry }: { entry: AuditEntry }) {
           ))}
         </dl>
         <details className="ag-payload">
-          <summary>Full entry</summary>
+          <summary>{entry.restricted ? 'Entry, narrowed' : 'Full entry'}</summary>
           <pre>{JSON.stringify(p, null, 2)}</pre>
         </details>
       </div>
@@ -366,7 +426,7 @@ function EntryDetail({ entry }: { entry: AuditEntry }) {
 }
 
 const EMPTY_POLICY: AuditRetention = {
-  effective_days: null, pending_days: null, pending_on: null, unconfirmed: false, erasure_unconfirmed: false, erasures: [],
+  effective_days: null, pending_days: null, pending_on: null, unconfirmed: false, erasure_unconfirmed: false, blocked: null, erasures: [],
 }
 
 /** Period and erasure, in the same card as verify. Mutations need audit.manage; the unconfirmed line does not. */
@@ -491,6 +551,9 @@ function RetentionCard({ notify }: SectionProps) {
             Erasure of {item.principal_id} takes effect {utcDayClock(item.on) ?? item.on} UTC.
           </p>
         ))}
+        {policy.blocked && (
+          <p className="audit-unconfirmed" role="status">Erasure is blocked: {policy.blocked}</p>
+        )}
         {policy.erasure_unconfirmed && (
           <p className="audit-unconfirmed" role="status">This erasure announcement has not left the box.</p>
         )}
@@ -559,6 +622,8 @@ export function verifyLine(v: AuditVerify): { level: 'good' | 'poor'; text: stri
 /** Feed health off the entries read: whether the trail is leaving the box (#3191). */
 function FeedHealth({ feed }: { feed: AuditFeedHealth | null }) {
   const behind = feed?.behind ?? 0
+  const held = feed?.held ?? 0
+  const heldSince = utcDayClock(feed?.held_since) ?? feed?.held_since
   return (
     <section className="audit-box" aria-label="Feed health">
       <div className="audit-box-head">
@@ -567,6 +632,12 @@ function FeedHealth({ feed }: { feed: AuditFeedHealth | null }) {
       </div>
       {feed && !feed.enabled && (
         <p className="audit-note">No feed is on. The trail has no outside proof unless it is exported or polled.</p>
+      )}
+      {held > 0 && (
+        <p className="audit-note" role="status">
+          {held === 1 ? '1 entry' : `${held} entries`} waiting to be recorded late
+          {heldSince ? `, since ${heldSince} UTC` : ''}.
+        </p>
       )}
       {feed?.enabled && (
         <>

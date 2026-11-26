@@ -1,11 +1,12 @@
 """Elastic Security / Elasticsearch API service for SIEM integration."""
 
 import logging
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 from urllib.parse import quote
 
 import httpx
 
+from core.federation.error_kind import kind_of
 from core.integrations._base.proxy import integration_proxy
 from core.integrations._base.search_params import validate_index
 from core.integrations._base.tls import tls_verify
@@ -149,10 +150,10 @@ class ElasticService:
         except httpx.HTTPStatusError as exc:
             err = f"HTTP {exc.response.status_code}: {exc.response.text[:200]}"
             logger.error(f"Elastic connection test failed: {err}")
-            return False, err
+            return False, err, kind_of(exc)
         except Exception as exc:
             logger.error(f"Elastic connection test error: {exc}")
-            return False, str(exc)
+            return False, str(exc), kind_of(exc)
 
     # ------------------------------------------------------------------
     # Elasticsearch search
@@ -164,8 +165,14 @@ class ElasticService:
         index: Optional[str] = None,
         size: int = 100,
         sort: Optional[List[Dict[str, Any]]] = None,
+        source: Optional[Union[List[str], bool]] = None,
+        aggs: Optional[Dict[str, Any]] = None,
     ) -> Optional[Dict[str, Any]]:
         """Run an Elasticsearch query and return the raw response body.
+
+        ``source`` limits each hit to those fields (``_source`` includes), or
+        False returns no fields;
+        ``aggs`` is sent as the request's aggregations. Both are omitted when None.
 
         A failed request returns None, but a client that cannot be built (an
         unusable CA path) or an invalid index name raises, so the caller
@@ -175,6 +182,12 @@ class ElasticService:
         body: Dict[str, Any] = {"query": query, "size": size}
         if sort:
             body["sort"] = sort
+        if source is not None:
+            body["_source"] = (
+                source if isinstance(source, bool) else {"includes": source}
+            )
+        if aggs is not None:
+            body["aggs"] = aggs
         client = self.es_client
         self.last_search_error = None
         try:
@@ -714,22 +727,24 @@ class ElasticService:
         self,
         signal_ids: List[str],
         status: str,
-    ) -> bool:
-        """Update alert status (open, acknowledged, closed)."""
+    ) -> int:
+        """Post an alert status. Returns the HTTP status.
+
+        Timeouts and connection errors propagate. A 4xx stays a status code
+        so the caller can tell it from a transport failure.
+        """
         body: Dict[str, Any] = {
             "signal_ids": signal_ids,
             "status": status,
         }
-        try:
-            resp = await self.kibana_client.post(
-                "/api/detection_engine/signals/status", json=body
-            )
-            resp.raise_for_status()
+        resp = await self.kibana_client.post(
+            "/api/detection_engine/signals/status", json=body
+        )
+        if resp.is_success:
             logger.info(f"Updated {len(signal_ids)} alerts to status '{status}'")
-            return True
-        except Exception as exc:
-            logger.error(f"Error updating alert status: {exc}")
-            return False
+        else:
+            logger.error("Error updating alert status: HTTP %s", resp.status_code)
+        return resp.status_code
 
     # ------------------------------------------------------------------
     # Kibana Security — Cases

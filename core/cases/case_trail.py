@@ -21,6 +21,7 @@ from core.cases.agent_closure import (
     principal_for_username,
     run_agent,
 )
+from core.exceptions import NotFoundError
 from core.storage import case_trail_hook
 from core.storage.case_trail_hook import TrailWriteError  # noqa: F401 - its home
 
@@ -31,9 +32,14 @@ EVIDENCE = "case.evidence"
 CUSTODY = "case.evidence.custody"
 IOC = "case.ioc"
 IOC_BULK = "case.ioc.bulk"
+IOC_FALSE_POSITIVE = "case.ioc.false_positive"
+IOC_FALSE_POSITIVE_CLEAR = "case.ioc.false_positive.clear"
 WATCHER_ADD = "case.watcher.add"
 WATCHER_REMOVE = "case.watcher.remove"
 ESCALATE = "case.escalate"
+MOVE = "case.move"
+CLAIM = "case.claim"
+REOPEN = "case.reopen"
 TASK = "case.task"
 TASK_UPDATE = "case.task.update"
 LINK = "case.link"
@@ -43,6 +49,9 @@ SLA_PAUSE = "case.sla.pause"
 SLA_RESUME = "case.sla.resume"
 APPROVE = "approval.approve"
 REJECT = "approval.reject"
+RELEASE = "approval.release"
+# A close answered an ask nobody had (#5107).
+SETTLE = "approval.settle"
 # The case row and its journal (#3403)
 CREATE = "case.create"
 STATUS = "case.status"
@@ -55,6 +64,11 @@ JOURNAL = "case.journal"
 STEP = "case.resolution_step"
 DELETE = "case.delete"
 PURGE = "case.purge"
+# Restricted cases (#4354): who may read the case, and each change to it.
+RESTRICT = "case.restrict"
+READERS_ADD = "case.readers.add"
+READERS_REMOVE = "case.readers.remove"
+UNRESTRICT = "case.unrestrict"
 
 # What a write of one field alone is. More than one field is an EDIT.
 _ALONE = {
@@ -84,7 +98,8 @@ def on_error(default: Any):
     """``default_on_error`` that lets the trail's own failures through.
 
     A ``TrailWriteError`` answers 500 with nothing committed, and
-    ``trail.Paused`` a 503 with Retry-After; anything else is ``default``.
+    ``trail.Paused`` a 503 with Retry-After, and ``NotFoundError`` (a case the
+    caller may not read) a 404; anything else is ``default``.
     """
 
     def decorate(fn):
@@ -92,7 +107,7 @@ def on_error(default: Any):
         def wrapper(*args, **kwargs):
             try:
                 return fn(*args, **kwargs)
-            except (TrailWriteError, trail.Paused):
+            except (TrailWriteError, trail.Paused, NotFoundError):
                 raise
             except Exception:
                 logging.getLogger(fn.__module__).exception("%s failed", fn.__qualname__)
@@ -321,8 +336,11 @@ def append_approval(
     action_id: str,
     username: Optional[str],
     operator_text: Optional[str] = None,
+    case_id: Optional[str] = None,
+    action_type: Optional[str] = None,
+    kind: Optional[str] = None,
 ) -> None:
-    """Append an approve or reject in the caller's transaction.
+    """Append an approve, reject, release, or settle in the caller's transaction.
 
     ``principal_id`` is the one the caller already resolved; ``approved_by``
     and ``approved_by_principal_id`` are not changed. No legacy row:
@@ -332,7 +350,14 @@ def append_approval(
         return
     trail.append(
         session,
-        _payload(action, principal_id, action_id=action_id),
+        _payload(
+            action,
+            principal_id,
+            case_id=case_id,
+            action_id=action_id,
+            action_type=action_type,
+            kind=kind,
+        ),
         **_beside(username or None, operator_text),
     )
 

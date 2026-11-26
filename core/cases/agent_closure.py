@@ -5,7 +5,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
-from typing import Iterator, Optional
+from typing import Any, Iterator, Optional
 
 from sqlalchemy.orm import Session
 
@@ -13,6 +13,7 @@ from core.audit import trail
 from core.cases.closure import CHANNEL_AGENT, CHANNEL_COOKIE
 from core.integrations.mcp.surface import current_caller
 from core.storage.connection import get_db_session
+from core.time import utcnow
 
 # No principal bound: nobody is behind the call, as in a hunt.
 CALLER_UNAUTHENTICATED = "agent"
@@ -60,6 +61,11 @@ def clear_http_actor() -> None:
     _http.set(None)
 
 
+def current_http_actor() -> Optional[HttpActor]:
+    """Who ``get_current_user`` accepted for this request, if anyone."""
+    return _http.get()
+
+
 @contextmanager
 def bound_credential(credential_id: Optional[str]) -> Iterator[None]:
     """The MCP credential this call authenticated with, beside the username."""
@@ -85,6 +91,26 @@ def close_channel() -> str:
     if actor is not None and actor.via == "cookie" and actor.person:
         return CHANNEL_COOKIE
     return CHANNEL_AGENT
+
+
+def closing_person() -> Optional[str]:
+    """The person a close is on behalf of, or None when no person is behind it.
+
+    The access cookie, or a console chat turn whose signed claims name the chat
+    assistant. A run a person started carries the case-working agent, not chat,
+    so it is not that person's close (#4983).
+    """
+    if close_channel() == CHANNEL_COOKIE:
+        actor = _http.get()
+        return actor.username if actor is not None else None
+    # Lazy: tool_principal reads the JWT secret on import, which an upgrade lacks.
+    from core.auth.principals import CHAT_PLUGIN_ID, agent_principal_id
+    from core.auth.tool_principal import current_claims
+
+    claims = current_claims()
+    if claims is not None and claims.agent_id == agent_principal_id(CHAT_PLUGIN_ID):
+        return claims.username or None
+    return None
 
 
 def run_agent() -> tuple[Optional[str], Optional[str]]:
@@ -168,6 +194,44 @@ def actor_identity(
     return principal, name
 
 
+def acting_principal() -> Optional[str]:
+    """The principal this tool call acts as, for a row that names its proposer.
+
+    Inside a run, its signed claims name who (the person, else the agent); over
+    /mcp, the bound caller does.
+    """
+    from core.auth.tool_principal import current_claims
+
+    claims = current_claims()
+    if claims is not None:
+        return claims.person_id or claims.agent_id
+    return actor_identity()[0]
+
+
+# The activity a title edit by a person (the API, or an agent acting for one)
+# leaves; its presence on a case means the title is a person's, and an
+# investigation's retitle leaves it alone.
+TITLE_EDITED = "case_title_edited"
+
+
+def title_edited_activities(case: dict, title: str) -> Optional[list]:
+    """The case's activities plus a TITLE_EDITED entry, for an update that
+    changes the title; None when ``title`` is the title already."""
+    old = case.get("title")
+    if title == old:
+        return None
+    return [
+        *(case.get("activities") or []),
+        {
+            "timestamp": utcnow().isoformat() + "Z",
+            "activity_type": TITLE_EDITED,
+            "description": f"Title edited: {old} \u2192 {title}",
+            "details": {},
+            **activity_actor(),
+        },
+    ]
+
+
 def activity_actor(
     explicit: Optional[str] = None, session: Optional[Session] = None
 ) -> dict[str, str]:
@@ -185,6 +249,11 @@ def activity_actor(
 
 _trail_ready = trail.in_use
 
+# Who closed, on the case.close trail entry (#4819).
+CLOSED_AS_MODEL = "model"
+CLOSED_AS_PERSON = "person"
+CLOSED_AS_API = "api"
+
 
 def record_close(
     session: Session,
@@ -192,15 +261,36 @@ def record_close(
     principal_id: Optional[str],
     case_id: str,
     actor_text: str,
+    category: str,
+    by_model: bool = False,
     credential_id: Optional[str] = None,
+    sampled: bool = False,
+    evidence_opened: Optional[bool] = None,
 ) -> None:
     """Append the close to the trail in the caller's transaction.
 
     No ``case_audit_logs`` row: a close does not write one today.
+    ``sampled`` is whether the row is in the dismissal sample.
+    ``evidence_opened`` is the flag stored on this close, null included.
+    ``closed_as`` is ``model`` when the close passed the autonomy check
+    (``by_model``), ``person`` for a console close, else ``api``.
     """
     if not _trail_ready(session):
         return
-    payload: dict[str, str] = {"action": CLOSE_ACTION, "case_id": case_id}
+    payload: dict[str, Any] = {
+        "action": CLOSE_ACTION,
+        "case_id": case_id,
+        "category": category,
+        "closed_as": (
+            CLOSED_AS_MODEL
+            if by_model
+            else (
+                CLOSED_AS_PERSON if close_channel() == CHANNEL_COOKIE else CLOSED_AS_API
+            )
+        ),
+        "sampled": sampled,
+        "evidence_opened": evidence_opened,
+    }
     if principal_id:
         payload["actor"] = principal_id
     if credential_id:

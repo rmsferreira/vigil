@@ -222,6 +222,20 @@
   display: flex;
   flex-direction: column;
   gap: 18px;
+  /* Settings' cards reflow on `main`'s width; here on the column's */
+  container: su-col / inline-size;
+}
+
+/* the history card's job message takes its own line, as it does in Settings */
+@container su-col (max-width: 699px) {
+  .data-job.wrap {
+    flex-wrap: wrap;
+  }
+
+  .data-job.wrap .data-job-msg {
+    order: 1;
+    flex-basis: 100%;
+  }
 }
 
 .su-eyebrow {
@@ -629,8 +643,12 @@
   font-weight: 600;
 }
 
-.su-resid.stays {
+.su-resid.your_cloud {
   color: var(--good);
+}
+
+.su-resid.unknown {
+  color: var(--fair);
 }
 
 .su-keyrow {
@@ -714,7 +732,13 @@
   }
 
   .su-foot {
+    gap: 4px;
     padding: 0 16px;
+  }
+
+  /* Back, Save and finish later and Finish setup fit a 360px phone */
+  .su-foot .btn {
+    padding: 0 10px;
   }
 
   .su-foot-note {

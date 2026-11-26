@@ -43,8 +43,29 @@ def _server():
 
 _cached_tools: Optional[List[Dict[str, Any]]] = None
 
-# Tools /mcp still serves that are not offered to Vigil's own agents (#4239).
-_MCP_ONLY = frozenset({"get_case"})
+# Tools /mcp still serves that are not offered to Vigil's own agents (#4239):
+# agents read rules and coverage through search_detections and analyze_coverage,
+# gaps through identify_gaps and what to emulate next through emulate_next.
+# The Day 1 Report is for outside callers (#5046), and so is importing rule
+# libraries (#5116). Approving a held repo rule is a person's statement about
+# data Vigil cannot see (#5118).
+_MCP_ONLY = frozenset(
+    {
+        "read_rule_repo",
+        "import_rules",
+        "remove_rule_library",
+        "get_case",
+        "list_detection_rules",
+        "get_detection_rule",
+        "get_detection_coverage",
+        "start_gaps_run",
+        "get_gaps_report",
+        "get_emulate_next",
+        "get_day1_report",
+        "start_day1_report",
+        "approve_detection_rule",
+    }
+)
 
 
 def list_tools() -> List[Dict[str, Any]]:
@@ -78,6 +99,21 @@ def required_permission(name: str) -> Optional[str]:
         logger.exception("Vigil's tool %s was not read", name)
         return None
     return None if tool is None else getattr(tool.fn, "permission", None)
+
+
+def changes(name: str) -> Optional[bool]:
+    """Whether one of Vigil's tools changes something, by its read-only hint.
+
+    None for any other name.
+    """
+    try:
+        tool = _server()._tool_manager.get_tool(name)
+    except Exception:  # noqa: BLE001 - a server that cannot be read names none
+        logger.exception("Vigil's tool %s was not read", name)
+        return None
+    if tool is None or tool.annotations is None:
+        return None
+    return not tool.annotations.read_only_hint
 
 
 async def call_tool(

@@ -6,6 +6,8 @@ Endpoints (registered under /api/ai):
   DELETE /config/{component}     — clear one assignment (falls back to chat_default)
   GET    /models                 — aggregated model list across active providers
   GET    /models/{model_id}/info — capability + pricing detail for one model
+  POST   /investigation-replay  — replay recent person-determined cases
+  GET    /investigation-replay  — the latest replay
 """
 
 from __future__ import annotations
@@ -13,10 +15,12 @@ from __future__ import annotations
 import logging
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+import httpx
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
 from pydantic import BaseModel, Field
 
 from core.auth.permissions import permission_gate
+from core.deps import provide_agent_http
 from core.llm.providers.registry import (
     COMPONENTS,
     FALLBACK_KEY,
@@ -26,6 +30,8 @@ from core.llm.providers.registry import (
     is_valid_component,
 )
 from core.llm.target import blank_model
+from core.reporting.investigation_replay import begin, drive, read
+from core.response.ceiling import investigation_model, judge_after_commit
 from core.routing import Auth, RouterMeta, UnitOfWorkSession
 from core.storage.config_service import write_config_audit
 from core.storage.models import AIModelConfig, LLMProviderConfig, User
@@ -154,6 +160,21 @@ def _audit(
     )
 
 
+# The rows the investigation model resolves through (it inherits chat_default).
+_INVESTIGATION_ROWS = ("investigation", "chat_default")
+
+
+def _judge_on_commit(db: Any, component: str) -> None:
+    """After the write commits, judge Act workflows if the investigation model
+    moved. Captures the model in force now; never fails the write."""
+    if component not in _INVESTIGATION_ROWS:
+        return
+    try:
+        judge_after_commit(db, investigation_model())
+    except Exception:  # noqa: BLE001
+        logger.exception("model change judgement not scheduled for %s", component)
+
+
 # ---------------------------------------------------------------------------
 # Endpoints — config CRUD
 # ---------------------------------------------------------------------------
@@ -202,6 +223,7 @@ def set_component_assignment(
             detail=f"provider {payload.provider_id} is not active",
         )
 
+    _judge_on_commit(db, component)
     actor = str(current_user.user_id)
     row = db.get(AIModelConfig, component)
     before = _pair(row)
@@ -249,9 +271,94 @@ def clear_component_assignment(
     row = db.get(AIModelConfig, component)
     if row is None:
         return {"component": component, "cleared": False}
+    _judge_on_commit(db, component)
     _audit(db, component, "delete", _pair(row), None, str(current_user.user_id))
     db.delete(row)
     return {"component": component, "cleared": True}
+
+
+# ---------------------------------------------------------------------------
+# Investigation replay (#4389). Does not change the assignment.
+# ---------------------------------------------------------------------------
+
+
+class InvestigationReplayStart(BaseModel):
+    provider_id: str
+    model_id: str
+
+
+class FalseCloseRow(BaseModel):
+    case_id: str
+    closure_category: str
+    disposition: str
+    evidence_opened: Optional[bool] = None
+
+
+class WorkflowReplayTally(BaseModel):
+    total: int
+    replayed: int
+    skipped: int
+    false_closes: int
+    false_close_rate: Optional[float] = None
+    false_close_wilson_low: Optional[float] = None
+    false_close_wilson_high: Optional[float] = None
+    agreed: int
+    disagreed: int
+    abstained: int
+    agreement_rate: Optional[float] = None
+    agreement_wilson_low: Optional[float] = None
+    agreement_wilson_high: Optional[float] = None
+
+
+class InvestigationReplayResponse(BaseModel):
+    status: str
+    reason: Optional[str] = None
+    provider_id: str
+    model_id: str
+    started_by: str
+    started_at: str
+    total: int
+    replayed: int
+    skipped: int
+    false_closes: int
+    false_close_rate: Optional[float] = None
+    false_close_wilson_low: Optional[float] = None
+    false_close_wilson_high: Optional[float] = None
+    agreed: int
+    disagreed: int
+    abstained: int
+    agreement_rate: Optional[float] = None
+    agreement_wilson_low: Optional[float] = None
+    agreement_wilson_high: Optional[float] = None
+    cost_usd: float
+    false_close: List[FalseCloseRow]
+    by_workflow: Dict[str, WorkflowReplayTally] = {}
+
+
+@router.post(
+    "/investigation-replay",
+    response_model=InvestigationReplayResponse,
+    dependencies=_SETTINGS_WRITE,
+)
+def start_investigation_replay(
+    payload: InvestigationReplayStart,
+    background: BackgroundTasks,
+    db: UnitOfWorkSession,
+    current_user: User = Depends(get_current_active_user),
+    agent_http: httpx.AsyncClient = Depends(provide_agent_http),
+):
+    public, cases, provider_type, started_at = begin(
+        db, payload.provider_id, payload.model_id, str(current_user.user_id)
+    )
+    background.add_task(
+        drive, agent_http, cases, provider_type, payload.model_id, started_at
+    )
+    return public
+
+
+@router.get("/investigation-replay", response_model=InvestigationReplayResponse)
+def get_investigation_replay(db: UnitOfWorkSession):
+    return read(db)
 
 
 # ---------------------------------------------------------------------------

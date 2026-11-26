@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import copy
 import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple
@@ -10,8 +11,9 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple
 import yaml
 
 from core.agents.enablement import disabled_agent_ids, disabled_message
+from core.config import get_settings
 from core.llm.defaults import DEFAULT_MODEL
-from core.response.ceiling import gated_tools
+from core.response.ceiling import IRREVERSIBLE, REVERSIBLE, gated_tools, tool_classes
 
 if TYPE_CHECKING:
     from core.integrations.mcp.registry import MCPRegistry
@@ -20,20 +22,63 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+# Named for what the agent layer already defaults to, so a resolved config that
+# states nothing unusual states the same numbers a packaged one would. Replay
+# reads this constant. Investigate and compose runs overlay max_wall_ms from
+# WORKFLOW_DEFAULT_WALL_SECONDS at resolve time; this dict stays 30 minutes.
+DEFAULT_SPEND = {"max_cost_usd": 5.0, "max_wall_ms": 1_800_000}
+# Seconds. Below a minute is not a wall an operator would set on purpose, and a
+# day is the override ceiling. Outside this, the setting is ignored.
+WALL_SECONDS_MIN = 60
+WALL_SECONDS_MAX = 86_400
+WALL_SETTING = "WORKFLOW_DEFAULT_WALL_SECONDS"
+DEFAULT_RUNTIME = {"max_turns": 8, "result_cap": 20_000, "recall_limit": 3}
+
+
+def deployment_wall_ms() -> int:
+    """Wall for an investigate or compose run whose start names none.
+
+    Read when the run starts. A number outside 60–86400 seconds is ignored and
+    the 30-minute constant stands; a non-numeric value never reaches here.
+    """
+    seconds = get_settings().workflow_default_wall_seconds
+    if WALL_SECONDS_MIN <= seconds <= WALL_SECONDS_MAX:
+        return seconds * 1000
+    return DEFAULT_SPEND["max_wall_ms"]
+
+
+def wall_setting_warning() -> Optional[str]:
+    """Why the deployment wall was ignored, or None when the setting is in range."""
+    seconds = get_settings().workflow_default_wall_seconds
+    if WALL_SECONDS_MIN <= seconds <= WALL_SECONDS_MAX:
+        return None
+    return (
+        f"{WALL_SETTING} is {seconds}, outside {WALL_SECONDS_MIN}-{WALL_SECONDS_MAX} "
+        "seconds; using 1800 seconds"
+    )
+
+
+def warn_default_wall() -> None:
+    """Log once, at API start, when the deployment wall is a number out of range."""
+    message = wall_setting_warning()
+    if message:
+        logger.warning("%s", message)
+
+
+def _with_deployment_wall(budgets: Dict[str, Any]) -> Dict[str, Any]:
+    return {**budgets, "max_wall_ms": deployment_wall_ms()}
+
+
 class UnknownPlaybook(Exception):
     pass
 
-
-# Named for what the agent layer already defaults to, so a resolved config that
-# states nothing unusual states the same numbers a packaged one would.
-DEFAULT_SPEND = {"max_cost_usd": 5.0, "max_wall_ms": 1_800_000}
-DEFAULT_RUNTIME = {"max_turns": 8, "result_cap": 20_000, "recall_limit": 3}
 
 # Two attempts at the answer follow a phase's tool loop, so a phase costs at most
 # this many model calls.
 EMIT_ATTEMPTS = 2
 
 REMOTE = "remote"
+EMULATION = "emulation"
 
 # What the investigate arch's lead asks for. Only telemetry_search needs an
 # integration; the rest are native tools. Naming them as capabilities is what lets
@@ -45,6 +90,11 @@ INVESTIGATE_CAPABILITIES = (
     "telemetry_search",
     "findings_search",
     "indicator_lookup",
+    # OpenCTI's graph, held when it is connected (OPTIONAL_CAPABILITIES).
+    "intel_observable",
+    "intel_indicator",
+    "intel_entities",
+    "intel_relationships",
 )
 
 
@@ -109,15 +159,18 @@ class Candidate:
         return tuple(f"{self.server}_{tool}" for tool in self.tools)
 
 
-# What an arch means when it asks for a capability, in the order a deployment
-# should prefer. First present wins; none present drops the capability, which the hunt
-# journals as a visibility gap rather than running blind.
+# What an arch means when it asks for a capability. Each connected server answers,
+# with its first present tool in its own preference order, and the agent picks between
+# them; none present drops the capability, which the hunt journals as a visibility gap
+# rather than running blind.
 CAPABILITIES: Dict[str, Tuple[Candidate, ...]] = {
     "telemetry_search": (
         # In-repo servers, whose list_tools() names these tools.
         # splunk_execute first: it takes earliest, which nl_search cannot express.
         Candidate("splunk-selfhosted", ("splunk_execute", "splunk_nl_search")),
         Candidate("elastic", ("elastic_search_logs", "elastic_search_by_ioc")),
+        # One region per call; a region not allowed answers a pointer, never rows.
+        Candidate("amazon-security-lake", ("security_lake_query",)),
         # Third-party servers: unverifiable from this repo, so these are preferences
         # matched against whatever the server reports.
         Candidate("splunk", ("run_splunk_search", "search", "oneshot_search")),
@@ -139,15 +192,58 @@ CAPABILITIES: Dict[str, Tuple[Candidate, ...]] = {
     # deployment with no sidecar answers each call unavailable.
     "shell": (Candidate(None, ("read_case_shell",)),),
     "get_finding": (Candidate(None, ("get_finding",)),),
+    # The rules declaring a technique, their stage and checks, what LogLM flagged
+    # on it and the hunts that tested it. Context for where to look, never evidence.
+    "detection_coverage": (Candidate(None, ("analyze_coverage",)),),
     # A threat-intel platform's own graph, one tool each: an observable's indicators,
     # one indicator, named actors and malware, and what an entity links to. OpenCTI is
-    # opt-in, so a hunt holds these when it is connected and misses nothing when not
-    # (OPTIONAL_HUNT_CAPABILITIES).
+    # opt-in, so a hunt or investigation holds these when it is connected and misses
+    # nothing when not (OPTIONAL_CAPABILITIES).
     "intel_observable": (Candidate("opencti", ("opencti_search_observable",)),),
     "intel_indicator": (Candidate("opencti", ("opencti_get_indicator",)),),
     "intel_entities": (Candidate("opencti", ("opencti_search_entities",)),),
     "intel_relationships": (Candidate("opencti", ("opencti_get_related",)),),
+    # One account read from the connected identity provider: state, department,
+    # manager. Reads only -- aad_disable_user is never a candidate, so never bound.
+    # Okta's names are fctr-id/okta-mcp-server's at the tag mcp-config.json pins.
+    "identity_lookup": (
+        Candidate("azure-ad", ("aad_get_user",)),
+        Candidate("okta", ("get_okta_user", "list_okta_users")),
+    ),
+    # A sandbox's prior analysis of a hash, and its report, from whichever sandbox is
+    # connected. Split by question: one tool binds per server per capability. Reads
+    # only -- no submit tool is a candidate.
+    "sandbox_hash_lookup": (
+        Candidate("cape-sandbox", ("cape_search_hash",)),
+        Candidate("hybrid-analysis", ("ha_search_hash",)),
+        Candidate("anyrun", ("anyrun_search_hash",)),
+    ),
+    "sandbox_report": (
+        Candidate("cape-sandbox", ("cape_get_report",)),
+        Candidate("hybrid-analysis", ("ha_get_report",)),
+        Candidate("anyrun", ("anyrun_get_report",)),
+    ),
+    # A topology integration's graph, and the console view it drives: one tool each,
+    # since the two view tools cannot share one capability.
+    "topology_graph": (Candidate("vstrike", ("vstrike_network_graph_get",)),),
+    "topology_focus": (Candidate("vstrike", ("vstrike_ui_rightpanel_focus",)),),
+    "topology_legend": (Candidate("vstrike", ("vstrike_ui_legend_apply",)),),
+    # Every outside tool the stored emulation record marks, read when resolve
+    # runs (_candidates): no tool is named here, so a person's mark is the binding.
+    EMULATION: (),
 }
+
+# A need a stored manifest may still name, and the capability it now means.
+NEED_ALIASES: Dict[str, str] = {"atomic_red_team_execute": EMULATION}
+
+
+def candidates_for(capability: str) -> Tuple[Candidate, ...]:
+    """What answers a capability; a need that is none names one catalogue tool."""
+    if capability == EMULATION:
+        from core.response.emulation import read_emulation
+
+        return tuple(Candidate(None, (tool,)) for tool in read_emulation().tools)
+    return CAPABILITIES.get(capability) or (Candidate(None, (capability,)),)
 
 
 # What one call of a capability may take and return, decided by the capability rather
@@ -170,6 +266,13 @@ CAPABILITY_BOUNDS: Dict[str, Dict[str, int]] = {
     # One row of our own Postgres. Its size is the record behind the alert, which
     # result_cap bounds, so the row cap is only the shape the bounds model asks for.
     "get_finding": {"timeout_ms": 15_000, "max_rows": 1},
+    # A read of our own Postgres, one answer per technique asked; the row cap is
+    # only the bounds model's shape.
+    "detection_coverage": {"timeout_ms": 30_000, "max_rows": 20},
+    # A save proves the rule on the SIEM, then a gaps run's save lints and replays
+    # its proposal (tools.GAP_REPLAY_TIMEOUT_S): the 30s default would cut the
+    # answer off after the rule is saved.
+    "save_detection_rule": {"timeout_ms": 240_000, "max_rows": 200},
     # Each tool caps its own list at 50; this is the shape the bounds model asks for.
     **{
         name: {"timeout_ms": 60_000, "max_rows": 50}
@@ -180,24 +283,41 @@ CAPABILITY_BOUNDS: Dict[str, Dict[str, int]] = {
             "intel_relationships",
         )
     },
+    # One account from an external API; the row cap allows a short user search.
+    "identity_lookup": {"timeout_ms": 30_000, "max_rows": 20},
+    # A sandbox API read of one hash or one report; the row cap is the bounds
+    # model's shape.
+    "sandbox_hash_lookup": {"timeout_ms": 60_000, "max_rows": 50},
+    "sandbox_report": {"timeout_ms": 60_000, "max_rows": 200},
+    # A topology read, and a console nudge that answers with an acknowledgement.
+    "topology_graph": {"timeout_ms": 60_000, "max_rows": 200},
+    "topology_focus": {"timeout_ms": 30_000, "max_rows": 20},
+    "topology_legend": {"timeout_ms": 30_000, "max_rows": 20},
+    # An emulator runs one technique on one host; a runner's own limit is 180s.
+    # Its answer is a step or a few; the row cap is the bounds model's shape.
+    EMULATION: {"timeout_ms": 240_000, "max_rows": 200},
 }
 
 
 # The tools that answer each capability the arch asked for, bound to what this
-# deployment reports. provides is what the agent layer matches a role's needs on.
-# A need that is not a capability but names a catalogue tool binds that tool.
+# deployment reports: one per connected server, its first present name in its own
+# preference order, so the agent picks between servers. provides is what the agent
+# layer matches a role's needs on. A need that is not a capability but names a
+# catalogue tool binds that tool.
 def _bound_capabilities(
     needs: List[str], catalogue: Dict[str, Dict[str, Any]]
 ) -> List[Dict[str, Any]]:
     bound: List[Dict[str, Any]] = []
-    for capability in needs:
-        candidates = _candidates_by_name(capability)
-        if capability not in CAPABILITIES:
-            candidates = ((capability, None),)
-        for name, server in candidates:
-            entry = catalogue.get(name)
-            if entry is None:
+    for need in needs:
+        capability = NEED_ALIASES.get(need, need)
+        candidates = candidates_for(capability)
+        found = False
+        for candidate in candidates:
+            name = next((n for n in candidate.names() if n in catalogue), None)
+            if name is None:
                 continue
+            found = True
+            entry = catalogue[name]
             bound.append(
                 {
                     "id": name,
@@ -207,18 +327,13 @@ def _bound_capabilities(
                     "parameters": entry.get("input_schema") or {},
                     # The integration behind it, so a hunt can name the system a
                     # row came from. A tool this backend implements names none.
-                    **({"server": server} if server else {}),
+                    **({"server": candidate.server} if candidate.server else {}),
                     **CAPABILITY_BOUNDS.get(capability, {}),
                 }
             )
-            break
-        else:
+        if not found:
             # An opt-in integration that is not connected is the expected case.
-            (
-                logger.debug
-                if capability in OPTIONAL_HUNT_CAPABILITIES
-                else logger.warning
-            )(
+            (logger.debug if capability in OPTIONAL_CAPABILITIES else logger.warning)(
                 "no tool in this deployment provides %s; roles needing it lose it",
                 capability,
             )
@@ -231,7 +346,11 @@ def unknown_needs(
     needs: List[str], registry: Optional["MCPRegistry"] = None
 ) -> List[str]:
     catalogue = _tool_catalogue(registry)
-    return [n for n in needs if n not in CAPABILITIES and n not in catalogue]
+    return [
+        n
+        for n in needs
+        if n not in CAPABILITIES and n not in NEED_ALIASES and n not in catalogue
+    ]
 
 
 # What an investigate run's lead holds: an operator manifest's needs, else the
@@ -239,19 +358,6 @@ def unknown_needs(
 def lead_needs(definition: Any) -> List[str]:
     needs = definition.metadata.get("needs")
     return list(needs) if isinstance(needs, list) else list(INVESTIGATE_CAPABILITIES)
-
-
-# Flattened once, so every caller matching the catalogue reads from one definition.
-def _candidate_names(capability: str) -> Tuple[str, ...]:
-    return tuple(name for name, _server in _candidates_by_name(capability))
-
-
-def _candidates_by_name(capability: str) -> Tuple[Tuple[str, Optional[str]], ...]:
-    return tuple(
-        (name, candidate.server)
-        for candidate in CAPABILITIES.get(capability, ())
-        for name in candidate.names()
-    )
 
 
 # An agent's prompt is rendered now rather than read from a file: the memory block
@@ -338,7 +444,8 @@ def _instructions_of(phase: Dict[str, Any]) -> str:
 
 # Every phase holds its agent's needs as this deployment binds them; without a
 # catalogue (a preflight read) the needs themselves. A need that binds nothing is
-# returned beside them, so the run journals a blind spot rather than a log line.
+# returned beside them, so the run journals a blind spot rather than a log line; an
+# optional capability nothing answers is an opt-in not connected, and records none.
 def _phase_tools(
     profile: Any, catalogue: Optional[Dict[str, Dict[str, Any]]]
 ) -> Tuple[List[str], List[Dict[str, str]]]:
@@ -349,7 +456,7 @@ def _phase_tools(
     unavailable: List[Dict[str, str]] = []
     for need in needs:
         bound = [t["id"] for t in _bound_capabilities([need], catalogue)]
-        if not bound:
+        if not bound and NEED_ALIASES.get(need, need) not in OPTIONAL_CAPABILITIES:
             unavailable.append(
                 {"tool": need, "reason": f"no tool in this deployment answers {need}"}
             )
@@ -420,7 +527,9 @@ def _tools_of(
 # flat ceiling would starve a long playbook part-way through. Cost and wall bind.
 def _budgets(phases: List[Dict[str, Any]]) -> Dict[str, Any]:
     per_phase = int(DEFAULT_RUNTIME["max_turns"]) + EMIT_ATTEMPTS
-    return {"max_calls": max(len(phases), 1) * per_phase, **DEFAULT_SPEND}
+    return _with_deployment_wall(
+        {"max_calls": max(len(phases), 1) * per_phase, **DEFAULT_SPEND}
+    )
 
 
 # Every outside tool whose stored class is reversible, irreversible, or none.
@@ -431,6 +540,83 @@ def _budgets(phases: List[Dict[str, Any]]) -> Dict[str, Any]:
 def _approvals_of(tools: List[Dict[str, Any]]) -> List[str]:
     gated = gated_tools(tool["id"] for tool in tools)
     return [tool["id"] for tool in tools if tool["id"] in gated]
+
+
+# The tools that change something when they succeed: one on Vigil's MCP server not
+# hinted read-only, else a built-in whose permission is more than a read (the hint
+# is the finer word: approve_action is gated as a decision but only reads), and an
+# outside one stored as reversible or irreversible. The agent layer reads the mark
+# at the run's end, so an answer that claims a save whose call failed is followed
+# by Vigil's own line saying so. An unclassified outside tool is not marked: it may
+# be a read.
+def _mark_writes(tools: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    from core.agents.tool_registry import TOOL_PERMISSIONS
+    from core.integrations.mcp import in_process
+
+    names = [tool["id"] for tool in tools]
+    own = {
+        name
+        for name in names
+        if (hint := in_process.changes(name)) is True
+        or (
+            hint is None
+            and name in TOOL_PERMISSIONS
+            and not TOOL_PERMISSIONS[name].endswith(".read")
+        )
+    }
+    outside = {
+        name
+        for name, effect in tool_classes(names).items()
+        if effect in (REVERSIBLE, IRREVERSIBLE)
+    }
+    writes = own | outside
+    # A tool the emulation record marks is an emulator wherever it was bound: the
+    # agent layer journals each call to it, and it gets the emulation bounds.
+    from core.response.emulation import read_emulation
+
+    emulation = read_emulation()
+    return [
+        {
+            **tool,
+            **({"writes": True} if tool["id"] in writes else {}),
+            **(
+                {
+                    **CAPABILITY_BOUNDS[EMULATION],
+                    "emulator": True,
+                    **_name_hosts(tool, emulation.hosts),
+                }
+                if emulation.marked(tool["id"])
+                else {}
+            ),
+        }
+        for tool in tools
+    ]
+
+
+# An emulator's hostname is narrowed to the listed hosts, and its description
+# names them, so the model asks only for a host it can run on. tools_router
+# still refuses an unlisted host: the list may change mid-run. The schema is
+# copied first; the catalogue entry is shared between runs.
+def _name_hosts(tool: Dict[str, Any], hosts: Tuple[str, ...]) -> Dict[str, Any]:
+    from core.response.emulation import LIMITS_POINTER
+
+    parameters = copy.deepcopy(tool.get("parameters") or {})
+    hostname = (parameters.get("properties") or {}).get("hostname")
+    if not isinstance(hostname, dict):
+        return {}
+    if hosts:
+        hostname["enum"] = list(hosts)
+        note = f"Runs only on the hosts listed for emulation: {', '.join(hosts)}."
+    else:
+        note = (
+            "No host is listed for emulation, so every call is refused until "
+            f"an operator lists one under {LIMITS_POINTER}."
+        )
+    description = (tool.get("description") or "").rstrip()
+    return {
+        "parameters": parameters,
+        "description": f"{description}\n\n{note}" if description else note,
+    }
 
 
 def resolve(
@@ -464,11 +650,14 @@ def resolve(
         if definition.run_kind == "investigate"
         else []
     )
-    tools = lead + [
-        tool
-        for tool in _tools_of(phases, catalogue)
-        if tool["id"] not in {held["id"] for held in lead}
-    ]
+    tools = _mark_writes(
+        lead
+        + [
+            tool
+            for tool in _tools_of(phases, catalogue)
+            if tool["id"] not in {held["id"] for held in lead}
+        ]
+    )
 
     playbook = {
         "name": definition.name,
@@ -486,8 +675,9 @@ def resolve(
         "model": model or DEFAULT_MODEL,
         **({"provider": provider} if provider else {}),
         **({"effort": effort} if effort else {}),
+        **_instructions(),
         "budgets": (
-            dict(INVESTIGATE_BUDGETS)
+            _with_deployment_wall(dict(INVESTIGATE_BUDGETS))
             if definition.run_kind == "investigate"
             else _budgets(phases)
         ),
@@ -515,20 +705,34 @@ HUNT_CAPABILITIES = (
     # Bound on the run rather than granted to every role: `needs` in the arch is
     # what decides who holds it, and the lead and critic are not granted it.
     "entity_recall",
+    "detection_coverage",
     "intel_observable",
     "intel_indicator",
     "intel_entities",
     "intel_relationships",
+    # The account a hunt is about, from the identity provider when one is connected.
+    "identity_lookup",
 )
 
-# Needs a hunt holds when the deployment answers them and goes without otherwise,
-# with no blind spot journalled: an opt-in integration that is not connected is not
-# a gap in this estate's visibility. Mirrors `optional` in the hunt plugin.yaml.
-OPTIONAL_HUNT_CAPABILITIES = (
+# Needs a run of any kind holds when the deployment answers them and goes without
+# otherwise, with no blind spot journalled: an opt-in integration that is not
+# connected, or a coverage read, says nothing about this estate's visibility.
+# Mirrors `optional` in the hunt and investigate plugin.yaml.
+OPTIONAL_CAPABILITIES = (
+    "detection_coverage",
     "intel_observable",
     "intel_indicator",
     "intel_entities",
     "intel_relationships",
+    # No identity provider is no blind spot on the estate: the account's existence
+    # goes to open questions instead (the insider-threat skill).
+    "identity_lookup",
+    # Sandboxes and a topology integration are opt-in.
+    "sandbox_hash_lookup",
+    "sandbox_report",
+    "topology_graph",
+    "topology_focus",
+    "topology_legend",
 )
 
 # A hunt is bounded by iterations rather than phases. Separate ceilings: max_calls
@@ -586,8 +790,8 @@ def capability_report(
     missing = [name for name in needs if name not in bound]
     return {
         "bound": [name for name in needs if name in bound],
-        "unbound": [n for n in missing if n not in OPTIONAL_HUNT_CAPABILITIES],
-        "absent": [n for n in missing if n in OPTIONAL_HUNT_CAPABILITIES],
+        "unbound": [n for n in missing if n not in OPTIONAL_CAPABILITIES],
+        "absent": [n for n in missing if n in OPTIONAL_CAPABILITIES],
     }
 
 
@@ -641,6 +845,7 @@ def resolve_hunt(
         "model": model or DEFAULT_MODEL,
         **({"provider": provider} if provider else {}),
         **({"effort": effort} if effort else {}),
+        **_instructions(),
         "budgets": dict(HUNT_BUDGETS),
         "runtime": DEFAULT_RUNTIME,
         "tools": _bound_capabilities(list(HUNT_CAPABILITIES), _tool_catalogue(registry))
@@ -693,6 +898,7 @@ def resolve_root_cause(
         "model": model or DEFAULT_MODEL,
         **({"provider": provider} if provider else {}),
         **({"effort": effort} if effort else {}),
+        **_instructions(),
         "budgets": {
             "max_calls": ROOT_CAUSE_MAX_CALLS,
             "max_cost_usd": HUNT_BUDGETS["max_cost_usd"],
@@ -779,6 +985,15 @@ def _expand_tool() -> Dict[str, Any]:
             },
         },
     }
+
+
+# Read at resolve time, which is run start: the agent layer journals the config
+# with the spec, so the run, a resume and a replay all hold the same text.
+def _instructions() -> Dict[str, str]:
+    from core.llm.system_prompt import operator_instructions
+
+    text = operator_instructions()
+    return {"instructions": text} if text else {}
 
 
 # Block style and no aliases: the agent layer parses this, and a YAML anchor would

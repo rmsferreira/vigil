@@ -5,7 +5,8 @@ import { Ajv, type ErrorObject, type ValidateFunction } from "ajv";
 import { GatewayExhausted } from "./limiter.js";
 import { ModelSilent, OutputCapReached } from "./wire.js";
 import { ZERO_TOKENS, type Refusal, type SpendPayload, type TokenCounts } from "../contracts/budget.js";
-import type { CheckpointPayload, DispatchPayload, NewEvent, ResolutionPayload, TerminalPayload } from "../contracts/events.js";
+import type { CheckpointPayload, DispatchPayload, FramePayload, NewEvent, ResolutionPayload, TerminalPayload } from "../contracts/events.js";
+import { factsPayloadOf, type FactsPayload } from "../contracts/facts.js";
 import { hasRecall, isRecalled, recalledNotesOf, recalledNotes, type RecallPayload } from "../contracts/memory.js";
 import { ToolBoundsViolation, type RegisteredTool, type ToolResult } from "../contracts/tool.js";
 import {
@@ -19,9 +20,9 @@ import {
   type TurnConfig,
 } from "./loop.js";
 import { ProviderError, stopCauseOf, type Message, type ToolCall, type ToolSchema, type Turn, type TurnRequest } from "./provider.js";
-import { assemble, canonical, DEFAULT_FOLD, prefixOf, windowCeiling, type FoldPolicy, type Prefix } from "./context.js";
+import { assemble, canonical, DEFAULT_FOLD, prefixOf, renderFacts, withInstructions, windowCeiling, type FoldPolicy, type Prefix } from "./context.js";
 import { createHash } from "node:crypto";
-import { redactCredentials, scannerFor, wrap } from "./security.js";
+import { redactCredentials, scannerFor, scrub, wrap } from "./security.js";
 import type { State } from "./seams.js";
 
 // Journaled from record without a checkpoint. An approvals entry would park
@@ -59,6 +60,7 @@ export interface FrameSeen {
   system: string;
   task: string;
   recall: string;
+  facts: string;
   tools: readonly ToolSchema[];
   // The caller's history: how many messages, and the messages themselves.
   history: readonly Message[];
@@ -156,13 +158,16 @@ class Run<T, Kinds extends Record<string, unknown>> {
     const submit = schema !== null && this.cfg.submit !== false;
     const offered = this.tools.map(schemaOf);
     this.prefix = prefixOf(
-      this.cfg.system,
+      withInstructions(this.cfg.system, this.harness.instructions),
       submit ? [...offered, { id: SUBMIT_TOOL, description: "Give your final answer, in the shape its parameters describe. Call it alone, once you can answer.", parameters: schema }] : offered,
       await this.recalled(),
+      await this.facts(),
     );
 
     const reserved = submit ? this.cfg.answer_within_cap === true : schema === null && this.cfg.max_turns > 0;
     this.searches = reserved ? Math.max(0, this.cfg.max_turns - 1) : this.cfg.max_turns;
+    const resumed = yield* this.resumeApproved();
+    if (resumed !== null) return yield* announce(resumed);
     const ended = yield* this.toolLoop(submit);
     if (ended !== null) return yield* announce(ended);
     // Prose was already streamed as it arrived, so asking for it again would bill
@@ -205,6 +210,45 @@ class Run<T, Kinds extends Record<string, unknown>> {
     return isRecalled(payload) ? recalledNotes(payload) : [];
   }
 
+  // The entity facts an investigation opens on (#4742), read by the harness as
+  // Recall is: once per run, journaled whether it found something, nothing, or could
+  // not happen, and re-rendered from that event on later turns, on resume and in a
+  // replay. Facts inform and settle nothing, so a read that failed costs the run an
+  // aid and the run goes on.
+  private async facts(): Promise<string> {
+    const ask = this.cfg.facts;
+    if (ask === undefined) return "";
+    const log = await this.harness.state.read(this.cfg.run_id);
+    const held = factsPayloadOf(log);
+    if (held !== null) return renderFacts(held);
+    // A hunt's opening journaled its read or had nothing to read; asking here would ask sources.
+    if (ask.held === true) return "";
+    // A run that already showed a model its prefix without facts -- one started
+    // before this read existed -- keeps that prefix rather than growing it mid-run.
+    if (log.some((one) => one.kind === "frame")) return "";
+    const payload = await this.readFacts(ask.keys, ask.case_id);
+    await this.write({ run_id: this.cfg.run_id, run_kind: this.cfg.run_kind, kind: "facts", payload });
+    return renderFacts(payload);
+  }
+
+  private async readFacts(keys: readonly string[], caseId: string | null): Promise<FactsPayload> {
+    // Known-to-be-none without asking: a run whose findings named no entity.
+    if (keys.length === 0) return { keys: [], case_id: caseId, facts: [], sources_unavailable: {}, dropped_keys: 0 };
+    try {
+      if (this.harness.memory.facts === undefined) throw new Error("no entity-facts read is wired behind this seam");
+      return await this.harness.memory.facts({
+        keys,
+        caseId,
+        asOf: new Date().toISOString(),
+        runId: this.cfg.run_id,
+        ...(this.cfg.signal === undefined ? {} : { signal: this.cfg.signal }),
+      });
+    } catch (error) {
+      if (this.cfg.signal?.aborted === true || hardStop(error)) throw error;
+      return { keys, case_id: caseId, unavailable: error instanceof Error ? error.message : String(error) };
+    }
+  }
+
   // A read that cannot be served is journaled as itself and the run goes on.
   // Memory reorders what to look at first and settles nothing, so a run that could
   // not read it has lost an aid rather than an input: failing here would make one
@@ -224,6 +268,28 @@ class Run<T, Kinds extends Record<string, unknown>> {
       if (this.cfg.signal?.aborted === true || hardStop(error)) throw error;
       return { keys, as_of: asOf, unavailable: error instanceof Error ? error.message : String(error) };
     }
+  }
+
+  // The call a person approved runs before the model is asked anything (#5077): its
+  // checkpoint holds the tool and arguments, and the executed record keeps it to once.
+  // The model then reads it in its transcript, as if the parking turn had gone through.
+  private async *resumeApproved(): AsyncGenerator<StreamEvent<T>, Outcome<T> | null> {
+    if (this.cfg.resume_approved !== true) return null;
+    const fold = await this.folder.advance();
+    if (this.settled(fold) !== null) return null;
+    // Only the role's latest park: an older approval the model moved on from stays unrun.
+    const parked = fold.parked.findLast((one) => one.role === null || one.role === this.cfg.role);
+    if (parked === undefined || fold.answered.get(parked.checkpoint_id) !== "approve" || fold.executed.has(parked.checkpoint_id)) return null;
+    const tool = this.tools.find((granted) => granted.id === parked.tool);
+    if (tool === undefined) return null;
+    const call: ToolCall = { id: `call_${parked.checkpoint_id}`, tool: tool.id, args: parked.args };
+    this.transcript.push({ role: "assistant", content: "", tool_calls: [call] });
+    const measured = await this.invoke(tool, call.args, call.id, parked.checkpoint_id);
+    yield* this.record(call, measured.result, parked.checkpoint_id, measured.duration_ms, measured.redacted);
+    if (this.cfg.park_on_denial === true && !measured.result.ok && measured.result.failure.kind === "denied") {
+      return this.done("waiting_approval", null, measured.result.failure.detail);
+    }
+    return null;
   }
 
   // Returns an outcome only when the run ends here; otherwise the loop stops
@@ -445,14 +511,17 @@ class Run<T, Kinds extends Record<string, unknown>> {
     this.calls.push(attempt);
     this.transcript.push({ role: "tool", call_id: call.id, content: guarded?.shown ?? wrapped.text });
     this.results += 1;
-    if (gated !== undefined) await this.journalExecuted(gated, call.tool, result);
-    else if (call.tool === CANDIDATE_CHECK) await this.journalExecuted(`dsp-${call.id}`, call.tool, result);
+    // An emulator's answer is journaled gated or not, stamped, so its steps are read
+    // only from calls the deployment marked (#5062).
+    const emulator = this.cfg.emulators?.has(call.tool) === true && tool !== undefined;
+    if (gated !== undefined) await this.journalExecuted(gated, call.tool, result, emulator);
+    else if (emulator || call.tool === CANDIDATE_CHECK) await this.journalExecuted(`dsp-${call.id}`, call.tool, result, emulator);
     yield { type: "tool_result", call, attempt, ...(ref === undefined ? {} : { ref }) };
   }
 
   // The dispatch event's own id is the checkpoint's, so the next pass finds it by
   // the same derivation that raised the approval.
-  private async journalExecuted(checkpointId: string, tool: string, result: ToolResult): Promise<void> {
+  private async journalExecuted(checkpointId: string, tool: string, result: ToolResult, emulator = false): Promise<void> {
     const payload: DispatchPayload = {
       dispatch_id: checkpointId,
       agent_id: this.cfg.role,
@@ -460,6 +529,7 @@ class Run<T, Kinds extends Record<string, unknown>> {
       question_id: null,
       failure_reason: result.ok ? null : result.failure.kind,
       result,
+      ...(emulator ? { tool, emulator: true as const } : {}),
     };
     await this.write({ run_id: this.cfg.run_id, run_kind: this.cfg.run_kind, kind: "dispatch", payload });
   }
@@ -612,6 +682,7 @@ class Run<T, Kinds extends Record<string, unknown>> {
       system: this.prefix.system,
       task: this.cfg.task,
       recall: this.prefix.recall,
+      facts: this.prefix.facts ?? "",
       tools: request.tools,
       history: this.cfg.history ?? [],
       results: this.results,
@@ -745,6 +816,13 @@ type Gate =
   | { kind: "park"; checkpoint_id: string }
   | { kind: "served"; checkpoint_id: string; result: ToolResult };
 
+interface Parked {
+  checkpoint_id: string;
+  tool: string;
+  args: string;
+  role: string | null;
+}
+
 interface Fold {
   answered: ReadonlyMap<string, ResolutionPayload["answer"]>;
   // Gated calls this run has already made, by the checkpoint that approved them.
@@ -752,6 +830,8 @@ interface Fold {
   // A checkpoint with no approving or rejecting resolution, which is what keeps
   // a run parked whether or not this harness is the one that raised it.
   open: string | null;
+  // Each tool approval's call, and the role whose model call raised it (null on a ledger without frames).
+  parked: readonly Parked[];
   terminal: TerminalPayload | null;
 }
 
@@ -761,6 +841,9 @@ class Folder<Kinds extends Record<string, unknown>> {
   private readonly answered = new Map<string, ResolutionPayload["answer"]>();
   private readonly executed = new Map<string, ToolResult>();
   private readonly raised: string[] = [];
+  private readonly parked: Parked[] = [];
+  // A checkpoint follows the frame of the model call that asked for it.
+  private framed: string | null = null;
   private terminal: TerminalPayload | null = null;
   private next = 0;
 
@@ -773,7 +856,15 @@ class Folder<Kinds extends Record<string, unknown>> {
         const payload = event.payload as ResolutionPayload;
         this.answered.set(payload.checkpoint_id, payload.answer);
       }
-      if (event.kind === "checkpoint") this.raised.push((event.payload as CheckpointPayload).checkpoint_id);
+      if (event.kind === "frame") this.framed = (event.payload as FramePayload).role;
+      if (event.kind === "checkpoint") {
+        const payload = event.payload as CheckpointPayload;
+        this.raised.push(payload.checkpoint_id);
+        const { tool, args } = payload.context ?? {};
+        if (payload.checkpoint_class === TOOL_APPROVAL && typeof tool === "string" && typeof args === "string") {
+          this.parked.push({ checkpoint_id: payload.checkpoint_id, tool, args, role: this.framed });
+        }
+      }
       if (event.kind === "dispatch") {
         const payload = event.payload as DispatchPayload;
         if (payload.result !== undefined) this.executed.set(payload.dispatch_id, payload.result as ToolResult);
@@ -785,6 +876,7 @@ class Folder<Kinds extends Record<string, unknown>> {
       answered: this.answered,
       executed: this.executed,
       open: this.raised.find((id) => !this.answered.has(id)) ?? null,
+      parked: this.parked,
       terminal: this.terminal,
     };
   }
@@ -823,6 +915,7 @@ export interface InputParts {
   system: string;
   tools: readonly ToolSchema[];
   recall: string;
+  facts?: string;
   task: string;
   transcript: readonly Message[];
   tail: string | null;
@@ -832,7 +925,7 @@ export interface InputParts {
 }
 
 export function rebuiltInput(parts: InputParts): { messages: Message[]; input: string; folded: number } {
-  const prefix: Prefix = { system: parts.system, tools: parts.tools, recall: parts.recall };
+  const prefix: Prefix = { system: parts.system, tools: parts.tools, recall: parts.recall, ...(parts.facts ? { facts: parts.facts } : {}) };
   const { messages, folded } = assemble(
     prefix,
     parts.task,
@@ -846,10 +939,55 @@ export function rebuiltInput(parts: InputParts): { messages: Message[]; input: s
 }
 
 // Names what was dropped rather than reproducing it: a summary that quotes the
-// middle back is the middle, and folds nothing.
+// middle back is the middle, and folds nothing. Each folded result is named by its ref
+// (call id where the transcript has none), tool and a one-line subject from the call's
+// arguments, never from the result, so an answer can say what it read and a structured
+// run can cite a folded ref. Pure in the slice, since rebuiltInput replays it.
 function summariseFolded(folded: readonly Message[]): string {
   const calls = folded.filter((one) => one.role === "tool").length;
-  return `[${folded.length} earlier messages folded away, including ${calls} tool results.]`;
+  const count = `[${folded.length} earlier messages folded away, including ${calls} tool results.]`;
+  return calls === 0 ? count : `${count}\nFolded results:\n${foldedList(folded)}`;
+}
+
+const FOLDED_ENTRIES = 20;
+const FOLDED_LIST_CHARS = 1_500;
+const SUBJECT_CHARS = 60;
+const OPENER = /^<vigil:tool_result((?:\s+[\w-]+="[^"]*")*)\s*>/;
+
+function foldedList(folded: readonly Message[]): string {
+  const asked = new Map<string, ToolCall>();
+  for (const one of folded) if (one.role === "assistant") for (const call of one.tool_calls) asked.set(call.id, call);
+  const lines = folded.flatMap((one) => {
+    if (one.role !== "tool") return [];
+    const attrs = Object.fromEntries([...(OPENER.exec(one.content)?.[1] ?? "").matchAll(/([\w-]+)="([^"]*)"/g)].map((m) => [m[1]!, m[2]!]));
+    const call = asked.get(one.call_id);
+    const handle = (attrs["ref"] ?? one.call_id).replace(/[^\w.-]/g, "");
+    const tool = (attrs["tool"] ?? call?.tool ?? "tool").replace(/[^\w.-]/g, "");
+    const subject = call === undefined ? "" : subjectOf(call.args);
+    return [`${handle} ${tool}${subject === "" ? "" : `: ${subject}`}`];
+  });
+  // Newest kept: the oldest go first, to the entry cap and then to the character cap.
+  let kept = lines.slice(-FOLDED_ENTRIES);
+  const rendered = () => [...kept, ...(kept.length < lines.length ? [`and ${lines.length - kept.length} older folded results not named`] : [])].join("\n");
+  while (kept.length > 0 && rendered().length > FOLDED_LIST_CHARS) kept = kept.slice(1);
+  return rendered();
+}
+
+// The longest string argument (a command over its case id, a query, a finding id), else
+// the first as key=value; raw text when the arguments are not JSON. Scrubbed so it cannot
+// open a block. Ties keep the earlier key, so the pick depends only on the arguments.
+function subjectOf(args: string): string {
+  const parsed = parseArgs(args);
+  const entries = parsed === null ? [] : Object.entries(parsed);
+  const text = entries.map(([, value]) => value).filter((value): value is string => typeof value === "string");
+  const first = entries[0];
+  const raw =
+    parsed === null ? args
+    : text.length > 0 ? text.reduce((best, one) => (one.length > best.length ? one : best))
+    : first === undefined ? "" : `${first[0]}=${JSON.stringify(first[1])}`;
+  const line = scrub(raw.replace(/\s+/g, " ").trim(), Infinity);
+  const points = Array.from(line);
+  return points.length <= SUBJECT_CHARS ? line : `${points.slice(0, SUBJECT_CHARS).join("")}…`;
 }
 
 function schemaOf(tool: RegisteredTool): ToolSchema {

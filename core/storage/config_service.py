@@ -109,9 +109,14 @@ class ConfigService:
         description: Optional[str] = None,
         config_type: str = "general",
         change_reason: Optional[str] = None,
+        *,
+        gated: bool = True,
     ) -> bool:
         """
         Set a system configuration value.
+
+        ``gated=False`` is for a change that only stops autonomy: it must land
+        during a restore's write pause too.
 
         Args:
             key: Configuration key
@@ -155,6 +160,7 @@ class ConfigService:
                 old_value=old_value,
                 new_value=value,
                 change_reason=change_reason,
+                gated=gated,
             )
 
             session.commit()
@@ -202,6 +208,7 @@ class ConfigService:
         integration_type: Optional[str] = None,
         description: Optional[str] = None,
         change_reason: Optional[str] = None,
+        credential_changed: bool = False,
     ) -> bool:
         """
         Set integration configuration.
@@ -214,6 +221,7 @@ class ConfigService:
             integration_type: Type/category of integration
             description: Optional description
             change_reason: Reason for change (for audit)
+            credential_changed: A secret held outside ``config`` was replaced
 
         Returns:
             True if successful
@@ -227,9 +235,22 @@ class ConfigService:
 
             old_value = None
             action = "create"
+            was_enabled = bool(integration and integration.enabled)
+            meta_changed = False
+            old_config = None
 
             if integration:
-                old_value = integration.config
+                # The on/off switch is recorded beside the settings it gates.
+                old_value = {**(integration.config or {}), "enabled": was_enabled}
+                meta_changed = any(
+                    new is not None and new != getattr(integration, attr)
+                    for attr, new in (
+                        ("integration_name", integration_name),
+                        ("integration_type", integration_type),
+                        ("description", description),
+                    )
+                )
+                old_config = integration.config
                 integration.config = config
                 integration.enabled = enabled
                 integration.updated_by = self.user_id
@@ -252,22 +273,47 @@ class ConfigService:
                 )
                 session.add(integration)
 
-            # Create audit log
-            self._create_audit_log(
-                session,
-                config_type="integration",
-                config_key=integration_id,
-                action=action,
-                old_value=old_value,
-                new_value=config,
-                change_reason=change_reason,
-            )
+            # Switched on, or a changed endpoint or credential: its health starts
+            # again from "no attempt yet". A save that changes nothing keeps it.
+            if (
+                (enabled and not was_enabled)
+                or (action == "update" and old_config != config)
+                or credential_changed
+            ):
+                from core.storage import source_health
+
+                try:
+                    # A savepoint: a failed reset never fails the save.
+                    with session.begin_nested():
+                        source_health.reset(integration_id, session=session)
+                except Exception as e:  # noqa: BLE001
+                    logger.warning(
+                        "Health reset for %s failed: %s",
+                        integration_id,
+                        type(e).__name__,
+                    )
+
+            new_value = {**config, "enabled": bool(enabled)}
+            if credential_changed:
+                # Secrets live outside ``config``; say one was replaced, never its value.
+                new_value["secret_replaced"] = True
+            # A save that changes nothing about this integration records nothing,
+            # so the entry that switched it off or re-keyed it stands out.
+            if action == "create" or old_value != new_value or meta_changed:
+                self._create_audit_log(
+                    session,
+                    config_type="integration",
+                    config_key=integration_id,
+                    action=action,
+                    old_value=old_value,
+                    new_value=new_value,
+                    change_reason=change_reason,
+                )
 
             session.commit()
             logger.info(f"Integration '{integration_id}' {action}d by {self.user_id}")
             return True
 
-    @default_on_error(False)
     def record_integration_test(
         self,
         integration_id: str,
@@ -276,30 +322,17 @@ class ConfigService:
         error: Optional[str],
         tested_at: datetime,
     ) -> bool:
-        """Stamp the last probe on an existing row.
+        """Stamp a test send on the integration's Integration Health record.
 
-        Does not rewrite ``config`` or ``enabled``. A missing row is left
-        missing — creating one would invent a configuration.
+        ``integration_configs.last_test_*`` is no longer written. Best-effort:
+        a failed health write is logged by the health store.
         """
-        with get_session() as session:
-            integration = (
-                session.query(IntegrationConfig)
-                .filter_by(integration_id=integration_id)
-                .first()
-            )
-            if integration is None:
-                return False
-            integration.last_test_at = tested_at
-            integration.last_test_success = success
-            integration.last_error = error
-            integration.updated_by = self.user_id
-            logger.info(
-                "Integration '%s' test recorded success=%s by %s",
-                integration_id,
-                success,
-                self.user_id,
-            )
-            return True
+        from core.storage import source_health
+
+        source_health.record_test(
+            integration_id, success=success, error=error, when=tested_at
+        )
+        return True
 
     @default_on_error(list)
     def list_integrations(self, enabled_only: bool = False) -> List[Dict[str, Any]]:
@@ -345,6 +378,8 @@ class ConfigService:
         old_value: Optional[Dict[str, Any]],
         new_value: Optional[Dict[str, Any]],
         change_reason: Optional[str] = None,
+        *,
+        gated: bool = True,
     ):
         """Record one config change on the caller's session.
 
@@ -361,6 +396,7 @@ class ConfigService:
             new_value=new_value,
             changed_by=self.user_id,
             change_reason=change_reason,
+            gated=gated,
         )
 
     def record_audit(
@@ -438,12 +474,14 @@ def write_config_audit(
     new_value: Optional[Dict[str, Any]],
     changed_by: str,
     change_reason: Optional[str] = None,
+    gated: bool = True,
 ) -> None:
     """Append a trail entry, or insert ``config_audit_log`` when the trail is absent.
 
     One or the other, never both. The trail path does not catch ``append``:
     a failure rolls the caller's transaction back. Secret copies are redacted
-    before they reach a trail column.
+    before they reach a trail column. ``gated=False`` is a safety write that
+    still lands during a restore's write pause.
     """
     if _trail_ready(session):
         trail.append(
@@ -458,6 +496,7 @@ def write_config_audit(
                 "old_value": redacted_config_copy(config_type, config_key, old_value),
                 "new_value": redacted_config_copy(config_type, config_key, new_value),
             },
+            gated=gated,
         )
         return
     session.add(
@@ -471,6 +510,38 @@ def write_config_audit(
             change_reason=change_reason,
         )
     )
+
+
+@contextmanager
+def audited_change(
+    changed_by: str,
+    *,
+    config_type: str,
+    config_key: str,
+    action: str,
+    old_value: Optional[Dict[str, Any]],
+    new_value: Optional[Dict[str, Any]],
+):
+    """Record a change whose state lives outside the database (a State
+    Directory file, the skills folder), then let the caller make it.
+
+    The entry is written first, so a refused one stops the change; an
+    exception in the block rolls the entry back.
+    """
+    from core.storage.unit_of_work import unit_of_work
+
+    with unit_of_work() as session:
+        write_config_audit(
+            session,
+            config_type=config_type,
+            config_key=config_key,
+            action=action,
+            old_value=old_value,
+            new_value=new_value,
+            changed_by=changed_by,
+        )
+        session.flush()
+        yield session
 
 
 def get_config_service(user_id: str = "system") -> ConfigService:

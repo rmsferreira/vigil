@@ -5,6 +5,7 @@ Handles password hashing, JWT generation/validation, MFA, and session management
 """
 
 import logging
+import os
 import re
 import secrets
 import time
@@ -15,6 +16,7 @@ from typing import Any, Dict, List, Optional
 import jwt
 import pyotp
 from cryptography.fernet import MultiFernet
+from dotenv import dotenv_values
 from sqlalchemy import update
 from sqlalchemy.orm import Session
 
@@ -24,18 +26,25 @@ from core.auth import (
     principals,
     security_keys,
     session_policy,
+    trail_events,
 )
 from core.auth.identity import claim_sign_in_names, identifier_in_use, matching_accounts
-from core.config import get_settings
+from core.config import _settings_env_file, get_settings
 from core.exceptions import default_on_error
 from core.storage.models import Principal, Role, User
 from core.storage.unit_of_work import unit_of_work
+from core.teams import TeamRefused, join_for_new_account
 from core.time import utcnow
 
 logger = logging.getLogger(__name__)
 
+# The refusal reason for a password hash under a retired pepper: reset, not retry.
+PASSWORD_RESET_REQUIRED = "password_reset_required"
+
 # A person's own act (decision 9). Never held by a service account, token, or agent.
-PERSON_ONLY = frozenset({"audit.forward", "audit.manage"})
+# ledgers.erase is the same string as permissions.LEDGERS_ERASE. This module
+# cannot import that one: permissions imports AuthService.
+PERSON_ONLY = frozenset({"audit.forward", "audit.manage", "ledgers.erase"})
 
 
 def _is_person(user_id: str, session: Optional[Session]) -> bool:
@@ -89,8 +98,37 @@ key_ring.wrapping_secret()
 
 # JWT Configuration
 JWT_ALGORITHM = "HS256"
-JWT_ACCESS_EXPIRATION_MINUTES = get_settings().jwt_access_expiration_minutes
-JWT_REFRESH_EXPIRATION_DAYS = get_settings().jwt_refresh_expiration_days
+# Fixed: the host settings that used to set these are retired.
+JWT_ACCESS_EXPIRATION_MINUTES = 30
+JWT_REFRESH_EXPIRATION_DAYS = key_ring.REFRESH_EXPIRATION_DAYS
+
+
+def warn_retired_settings() -> None:
+    """Log once, at API start, each retired host setting still in the
+    environment or .env: it is ignored. ``Settings`` drops unknown names
+    silently, so this reads them itself."""
+    from core.auth import password_reset
+
+    env_file = _settings_env_file()
+    env = dict(dotenv_values(env_file)) if env_file else {}
+    env.update(os.environ)
+    names = {k.upper() for k in env}
+    for name, fixed in (
+        ("JWT_ACCESS_EXPIRATION_MINUTES", f"{JWT_ACCESS_EXPIRATION_MINUTES} minutes"),
+        ("JWT_REFRESH_EXPIRATION_DAYS", f"{JWT_REFRESH_EXPIRATION_DAYS} days"),
+        ("AUTH_MIN_ZXCVBN_SCORE", None),
+        ("PASSWORD_RESET_TTL_SECONDS", f"{password_reset.RESET_TTL_SECONDS} seconds"),
+    ):
+        if name not in names:
+            continue
+        if name == "AUTH_MIN_ZXCVBN_SCORE":
+            logger.warning(
+                "%s is ignored: set the strength score in Settings › Sessions.",
+                name,
+            )
+            continue
+        logger.warning("%s is ignored: the value is fixed at %s.", name, fixed)
+
 
 # Old codes were 8 hex characters, new ones 16
 _RECOVERY_CODE = re.compile(r"[0-9A-F]{8}|[0-9A-F]{16}")
@@ -152,18 +190,59 @@ def password_matches_any(plaintext: str, hashes) -> bool:
 
 def managers(person: str) -> list[str]:
     """Principal ids of active people, other than this one, who hold users.write."""
-    with unit_of_work() as session:
+    return [principal for principal, _, _ in _manager_rows(person)]
+
+
+def _manager_rows(
+    person: str, session: Optional[Session] = None
+) -> list[tuple[str, str, str]]:
+    """Active people other than ``person`` who hold users.write: principal, name, email.
+
+    Service accounts are never included. Pass ``session`` from a request
+    transaction so this does not open a second one."""
+    with unit_of_work(session) as session:
         users = (
-            session.query(User.user_id, User.principal_id)
+            session.query(User)
             .filter(User.is_active.is_(True), User.service_account.isnot(True))
             .all()
         )
-        return [
-            principal
-            for user_id, principal in users
-            if principal != person
-            and AuthService.check_permission(user_id, "users.write", session=session)
+        rows = [
+            (user.principal_id, user.full_name or user.username, user.email)
+            for user in users
+            if user.principal_id != person
+            and AuthService.check_permission(
+                user.user_id, "users.write", session=session
+            )
         ]
+    rows.sort(key=lambda row: (row[1].casefold(), row[2].casefold()))
+    return rows
+
+
+def dispute_line(person: str, fallback: str, session: Optional[Session] = None) -> str:
+    """The closing sentence of a notice to ``person``.
+
+    Names the account managers and their email, or ``fallback`` when this
+    person has no other account manager."""
+    contacts = _manager_rows(person, session)
+    if not contacts:
+        return fallback
+    named = ", ".join(f"{name} <{email}>" for _, name, email in contacts)
+    return f"If this wasn't you, contact {named}."
+
+
+def with_dispute(
+    person: str, message: str, fallback: str, session: Optional[Session] = None
+) -> str:
+    """``message`` with its dispute sentence resolved.
+
+    ``fallback`` is the sentence already in ``message`` (empty when the notice
+    has none today). No other account manager leaves that wording as it is."""
+    line = dispute_line(person, fallback, session)
+    if fallback:
+        return message.replace(fallback, line, 1)
+    if not line:
+        return message
+    return f"{message} {line}"
 
 
 class AuthService:
@@ -175,9 +254,13 @@ class AuthService:
         return password_hash.hash(password)
 
     @staticmethod
-    @default_on_error(False)
-    def verify_password(password: str, stored_hash: str) -> bool:
-        """Verify a password against its hash (PBKDF2, or a bcrypt from before)."""
+    @default_on_error(False, passthrough=(key_ring.KeyRingError,))
+    def verify_password(password: str, stored_hash: Optional[str]) -> bool:
+        """Verify a password against its hash (PBKDF2, or a bcrypt from before).
+        An unreadable key ring raises: it is not a wrong password. No hash (a
+        token-only service account) is a wrong password."""
+        if not stored_hash:
+            return False
         return password_hash.verify(password, stored_hash)
 
     @staticmethod
@@ -311,6 +394,16 @@ class AuthService:
                     refusal["reason"] = "locked"
                 raise_if_locked(user)
 
+                # A hash under a retired pepper can't be checked: not a wrong
+                # password, so nothing is counted and no lock is set. A service
+                # account's gateway rewrites its own at its next start.
+                if not _is_service_account(user) and password_hash.unreadable(
+                    user.password_hash
+                ):
+                    logger.warning("Password must be reset: %s", user.username)
+                    refusal["reason"] = PASSWORD_RESET_REQUIRED
+                    return None
+
                 # Verify password
                 if not AuthService.verify_password(password, user.password_hash):
                     AuthService._record_failed_attempt(user.user_id, now, source)
@@ -342,8 +435,8 @@ class AuthService:
                 logger.info(f"User authenticated successfully: {username_or_email}")
                 return user
 
-        except AccountLockedError:
-            raise
+        except (AccountLockedError, key_ring.KeyRingError):
+            raise  # an unreadable ring is a service error: no failure is counted
         except Exception as e:
             logger.error(f"Authentication error: {e}")
             refusal["reason"] = "error"
@@ -395,7 +488,9 @@ class AuthService:
                 # The count is not reset when a timed lock ends: each failure
                 # after it locks again, and LOCK_UNTIL_UNLOCKED of them in a
                 # row lock until unlocked.
-                timed = (
+                # A break-glass account's lock is always timed: a lock until
+                # unlocked would shut the way back in until someone acts.
+                timed = user.break_glass_at is not None or (
                     policy.lockout_timed
                     and user.failed_login_count < session_policy.LOCK_UNTIL_UNLOCKED
                 )
@@ -417,6 +512,9 @@ class AuthService:
                     user.username,
                 )
         if locked:
+            # After the lock committed: a lock only reduces access, so the entry is
+            # held to record late if the trail refuses, and never blocks the lock.
+            trail_events.locked(locked[0], locked[2], locked[4], locked[5])
             AuthService._tell_locked(*locked)
 
     @staticmethod
@@ -445,6 +543,18 @@ class AuthService:
         except Exception:  # noqa: BLE001 - the lock stands, so does the person's notice
             logger.exception("could not find the managers to tell about a lock")
             to_managers = []
+        person_text = (
+            f"Your account was locked at {at} after {failures} failed sign-ins "
+            f"{where}. {ends} If this was not you, tell an administrator."
+        )
+        try:
+            person_text = with_dispute(
+                principal_id,
+                person_text,
+                "If this was not you, tell an administrator.",
+            )
+        except Exception:  # noqa: BLE001 - the lock stands; today's wording still goes
+            logger.exception("could not name the managers on a lock notice")
         notices = [
             (
                 principal,
@@ -453,6 +563,7 @@ class AuthService:
                 f"{username} was locked at {at} after {failures} failed sign-ins "
                 f"{where}. {ends} Open sign-ins were not ended. Unlock it in "
                 "Settings once you have confirmed it is them.",
+                principal_id,
             )
             for principal in to_managers
         ]
@@ -461,11 +572,11 @@ class AuthService:
                 principal_id,
                 "account_locked",
                 "Your account was locked",
-                f"Your account was locked at {at} after {failures} failed sign-ins "
-                f"{where}. {ends} If this was not you, tell an administrator.",
+                person_text,
+                None,
             )
         )
-        for principal, kind, title, message in notices:
+        for principal, kind, title, message, about in notices:
             try:
                 notify(
                     principal,
@@ -476,6 +587,7 @@ class AuthService:
                         "/settings?section=users" if principal != principal_id else None
                     ),
                     priority="high",
+                    about=about,
                 )
             except Exception:  # noqa: BLE001 - one missed notice must not hide the rest
                 logger.exception("could not send a lock notice")
@@ -499,8 +611,11 @@ class AuthService:
             secret = pyotp.random_base32()
             user.mfa_secret = AuthService._encrypt_mfa_secret(secret)
             # A person with security keys keeps MFA on, and the codes issued with
-            # their first method, while the app is set up beside them.
-            if not security_keys.has_keys(session, user.principal_id):
+            # their first method, while the app is set up beside them. So does
+            # a break-glass account, with the safe's codes.
+            if user.break_glass_at is None and not security_keys.has_keys(
+                session, user.principal_id
+            ):
                 user.mfa_enabled = False
                 # Clear any stale codes from a prior setup attempt; fresh codes
                 # are issued at enable time.
@@ -549,11 +664,8 @@ class AuthService:
                         result = []
                     else:
                         user.mfa_enabled = True
-                        codes, user.mfa_recovery_codes = (
-                            AuthService._generate_recovery_codes()
-                        )
+                        result = AuthService._first_codes(user)
                         logger.info(f"MFA enabled for user: {user.username}")
-                        result = codes
             finally:
                 if failed:
                     nested.rollback()
@@ -612,15 +724,18 @@ class AuthService:
                 if not user or _account_is_locked(user):
                     return None
                 keyed = security_keys.has_keys(session, user.principal_id)
-                # With keys, a secret no code has confirmed yet (no TOTP step) is a
-                # setup in progress, not a method: it answers no login or check.
+                # A break-glass account's codes are its sign-in factor.
+                marked = user.break_glass_at is not None
+                # With keys (or the safe's codes), a secret no code has confirmed
+                # yet (no TOTP step) is a setup in progress, not a method: it
+                # answers no login or check.
                 app = bool(user.mfa_secret) and not (
-                    user.mfa_last_totp_step is None and keyed
+                    user.mfa_last_totp_step is None and (keyed or marked)
                 )
                 # A person with keys and no app has only the recovery codes to
                 # give, and only at the login step (count_failures): a check
                 # that needs a key never takes a code in its place.
-                if not app and not (keyed and count_failures):
+                if not app and not ((keyed or marked) and count_failures):
                     return None
 
                 # Try TOTP first. An undecryptable secret must not block recovery
@@ -675,6 +790,14 @@ class AuthService:
         user.mfa_secret = None
         user.mfa_last_totp_step = None
         user.mfa_enabled = True
+        return AuthService._first_codes(user)
+
+    @staticmethod
+    def _first_codes(user: User) -> list[str]:
+        """The codes a first method issues, shown once. A break-glass account's
+        are the host's, for the safe: it keeps them and none are shown."""
+        if user.break_glass_at is not None:
+            return []
         codes, user.mfa_recovery_codes = AuthService._generate_recovery_codes()
         return codes
 
@@ -918,7 +1041,7 @@ class AuthService:
             return role.permissions
 
     @staticmethod
-    @default_on_error(None)
+    @default_on_error(None, passthrough=(TeamRefused,))
     def create_user(
         username: str,
         email: str,
@@ -926,6 +1049,7 @@ class AuthService:
         full_name: str,
         role_id: str,
         session: Optional[Session] = None,
+        invite_link_id: Optional[str] = None,
     ) -> Optional[User]:
         """
         Create a new user.
@@ -937,17 +1061,20 @@ class AuthService:
             full_name: Full name
             role_id: Role ID
             session: Database session (optional)
+            invite_link_id: The invite being accepted, whose pending address
+                this account takes
 
         Returns:
-            Created User object or None
+            Created User object, or None when the username or email is in use
+            or reserved
         """
         with unit_of_work(session) as session:
             # Either string is a sign-in name, so each has to be free as a
             # username and as an email, not only in its own column.
             claim_sign_in_names(session, username, email)
-            if identifier_in_use(session, username) or identifier_in_use(
-                session, email
-            ):
+            if identifier_in_use(
+                session, username, except_link_id=invite_link_id
+            ) or identifier_in_use(session, email, except_link_id=invite_link_id):
                 logger.warning(f"User already exists: {username} or {email}")
                 return None
 
@@ -960,7 +1087,9 @@ class AuthService:
                 full_name=full_name,
                 role_id=role_id,
                 is_active=True,
-                is_verified=False,
+                # A new account's address is confirmed. Only a person's own
+                # later change leaves one unconfirmed until they use the link.
+                is_verified=True,
                 mfa_enabled=False,
                 login_count=0,
             )
@@ -971,6 +1100,7 @@ class AuthService:
             # commits.
             session.flush()
             session.refresh(user)
+            join_for_new_account(session, user.principal_id, invite_link_id)
 
             logger.info(f"User created: {username}")
             return user

@@ -52,7 +52,29 @@ COPY requirements.lock .
 RUN pip install --no-cache-dir --prefix=/install/deps -r requirements.lock
 
 # ---------------------------------------------------------------------------
-# Stage 3: runtime image
+# Stage 3: SkillSpector, the skill scanner (core.skills.skill_scan)
+# ---------------------------------------------------------------------------
+# Its own venv, run as a separate program: it pulls LangChain, boto3 and
+# yara-python, which must not mix with the backend's pinned requirements. It is
+# not on PyPI, so it is installed from git at a pinned commit (2.12.0), its
+# dependencies held to skillspector-constraints.txt. git and
+# the compilers exist only in this stage; the venv alone is copied forward.
+# The venv is built at its final path so its scripts' shebangs stay valid.
+FROM python:${PYTHON_VERSION}-slim AS skillspector
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      build-essential \
+      git \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY infra/docker/skillspector-constraints.txt /tmp/skillspector-constraints.txt
+RUN python -m venv /opt/skillspector \
+    && /opt/skillspector/bin/pip install --no-cache-dir \
+      -c /tmp/skillspector-constraints.txt \
+      "git+https://github.com/NVIDIA/skillspector.git@c81615007d40e86051a302a3cf897f8a05264928"
+
+# ---------------------------------------------------------------------------
+# Stage 4: runtime image
 # ---------------------------------------------------------------------------
 FROM python:${PYTHON_VERSION}-slim AS runtime
 
@@ -101,6 +123,18 @@ RUN set -eu; \
     apt-get autoremove -y; \
     rm -rf /var/lib/apt/lists/*
 
+# OCR's English language data (core/documents/extract.py). LiteParse otherwise
+# fetches it on first use, which fails with no route out. Root-owned and outside
+# HOME, which a Helm pod may not share. tessdata_best pinned by commit and sha256.
+ENV TESSDATA_PREFIX=/usr/share/vigil/tessdata
+RUN set -eu; \
+    mkdir -p "$TESSDATA_PREFIX"; \
+    curl -fsSL -o "$TESSDATA_PREFIX/eng.traineddata" \
+      https://raw.githubusercontent.com/tesseract-ocr/tessdata_best/e12c65a915945e4c28e237a9b52bc4a8f39a0cec/eng.traineddata; \
+    echo "8280aed0782fe27257a68ea10fe7ef324ca0f8d85bd2fd145d1c2b560bcb66ba  $TESSDATA_PREFIX/eng.traineddata" | sha256sum -c -; \
+    chmod 0755 "$TESSDATA_PREFIX"; \
+    chmod 0644 "$TESSDATA_PREFIX/eng.traineddata"
+
 # Non-root user (matching UID/GID 1000 from podSecurityContext in Helm chart)
 RUN groupadd -g 1000 vigil && useradd -u 1000 -g 1000 -d /home/vigil -m -s /sbin/nologin vigil
 
@@ -108,6 +142,10 @@ WORKDIR /app
 
 # Installed Python packages from the deps stage
 COPY --from=python-deps /install/deps /usr/local
+
+# The skill scanner's venv. Same base image and Python as the runtime, so its
+# interpreter symlink resolves here too.
+COPY --from=skillspector /opt/skillspector /opt/skillspector
 
 # Application source — copy each top-level package separately so
 # modifying one doesn't bust the cache for all the others.
@@ -143,10 +181,13 @@ RUN if [ -n "${VIGIL_VERSION}" ]; then echo "${VIGIL_VERSION}" > /app/VERSION; f
 
 USER vigil
 
+# The image ships the skill scanner, so scanning is on here; elsewhere the
+# setting defaults to off (core/config.py).
 ENV HOME=/home/vigil \
     PYTHONPATH=/app \
     PYTHONUNBUFFERED=1 \
-    PORT=6987
+    PORT=6987 \
+    VIGIL_SKILL_SCANNER=/opt/skillspector/bin/skillspector
 
 EXPOSE 6987
 

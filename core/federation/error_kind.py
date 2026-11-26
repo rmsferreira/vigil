@@ -83,7 +83,52 @@ def _one(exc: BaseException) -> Optional[str]:
         return _from_status(getattr(exc, "status_code", None))
     if names & {"EndpointConnectionError", "ConnectTimeoutError", "ReadTimeoutError"}:
         return "network"  # botocore
+    # aiokafka / kafka-python, matched by name so a missing client does not
+    # import it here.
+    if names & {
+        "KafkaConnectionError",
+        "NoBrokersAvailable",
+        "KafkaTimeoutError",
+        "KafkaUnavailableError",
+        "NodeNotReadyError",
+        "RequestTimedOutError",
+        "BrokerNotAvailableError",
+    }:
+        return "network"
+    if names & {
+        "UnknownTopicOrPartitionError",
+        "InvalidTopicError",
+        "KafkaConfigurationError",
+    }:
+        return "config"
+    if names & {
+        "AuthenticationFailedError",
+        "SaslAuthenticationFailed",
+        "TopicAuthorizationFailedError",
+        "GroupAuthorizationFailedError",
+        "ClusterAuthorizationFailedError",
+    }:
+        return "auth"
+    if "QuotaViolationError" in names:
+        return "quota"
     return None
+
+
+def kind_of(exc: Optional[BaseException] = None, status: Optional[int] = None) -> str:
+    """One of :data:`KINDS` from an exception, else from an HTTP status.
+
+    A status the exception does not carry (a client that kept the code on
+    itself) still counts. Message text is not read.
+    """
+    if status is None and exc is not None:
+        carried = getattr(exc, "status_code", None)
+        if isinstance(carried, int):
+            status = carried
+    if exc is not None:
+        found = classify_failure(exc)
+        if found != "unknown":
+            return found
+    return _from_status(status) or "unknown"
 
 
 def classify_failure(exc: BaseException) -> str:

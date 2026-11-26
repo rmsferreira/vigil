@@ -252,6 +252,31 @@ class CaseWatcher(Base):
     )
 
 
+class CaseFindingRemoval(Base):
+    """A finding a person took off a Case, so intake does not join it back (#4682).
+
+    Written when an update unlinks the finding and cleared when it is linked
+    again. ``finding_id`` has no foreign key: the row does not depend on the
+    finding's retention.
+    """
+
+    __tablename__ = "case_finding_removals"
+
+    case_id: Mapped[str] = mapped_column(
+        String(50), ForeignKey("cases.case_id", ondelete="CASCADE"), primary_key=True
+    )
+    finding_id: Mapped[str] = mapped_column(String(50), primary_key=True)
+    # Naive UTC, as everywhere else (core/time.py).
+    removed_at: Mapped[datetime] = mapped_column(
+        DateTime,
+        nullable=False,
+        default=utcnow,
+        server_default=text("(now() AT TIME ZONE 'utc')"),
+    )
+
+    __table_args__ = (Index("idx_case_finding_removals_finding", "finding_id"),)
+
+
 class CaseEvidence(Base):
     """
     Case Evidence - Tracks evidence and artifacts for cases.
@@ -720,8 +745,11 @@ class CaseClosureInfo(Base):
     recommendations: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     recurrence_prevention: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
-    # False positive details
+    # False positive details. The reason is free text. The cause is one of
+    # FalsePositiveCause, or null when none was stated or the category is not
+    # false_positive. A reopen clears the cause with the category.
     false_positive_reason: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    false_positive_cause: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
     # Summary
     executive_summary: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
@@ -743,6 +771,12 @@ class CaseClosureInfo(Base):
     closed_at: Mapped[datetime] = mapped_column(
         DateTime, nullable=False, default=utcnow, server_default=text("now()")
     )
+    # Set when an agent false-positive close is drawn into the sample (one in
+    # twenty). A later close does not draw again; a reopen clears it.
+    sampled_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    # Whether the person who closed it opened the evidence. Null on an agent
+    # close and when the person left the field out.
+    evidence_opened: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True)
 
 
 class CaseEscalation(Base):
@@ -868,7 +902,7 @@ class CaseNotification(Base):
     # Notification details
     notification_type: Mapped[str] = mapped_column(
         String(50), nullable=False
-    )  # case_assigned, comment_mention, sla_warning, escalation, etc.
+    )  # comment_mention, new_comment, intake_surge, etc.
     title: Mapped[str] = mapped_column(String(200), nullable=False)
     message: Mapped[str] = mapped_column(Text, nullable=False)
 

@@ -1,17 +1,24 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState, type KeyboardEvent } from 'react'
 import { Link, useNavigate } from 'react-router-dom'
-import { Icon } from '../../shared/icons'
+import { Icon, type IconName } from '../../shared/icons'
 import '../../shared/kit.css'
 import {
   ConfirmDialog,
   Field,
+  OverlayPortal,
   Popup,
   Select,
   SettingsCard,
   TextInput,
 } from '../../shared/ui'
 import { useAuth } from '../../contexts/AuthContext'
-import { signInsApi } from '../../services/api'
+import { directoryPushesApi, signInsApi } from '../../services/api'
+import DirectoryPushesCard from './DirectoryPushesCard'
+import InvitesCard from './InvitesCard'
+import TeamsCard from './TeamsCard'
+import { CONFIRMED_BY, CompromiseBox, ResetLinkDialog } from './RecoveryDialogs'
+import ServiceAccountsCard from './ServiceAccountsCard'
+import SsoCard from './SsoCard'
 import TokensCard from './TokensCard'
 import UserMethodsDialog from './UserMethodsDialog'
 import UserSignInsDialog from './UserSignInsDialog'
@@ -19,6 +26,7 @@ import {
   useUsers,
   type AccountFilter,
   type AccountStatus,
+  type MfaMethodType,
   type Role,
   type RolePayload,
   type RolesMeta,
@@ -30,7 +38,6 @@ import type { SectionProps } from './types'
 const EMPTY_FORM: UserPayload = {
   username: '',
   email: '',
-  password: '',
   full_name: '',
   role_id: '',
 }
@@ -38,6 +45,40 @@ const EMPTY_FORM: UserPayload = {
 // mirrors what the backend's Pydantic EmailStr accepts, so this fails fast
 // inline instead of round-tripping to a 422
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/
+
+function mfaTypeLabel(type: MfaMethodType): string {
+  switch (type) {
+    case 'authenticator_app':
+      return 'Authenticator app'
+    case 'security_key':
+      return 'Security key'
+    case 'recovery_codes':
+      return 'Recovery codes'
+    default: {
+      const unexpected: never = type
+      return unexpected
+    }
+  }
+}
+
+function mfaMarks(u: User) {
+  // An account that signs in only through SSO, with no Vigil method, stays "At provider".
+  if (u.has_sso && !u.has_password && u.mfa_method_types.length === 0) {
+    return (
+      <span className="status dropped" title="Two-step sign-in is up to the SSO provider">
+        At provider
+      </span>
+    )
+  }
+  if (u.mfa_method_types.length === 0) {
+    return <span className="chip">None</span>
+  }
+  return u.mfa_method_types.map((type) => (
+    <span className="chip" key={type}>
+      {mfaTypeLabel(type)}
+    </span>
+  ))
+}
 
 function errText(e: unknown, fallback: string): string {
   const detail = (e as { response?: { data?: { detail?: unknown } } })?.response?.data?.detail
@@ -58,7 +99,9 @@ export default function UsersSection({ notify }: SectionProps) {
   const { hasPermission } = useAuth()
   return (
     <>
+      {hasPermission('roles.manage') && <SsoCard notify={notify} />}
       <PeopleAndRoles notify={notify} />
+      {hasPermission('users.read') && <ServiceAccountsCard notify={notify} canWrite={hasPermission('users.write')} />}
       <TokensCard notify={notify} canManage={hasPermission('users.write')} />
     </>
   )
@@ -82,12 +125,12 @@ function PeopleAndRoles({ notify }: SectionProps) {
   const {
     users,
     total,
+    restrictedNoReader,
     roles,
     rolesMeta,
     phase,
     error,
     reload,
-    createUser,
     updateUser,
     deleteUser,
     changeStatus,
@@ -106,6 +149,7 @@ function PeopleAndRoles({ notify }: SectionProps) {
   const [dialogError, setDialogError] = useState('')
   const [saving, setSaving] = useState(false)
   const [confirmDelete, setConfirmDelete] = useState<User | null>(null)
+  const [removeOf, setRemoveOf] = useState<User | null>(null)
   const [deleting, setDeleting] = useState(false)
   const [signInsOf, setSignInsOf] = useState<User | null>(null)
   const [methodsOf, setMethodsOf] = useState<User | null>(null)
@@ -114,7 +158,10 @@ function PeopleAndRoles({ notify }: SectionProps) {
   const [signingOut, setSigningOut] = useState(false)
   const [unlockOf, setUnlockOf] = useState<User | null>(null)
   const [confirmedBy, setConfirmedBy] = useState('')
+  const [unlockReason, setUnlockReason] = useState('')
   const [unlocking, setUnlocking] = useState(false)
+  const [unlockCompromise, setUnlockCompromise] = useState(false)
+  const [resetOf, setResetOf] = useState<User | null>(null)
   const [statusAct, setStatusAct] = useState<{ user: User; act: StatusAct } | null>(null)
   const [acting, setActing] = useState(false)
 
@@ -144,14 +191,16 @@ function PeopleAndRoles({ notify }: SectionProps) {
     const r = roles.find((x) => x.role_id === id)
     return r ? roleLabel(r) : id
   }
-  const roleOptions = roles.map((r) => ({
-    value: r.role_id,
-    label: r.description ? `${roleLabel(r)} — ${r.description}` : roleLabel(r),
-  }))
+  const roleOptions = roles
+    .filter((r) => !r.reserved || r.role_id === form.role_id)
+    .map((r) => ({
+      value: r.role_id,
+      label: r.description ? `${roleLabel(r)} — ${r.description}` : roleLabel(r),
+    }))
   // A kept legacy role is never the default for a new account.
   const defaultRoleId =
     roles.find((r) => r.role_id === 'role-viewer')?.role_id ??
-    roles.find((r) => r.kind !== 'legacy')?.role_id ??
+    roles.find((r) => r.kind !== 'legacy' && !r.reserved)?.role_id ??
     roles[0]?.role_id
   const editingMedic = !!editing?.managed_by_medic
 
@@ -184,13 +233,15 @@ function PeopleAndRoles({ notify }: SectionProps) {
   }
 
   const handleUnlock = async () => {
-    if (!unlockOf || !confirmedBy) return
+    if (!unlockOf || !confirmedBy || !unlockReason.trim()) return
     setUnlocking(true)
     try {
-      await signInsApi.unlock(unlockOf.user_id, confirmedBy)
-      notify('ok', `Unlocked ${unlockOf.username}.`)
+      await signInsApi.unlock(unlockOf.user_id, confirmedBy, unlockReason.trim(), unlockCompromise)
+      notify('ok', `Unlocked ${unlockOf.username}.${unlockCompromise ? ' Their API tokens were revoked.' : ''}`)
       setUnlockOf(null)
       setConfirmedBy('')
+      setUnlockReason('')
+      setUnlockCompromise(false)
       reload()
     } catch (e) {
       notify('err', errText(e, 'Failed to unlock'))
@@ -199,23 +250,11 @@ function PeopleAndRoles({ notify }: SectionProps) {
     }
   }
 
-  const openCreate = () => {
-    if (roles.length === 0) {
-      notify('err', 'Roles not loaded yet — try Refresh.')
-      return
-    }
-    setEditing(null)
-    setForm({ ...EMPTY_FORM, role_id: defaultRoleId })
-    setDialogError('')
-    setDialogOpen(true)
-  }
-
   const openEdit = (u: User) => {
     setEditing(u)
     setForm({
       username: u.username,
       email: u.email,
-      password: '',
       full_name: u.full_name,
       role_id: u.role_id,
     })
@@ -224,12 +263,6 @@ function PeopleAndRoles({ notify }: SectionProps) {
   }
 
   const validate = (): string | null => {
-    if (!editing) {
-      if (!form.username.trim()) return 'Username is required'
-      // Length and strength are the server's policy. A copy of those numbers
-      // here would drift from a deployment's session policy.
-      if (!form.password) return 'Enter a password.'
-    }
     if (!form.full_name.trim()) return 'Full name is required'
     if (!form.email.trim()) return 'Email is required'
     if (!EMAIL_RE.test(form.email.trim())) return 'Enter a valid email address'
@@ -247,18 +280,14 @@ function PeopleAndRoles({ notify }: SectionProps) {
     setDialogError('')
     try {
       const email = form.email.trim()
-      if (editing) {
-        await updateUser(editing.user_id, {
-          full_name: form.full_name,
-          email,
-          // Medic's account is not reassigned; the server refuses it too.
-          ...(editingMedic ? {} : { role_id: form.role_id }),
-        })
-        notify('ok', `Updated ${form.username || editing.username}.`)
-      } else {
-        await createUser({ ...form, email })
-        notify('ok', `Created ${form.username}.`)
-      }
+      if (!editing) return
+      await updateUser(editing.user_id, {
+        full_name: form.full_name,
+        email,
+        // Medic's account is not reassigned; the server refuses it too.
+        ...(editingMedic ? {} : { role_id: form.role_id }),
+      })
+      notify('ok', `Updated ${form.username || editing.username}.`)
       setDialogOpen(false)
     } catch (e) {
       setDialogError(errText(e, 'Failed to save user'))
@@ -303,6 +332,21 @@ function PeopleAndRoles({ notify }: SectionProps) {
     }
   }
 
+  const handleRemove = async () => {
+    if (!removeOf) return
+    setDeleting(true)
+    try {
+      await directoryPushesApi.removeUnused(removeOf.user_id)
+      notify('ok', `Removed ${removeOf.username}. Its username and email are free for the next push.`)
+      setRemoveOf(null)
+      reload()
+    } catch (e) {
+      notify('err', errText(e, 'Failed to remove'))
+    } finally {
+      setDeleting(false)
+    }
+  }
+
   return (
     <>
       <SettingsCard
@@ -319,14 +363,18 @@ function PeopleAndRoles({ notify }: SectionProps) {
                 <Icon name="logout" /> Sign everyone out
               </button>
             )}
-            {canWrite && (
-              <button className="btn primary" onClick={openCreate}>
-                <Icon name="plus" /> Add User
-              </button>
-            )}
           </>
         }
       >
+        {restrictedNoReader > 0 && (
+          <div className="settings-banner warn mb-3" role="status">
+            <Icon name="alert" size={14} />
+            <span className="min-w-0">
+              {restrictedNoReader} restricted case{restrictedNoReader === 1 ? ' has' : 's have'} no active reader. An operator on the
+              host can list them and name a reader with <code>python -m core.auth.recover_admin --unread-cases</code>.
+            </span>
+          </div>
+        )}
         <div className="flex items-center gap-2.5 flex-wrap mb-3">
           <div className="search">
             <Icon name="search" />
@@ -353,14 +401,12 @@ function PeopleAndRoles({ notify }: SectionProps) {
             <thead>
               <tr>
                 <th style={{ minWidth: 'var(--col-main-min)' }}>
-                  Username
-                  <span className="col-low-note">Full name, MFA and last login are hidden while Ask Vigil is open</span>
+                  Account
+                  <span className="col-low-note">Last login is hidden while Ask Vigil is open</span>
                 </th>
-                <th className="col-low">Full Name</th>
-                <th>Email</th>
                 <th>Role</th>
+                <th>Sign-in &amp; MFA</th>
                 <th>Status</th>
-                <th className="col-low">MFA</th>
                 <th className="col-low">Last Login</th>
                 <th className="col-act" style={{ textAlign: 'right' }}>Actions</th>
               </tr>
@@ -368,29 +414,44 @@ function PeopleAndRoles({ notify }: SectionProps) {
             <tbody>
               {users.length === 0 && (
                 <tr>
-                  <td colSpan={8} className="muted" style={{ textAlign: 'center', padding: '28px 0' }}>
+                  <td colSpan={6} className="muted" style={{ textAlign: 'center', padding: '28px 0' }}>
                     {search.trim() || statusFilter !== 'current' ? 'No accounts match.' : 'No users found.'}
                   </td>
                 </tr>
               )}
               {users.map((u) => (
                 <tr key={u.user_id}>
-                  <td>{u.username}</td>
-                  <td className="col-low" style={{ whiteSpace: 'normal' }}>
-                    <span className="line-clamp-2 break-words" title={u.full_name}>
-                      {u.full_name}
-                    </span>
+                  <td className="cell-wrap">
+                    {/* full name over username · email; with no full name, the username leads */}
+                    <div className="cell-clamp" title={u.full_name?.trim() || u.username}>
+                      {u.full_name?.trim() || u.username}
+                    </div>
+                    <div className="muted cell-clamp" title={u.status === 'erased' ? undefined : u.email}>
+                      {u.full_name?.trim() && `${u.username} · `}
+                      {/* an erased account's email is an opaque placeholder */}
+                      {u.status === 'erased' ? '—' : u.email}
+                    </div>
                   </td>
-                  {/* an erased account's email is an opaque placeholder */}
-                  <td className="muted">{u.status === 'erased' ? '—' : u.email}</td>
                   <td>
                     <div className="flex flex-col items-start gap-1">
                       <span className="chip">{roleName(u.role_id)}</span>
+                      {u.break_glass && (
+                        <span className="chip" title="Marked break-glass at the host">Break-glass</span>
+                      )}
                       {u.principal_kind === 'service_account' && (
                         <span className="text-xs text-tx-3 whitespace-nowrap">
                           {u.managed_by_medic ? 'Managed by Medic' : 'Service account'}
                         </span>
                       )}
+                    </div>
+                  </td>
+                  <td style={{ whiteSpace: 'normal' }}>
+                    <div className="flex flex-wrap items-center gap-1.5 max-w-72">
+                      {u.has_sso && <span className="chip sel">SSO</span>}
+                      {u.has_password && <span className="chip">Password</span>}
+                      {u.principal_kind === 'service_account' && !u.has_password && <span className="chip">Token only</span>}
+                      {!u.has_sso && !u.has_password && u.principal_kind !== 'service_account' && <span className="muted">—</span>}
+                      {mfaMarks(u)}
                     </div>
                   </td>
                   <td>
@@ -400,7 +461,16 @@ function PeopleAndRoles({ notify }: SectionProps) {
                     </span>
                     {u.status === 'locked' && (
                       <div className="text-xs text-tx-3 mt-1" title={lockedFrom(u)}>
-                        <Icon name="lock" size={11} /> {u.locked_until ? 'Until ' + new Date(u.locked_until).toLocaleString() : 'Until unlocked'}
+                        <Icon name="lock" size={11} /> {u.locked_until ? 'Until ' + lockEnd(u.locked_until) : 'Until unlocked'}
+                      </div>
+                    )}
+                    {u.status === 'deactivated' && u.deactivation_route && (
+                      <div className="text-xs text-tx-3 mt-1 break-words">
+                        {u.deactivation_route === 'sync'
+                          ? 'Directory sync'
+                          : u.deactivation_route === 'dormancy'
+                            ? 'Dormancy'
+                            : 'By a person'}
                       </div>
                     )}
                     {u.status === 'active' && u.deactivating_at && (
@@ -409,61 +479,45 @@ function PeopleAndRoles({ notify }: SectionProps) {
                       </div>
                     )}
                   </td>
-                  <td className="col-low">
-                    <span className={`status ${u.mfa_enabled ? 'closed' : 'open'}`}>
-                      {u.mfa_enabled ? 'Enabled' : 'Disabled'}
-                    </span>
-                  </td>
                   <td className="muted col-low">
                     {u.last_login ? new Date(u.last_login).toLocaleDateString() : 'Never'}
                   </td>
                   <td className="col-act" style={{ textAlign: 'right' }}>
-                    <div className="inline-flex gap-1.5">
-                      {canWrite && live(u) && covers(u.role_id) && u.user_id !== me?.user_id && (
-                        <button className="btn ghost icon" title="Sign-ins" onClick={() => setSignInsOf(u)}>
-                          <Icon name="clock" size={15} />
-                        </button>
-                      )}
-                      {canWrite && live(u) && covers(u.role_id) && u.user_id !== me?.user_id && (
-                        <button className="btn ghost icon" title="Sign-in methods" onClick={() => setMethodsOf(u)}>
-                          <Icon name="shield" size={15} />
-                        </button>
-                      )}
-                      {canWrite && u.status === 'locked' && covers(u.role_id) && u.user_id !== me?.user_id && (
-                        <button className="btn ghost icon" title="Unlock" onClick={() => setUnlockOf(u)}>
-                          <Icon name="lock" size={15} />
-                        </button>
-                      )}
-                      {canWrite && (live(u) || u.status === 'deactivated') && (
-                        <button className="btn ghost icon" title="Edit" onClick={() => openEdit(u)}>
-                          <Icon name="edit" size={15} />
-                        </button>
-                      )}
-                      {canWrite && live(u) && covers(u.role_id) && u.user_id !== me?.user_id && (
-                        <button className="btn ghost icon" title="Deactivate" onClick={() => setStatusAct({ user: u, act: 'deactivate' })}>
-                          <Icon name="pause" size={15} />
-                        </button>
-                      )}
-                      {canWrite && u.status === 'deactivated' && covers(u.role_id) && (
-                        <button className="btn ghost icon" title="Reactivate" onClick={() => setStatusAct({ user: u, act: 'reactivate' })}>
-                          <Icon name="play" size={15} />
-                        </button>
-                      )}
-                      {canDelete && u.status === 'deleted' && covers(u.role_id) && (
-                        <button className="btn ghost icon" title="Restore" onClick={() => setStatusAct({ user: u, act: 'restore' })}>
-                          <Icon name="refresh" size={15} />
-                        </button>
-                      )}
-                      {canDelete && (live(u) || u.status === 'deactivated') && (
-                        <button
-                          className="btn ghost icon"
-                          title="Delete"
-                          onClick={() => setConfirmDelete(u)}
-                        >
-                          <Icon name="trash" size={15} />
-                        </button>
-                      )}
-                    </div>
+                    {(() => {
+                      // Edit stays on the row; the rest share one ⋯ menu so the table fits its card
+                      const other = canWrite && covers(u.role_id) && u.user_id !== me?.user_id
+                      const items: RowItem[] = []
+                      if (other && live(u)) {
+                        items.push({ label: 'Sign-ins', icon: 'clock', onSelect: () => setSignInsOf(u) })
+                        items.push({ label: 'Sign-in methods', icon: 'shield', onSelect: () => setMethodsOf(u) })
+                      }
+                      if (other && u.status === 'locked') items.push({ label: 'Unlock', icon: 'lock', onSelect: () => setUnlockOf(u) })
+                      if (other && u.status === 'active' && u.principal_kind !== 'service_account') {
+                        items.push({ label: 'Reset password', icon: 'key', onSelect: () => setResetOf(u) })
+                      }
+                      if (other && live(u)) items.push({ label: 'Deactivate', icon: 'pause', onSelect: () => setStatusAct({ user: u, act: 'deactivate' }) })
+                      if (canWrite && u.status === 'deactivated' && covers(u.role_id)) {
+                        items.push({ label: 'Reactivate', icon: 'play', onSelect: () => setStatusAct({ user: u, act: 'reactivate' }) })
+                      }
+                      if (canDelete && u.status === 'deleted' && covers(u.role_id)) {
+                        items.push({ label: 'Restore', icon: 'refresh', onSelect: () => setStatusAct({ user: u, act: 'restore' }) })
+                      }
+                      if (canDelete && (live(u) || u.status === 'deactivated')) items.push({ label: 'Delete', icon: 'trash', onSelect: () => setConfirmDelete(u) })
+                      // a pushed account nobody used: its names go back to the provider
+                      if (canDelete && u.unused_sync && covers(u.role_id) && (live(u) || u.status === 'deactivated')) {
+                        items.push({ label: 'Remove unused account', icon: 'close', onSelect: () => setRemoveOf(u) })
+                      }
+                      return (
+                        <div className="inline-flex gap-1.5">
+                          {canWrite && (live(u) || u.status === 'deactivated') && (
+                            <button className="btn ghost icon" title="Edit" aria-label={`Edit ${u.username}`} onClick={() => openEdit(u)}>
+                              <Icon name="edit" size={15} />
+                            </button>
+                          )}
+                          {items.length > 0 && <RowMenu label={`More actions for ${u.username}`} items={items} />}
+                        </div>
+                      )
+                    })()}
                   </td>
                 </tr>
               ))}
@@ -487,7 +541,7 @@ function PeopleAndRoles({ notify }: SectionProps) {
         <Popup
           open={dialogOpen}
           onClose={() => setDialogOpen(false)}
-          title={editing ? 'Edit User' : 'Create New User'}
+          title="Edit User"
           width={460}
         >
           <div className="flex flex-col gap-3.5">
@@ -516,15 +570,6 @@ function PeopleAndRoles({ notify }: SectionProps) {
                 onChange={(e) => setForm({ ...form, email: e.target.value })}
               />
             </Field>
-            {!editing && (
-              <Field label="Password" hint="A few unrelated words make a strong one.">
-                <TextInput
-                  type="password"
-                  value={form.password}
-                  onChange={(e) => setForm({ ...form, password: e.target.value })}
-                />
-              </Field>
-            )}
             <Field
               label="Role"
               hint={
@@ -548,13 +593,27 @@ function PeopleAndRoles({ notify }: SectionProps) {
                 Cancel
               </button>
               <button className="btn primary" onClick={handleSave} disabled={saving}>
-                {saving ? 'Saving…' : editing ? 'Update' : 'Create'}
+                {saving ? 'Saving…' : 'Update'}
               </button>
             </div>
           </div>
         </Popup>
 
-        {methodsOf && <UserMethodsDialog user={methodsOf} onClose={() => setMethodsOf(null)} />}
+        {methodsOf && (
+          <UserMethodsDialog
+            user={methodsOf}
+            notify={notify}
+            canReset={methodsOf.principal_kind !== 'service_account'}
+            onClose={() => setMethodsOf(null)}
+            onReset={reload}
+            onResetPassword={() => {
+              setResetOf(methodsOf)
+              setMethodsOf(null)
+            }}
+          />
+        )}
+
+        {resetOf && <ResetLinkDialog user={resetOf} notify={notify} onClose={() => setResetOf(null)} />}
 
         {signInsOf && (
           <UserSignInsDialog user={signInsOf} onClose={() => setSignInsOf(null)} notify={notify} />
@@ -594,8 +653,16 @@ function PeopleAndRoles({ notify }: SectionProps) {
             <div className="flex flex-col gap-3.5">
               <span>
                 {unlockOf?.username} {unlockOf?.locked_at ? lockedFrom(unlockOf) : 'is locked.'} Unlocking lets them
-                sign in again and starts their failure count over. Confirm it is them first.
+                sign in again, starts their failure count over, and ends their open sign-ins. Confirm it is them first.
               </span>
+              <Field label="Reason" hint="Kept in the audit trail.">
+                <TextInput
+                  maxLength={500}
+                  value={unlockReason}
+                  disabled={unlocking}
+                  onChange={(e) => setUnlockReason(e.target.value)}
+                />
+              </Field>
               <Field label="How you confirmed it is them" hint="Kept in the audit trail.">
                 <Select
                   value={confirmedBy}
@@ -605,13 +672,20 @@ function PeopleAndRoles({ notify }: SectionProps) {
                   onSelect={setConfirmedBy}
                 />
               </Field>
+              <CompromiseBox checked={unlockCompromise} disabled={unlocking} onChange={setUnlockCompromise} />
             </div>
           }
           confirmLabel="Unlock"
           busy={unlocking}
-          confirmDisabled={!confirmedBy}
+          confirmDisabled={!confirmedBy || !unlockReason.trim()}
           onConfirm={handleUnlock}
-          onClose={() => !unlocking && setUnlockOf(null)}
+          onClose={() => {
+            if (unlocking) return
+            setUnlockOf(null)
+            setConfirmedBy('')
+            setUnlockReason('')
+            setUnlockCompromise(false)
+          }}
         />
 
         <ConfirmDialog
@@ -651,7 +725,37 @@ function PeopleAndRoles({ notify }: SectionProps) {
           onConfirm={handleDelete}
           onClose={() => setConfirmDelete(null)}
         />
+
+        <ConfirmDialog
+          open={!!removeOf}
+          title={removeOf ? `Remove ${removeOf.username}?` : ''}
+          body={
+            <span>
+              Directory sync created this account and nobody has used it. Removing it can’t be undone: its username and
+              email are freed, its link to the provider goes, and it is deactivated. The provider’s next push of this
+              person creates a new account.
+            </span>
+          }
+          confirmLabel="Remove"
+          busy={deleting}
+          onConfirm={handleRemove}
+          onClose={() => !deleting && setRemoveOf(null)}
+        />
       </SettingsCard>
+
+      {canWrite && <DirectoryPushesCard notify={notify} onChanged={reload} />}
+
+      <TeamsCard notify={notify} />
+
+      {canWrite && (
+        <InvitesCard
+          notify={notify}
+          // only roles the caller may hand out; the server checks the same rule
+          roleOptions={roleOptions.filter((o) => covers(o.value))}
+          roleName={roleName}
+          defaultRoleId={defaultRoleId}
+        />
+      )}
 
       <RolesCard
         roles={roles}
@@ -680,6 +784,111 @@ const ACT_BODY: Record<StatusAct, string> = {
   deactivate: 'Their sign-ins end and every token they hold is revoked. Reactivating later keeps their password and two-step sign-in, but not the tokens.',
   reactivate: 'They can sign in again with their password and two-step sign-in, and are told. Their old tokens stay revoked: new tokens must be minted.',
   restore: 'The account comes back deactivated, with its password and two-step sign-in, and they are told. Its tokens stay revoked. Reactivate it to let them sign in.',
+}
+
+type RowItem = { label: string; icon: IconName; onSelect: () => void }
+
+/** A row's ⋯ menu. Fixed and portaled, as UserMenu's, so the table's scroll box can't clip it.
+    Arrows, Tab, Home and End move between items; Escape closes and returns focus to ⋯. */
+function RowMenu({ label, items }: { label: string; items: RowItem[] }) {
+  const [pos, setPos] = useState<{ right: number; maxHeight: number; top?: number; bottom?: number } | null>(null)
+  const btn = useRef<HTMLButtonElement>(null)
+  const menu = useRef<HTMLDivElement>(null)
+
+  useEffect(() => {
+    if (!pos) return
+    menu.current?.querySelector<HTMLElement>('[role="menuitem"]')?.focus({ preventScroll: true })
+    const onDoc = (e: MouseEvent) => {
+      const t = e.target as Node
+      if (!btn.current?.contains(t) && !menu.current?.contains(t)) setPos(null)
+    }
+    // fixed to where ⋯ was: once the page or the table scrolls, it would float off its row (not, say, Ask Vigil's thread)
+    const onScroll = (e: Event) => {
+      const t = e.target as Node
+      if (t === document || t.contains(btn.current)) setPos(null)
+    }
+    const shut = () => setPos(null)
+    document.addEventListener('mousedown', onDoc)
+    window.addEventListener('scroll', onScroll, true)
+    window.addEventListener('resize', shut)
+    return () => {
+      document.removeEventListener('mousedown', onDoc)
+      window.removeEventListener('scroll', onScroll, true)
+      window.removeEventListener('resize', shut)
+    }
+  }, [pos])
+
+  const toggle = () => {
+    if (pos) return setPos(null)
+    const r = btn.current!.getBoundingClientRect()
+    const right = Math.max(8, window.innerWidth - r.right)
+    const below = window.innerHeight - r.bottom - 12
+    const above = r.top - 12
+    // opens upward when the list doesn't fit below and there is more room above; scrolls when neither fits
+    setPos(
+      below < items.length * 36 + 24 && above > below
+        ? { right, bottom: window.innerHeight - r.top + 4, maxHeight: above }
+        : { right, top: r.bottom + 4, maxHeight: below },
+    )
+  }
+
+  const onKey = (e: KeyboardEvent<HTMLDivElement>) => {
+    const all = [...(menu.current?.querySelectorAll<HTMLElement>('[role="menuitem"]') ?? [])]
+    const at = all.indexOf(document.activeElement as HTMLElement)
+    const go = (i: number) => all[(i + all.length) % all.length]?.focus()
+    if (e.key === 'Escape') {
+      setPos(null)
+      btn.current?.focus()
+    } else if (e.key === 'ArrowDown' || (e.key === 'Tab' && !e.shiftKey)) go(at + 1)
+    else if (e.key === 'ArrowUp' || (e.key === 'Tab' && e.shiftKey)) go(at - 1)
+    else if (e.key === 'Home') go(0)
+    else if (e.key === 'End') go(all.length - 1)
+    else return
+    e.preventDefault()
+    e.stopPropagation()
+  }
+
+  return (
+    <>
+      <button
+        ref={btn}
+        className="btn ghost icon"
+        title="More actions"
+        aria-label={label}
+        aria-haspopup="menu"
+        aria-expanded={!!pos}
+        onClick={toggle}
+      >
+        <Icon name="more" size={15} />
+      </button>
+      {pos && (
+        <OverlayPortal>
+          <div
+            ref={menu}
+            className="user-pop"
+            role="menu"
+            aria-label={label}
+            onKeyDown={onKey}
+            style={{ position: 'fixed', ...pos, zIndex: 80, width: 'auto', minWidth: 190 }}
+          >
+            {items.map((it) => (
+              <button
+                key={it.label}
+                role="menuitem"
+                onClick={() => {
+                  setPos(null)
+                  btn.current?.focus() // the dialog it opens returns focus here
+                  it.onSelect()
+                }}
+              >
+                <Icon name={it.icon} size={14} /> {it.label}
+              </button>
+            ))}
+          </div>
+        </OverlayPortal>
+      )}
+    </>
+  )
 }
 
 const STATUS_LABEL: Record<AccountStatus, string> = {
@@ -714,7 +923,14 @@ const live = (u: User) => u.status === 'active' || u.status === 'locked'
 
 /** What the account owns that someone has to pick up, linked to Cases filtered to it. */
 function OpenCases({ user }: { user: User }) {
-  if (!user.open_cases) return <span className="text-tx-3">They own no open cases.</span>
+  const hidden = user.open_cases_hidden ?? 0
+  // restricted cases the viewer can't read: counted, never linked
+  const hiddenNote = hidden > 0 && ` ${hidden} more restricted ${hidden === 1 ? 'case is' : 'cases are'} hidden.`
+  if (!user.open_cases) {
+    return hidden > 0
+      ? <span>They own no open cases you can see.{hiddenNote}</span>
+      : <span className="text-tx-3">They own no open cases.</span>
+  }
   const n = user.open_cases
   return (
     <span>
@@ -722,17 +938,20 @@ function OpenCases({ user }: { user: User }) {
       <Link className="underline" to={`/cases?owner=${encodeURIComponent(user.username)}`}>
         {n} open case{n === 1 ? '' : 's'}
       </Link>
-      . Reassign {n === 1 ? 'it' : 'them'}.
+      . Reassign {n === 1 ? 'it' : 'them'}.{hiddenNote}
     </span>
   )
 }
 
-const CONFIRMED_BY = [
-  { value: 'in_person', label: 'In person' },
-  { value: 'video_call', label: 'On a video call' },
-  { value: 'phone_call_back', label: 'By calling them back on a known number' },
-  { value: 'other_verified_channel', label: 'Another verified channel' },
-]
+
+/** a lock lasts minutes or hours: the time alone today, else the day too, so Status stays narrow */
+function lockEnd(iso: string): string {
+  const d = new Date(iso)
+  const time = { hour: 'numeric', minute: '2-digit' } as const
+  return d.toDateString() === new Date().toDateString()
+    ? d.toLocaleTimeString(undefined, time)
+    : d.toLocaleString(undefined, { month: 'short', day: 'numeric', ...time })
+}
 
 // when and where the lock was set, as a sentence
 function lockedFrom(u: User): string {
@@ -789,8 +1008,9 @@ function RolesCard({
   const [deleting, setDeleting] = useState(false)
 
   const known = new Set(meta.permissions)
+  // directory.sync is not grantable. A copy drops it.
   const onlyKnown = (p: Record<string, boolean>) =>
-    Object.fromEntries(Object.entries(p).filter(([k]) => known.has(k)))
+    Object.fromEntries(Object.entries(p).filter(([k]) => known.has(k) && k !== 'directory.sync'))
 
   const startOptions = [
     { value: '', label: 'Blank' },
@@ -813,7 +1033,9 @@ function RolesCard({
     )
   const openRole = (r: Role) =>
     open(
-      canManage && r.kind !== 'builtin' ? { mode: 'edit', role: r } : { mode: 'view', role: r },
+      canManage && r.kind !== 'builtin' && !r.reserved
+        ? { mode: 'edit', role: r }
+        : { mode: 'view', role: r },
       { name: r.name, description: r.description, permissions: { ...r.permissions } },
     )
 
@@ -872,6 +1094,7 @@ function RolesCard({
 
   const viewing = dialog?.mode === 'view' ? dialog.role : null
   const platformEquivalent = new Set(meta.platform_equivalent)
+  const personOnly = new Set(meta.person_only)
 
   return (
     <SettingsCard
@@ -889,7 +1112,17 @@ function RolesCard({
       {meta.nobody_can_manage_roles && (
         <div className="settings-banner err mb-3">
           <Icon name="alert" size={14} /> Nobody on this install can manage roles. On the host, run{' '}
-          <code className="font-mono">python -m core.auth.recover_admin &lt;username&gt;</code>
+          <code className="font-mono">python -m core.auth.recover_admin &lt;username&gt;</code>. If Require single sign-on is on
+          and the provider is down, run <code className="font-mono">python -m core.auth.require_sso_off</code> to let passwords back in.
+        </div>
+      )}
+      {meta.new_permissions_unheld.length > 0 && (
+        <div className="settings-banner info items-start mb-3">
+          <Icon name="info" size={14} />
+          <span className="min-w-0">
+            New permissions no custom role holds yet:{' '}
+            <span className="font-mono">{meta.new_permissions_unheld.join(', ')}</span>
+          </span>
         </div>
       )}
       <div className="table-wrap">
@@ -913,6 +1146,7 @@ function RolesCard({
                   <div className="flex items-center gap-1.5 whitespace-nowrap">
                     <span>{roleLabel(r)}</span>
                     {r.kind === 'builtin' && <span className="chip">Built-in</span>}
+                    {r.reserved && <span className="chip">Directory sync</span>}
                     {r.kind === 'legacy' && <span className="chip sel">Review</span>}
                     {r.modified && (
                       <span className="chip sel" title={Object.keys(r.diff ?? {}).join(', ')}>
@@ -932,17 +1166,17 @@ function RolesCard({
                   <div className="inline-flex gap-1.5">
                     <button
                       className="btn ghost icon"
-                      title={canManage && r.kind !== 'builtin' ? 'Edit' : 'View'}
+                      title={canManage && r.kind !== 'builtin' && !r.reserved ? 'Edit' : 'View'}
                       onClick={() => openRole(r)}
                     >
-                      <Icon name={canManage && r.kind !== 'builtin' ? 'edit' : 'eye'} size={15} />
+                      <Icon name={canManage && r.kind !== 'builtin' && !r.reserved ? 'edit' : 'eye'} size={15} />
                     </button>
                     {canManage && (
                       <button className="btn ghost icon" title="Copy" onClick={() => openCopy(r)}>
                         <Icon name="copy" size={15} />
                       </button>
                     )}
-                    {canManage && r.kind !== 'builtin' && (
+                    {canManage && r.kind !== 'builtin' && !r.reserved && (
                       <button
                         className="btn ghost icon"
                         title={r.holders ? `${r.holders} account(s) hold this role` : 'Delete'}
@@ -1008,25 +1242,44 @@ function RolesCard({
           <div>
             <div className="field-label mb-1.5">Permissions</div>
             <div
-              className="grid grid-cols-2 gap-x-4 gap-y-2"
-              style={{ maxHeight: 300, overflowY: 'auto', border: '1px solid var(--line)', borderRadius: 6, padding: 10 }}
+              className="grid gap-x-4 gap-y-2"
+              style={{
+                maxHeight: 300,
+                overflowY: 'auto',
+                border: '1px solid var(--line)',
+                borderRadius: 6,
+                padding: 10,
+                // One column when the dialog is narrow, two once a name and its tag fit.
+                gridTemplateColumns: 'repeat(auto-fit, minmax(min(100%, 220px), 1fr))',
+              }}
             >
               {byArea(meta.permissions).map(([area, keys]) => (
-                <div key={area} className="flex flex-col">
+                <div key={area} className="flex flex-col min-w-0">
                   {keys.map((k) => (
                     <label
                       key={k}
-                      className="flex items-center gap-2 py-0.5 text-xs"
+                      className="flex flex-wrap items-center gap-x-2 gap-y-0.5 py-0.5 text-xs min-w-0"
                       style={{ cursor: viewing ? 'default' : 'pointer' }}
                     >
                       <input
                         type="checkbox"
                         checked={!!form.permissions[k]}
-                        disabled={!!viewing}
+                        disabled={!!viewing || k === 'directory.sync'}
+                        title={
+                          k === 'directory.sync'
+                            ? 'directory.sync is held only by directory sync and can’t be granted'
+                            : undefined
+                        }
                         onChange={() => toggle(k)}
                       />
                       <span className="font-mono">{k}</span>
+                      {k === 'directory.sync' && (
+                        <span className="text-tx-3 basis-full">not grantable</span>
+                      )}
                       {platformEquivalent.has(k) && <span className="text-tx-3 whitespace-nowrap">platform-equivalent</span>}
+                      {personOnly.has(k) && !!form.permissions[k] && (
+                        <span className="text-tx-3">no effect for a service account</span>
+                      )}
                     </label>
                   ))}
                 </div>

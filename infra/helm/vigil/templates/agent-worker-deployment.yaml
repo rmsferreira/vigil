@@ -47,19 +47,18 @@ spec:
           imagePullPolicy: {{ include "vigil.imagePullPolicy" (dict "context" . "component" "agentWorker") }}
           {{- /* No command override: unlike llm-worker, this image's CMD is
                  already the worker (node dist/worker.js). */}}
+          {{- /* ConfigMap whole. The app Secret is named below, not loaded whole. */}}
           envFrom:
-            {{- include "vigil.envFrom" . | nindent 12 }}
+            - configMapRef:
+                name: {{ include "vigil.configmap.fullname" . }}
           env:
-            - name: POSTGRES_PASSWORD
-              valueFrom:
-                secretKeyRef:
-                  name: {{ include "vigil.postgres.appPasswordSecret" . }}
-                  key: {{ include "vigil.postgres.appPasswordSecretKey" . }}
+            {{- include "vigil.agentPostgresEnv" . | nindent 12 }}
             {{- /* The worker reads the discrete parts, not a DSN or a URL: a
                    $(VAR) substituted into either is not URL-encoded. */}}
-            {{- include "vigil.env" . | nindent 12 }}
+            {{- include "vigil.agentEnv" . | nindent 12 }}
             {{- include "vigil.agentRedisEnv" . | nindent 12 }}
             {{- include "vigil.caBundleEnv" . | nindent 12 }}
+            {{- include "vigil.agentSecretEnv" (dict "context" . "extraEnv" .Values.agentWorker.extraEnv) | nindent 12 }}
             {{- with .Values.agentWorker.extraEnv }}
             {{- toYaml . | nindent 12 }}
             {{- end }}

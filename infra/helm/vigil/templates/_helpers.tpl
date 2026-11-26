@@ -95,6 +95,17 @@ Never the app Secret the chart templates itself.
 {{- end -}}
 
 {{/*
+Secret holding SHELL_TOKEN, chosen as vigil.mcpRunner.tokenSecret chooses.
+*/}}
+{{- define "vigil.agentShell.tokenSecret" -}}
+{{- if or .Values.secrets.existingSecret .Values.secrets.externalSecret.enabled -}}
+{{- include "vigil.secret.fullname" . -}}
+{{- else -}}
+{{- include "vigil.agentShell.fullname" . -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
 MCP_RUNNER_URL and MCP_RUNNER_TOKEN for the backend and daemon; nothing when the
 runner is off. The token ref is optional so an existingSecret without the key
 leaves only the runner unready, not the app (the runner's own ref is required).
@@ -158,8 +169,8 @@ read-only on the runner. Nothing when detectionRules.volume is unset.
 {{- end -}}
 
 {{/*
-Owner password only. Not the app Secret: that one is envFrom'd into every
-workload, and the owner password must not ride along.
+Owner password only. Not the app Secret: that one is envFrom'd into the
+backend, the daemon and llm-worker, and the owner password must not ride along.
 */}}
 {{- define "vigil.postgres.ownerSecret" -}}
 {{- printf "%s-postgres" (include "vigil.fullname" .) | trunc 63 | trimSuffix "-" -}}
@@ -206,67 +217,73 @@ Service account name.
 {{- end -}}
 
 {{/*
-Resolve an image reference for the given component.
-Usage: {{ include "vigil.image" (dict "context" . "component" "backend") }}
-Falls back to global.imageNamespace + "-<component>" when repository is empty.
-The "llmWorker" component always reuses the backend image.
+Resolve an image reference. Every image the chart renders goes through here, so
+global.imageRegistry moves all of them.
+Usage:
+  Vigil's own:  include "vigil.image" (dict "context" . "component" "backend")
+  Third-party:  include "vigil.image" (dict "context" . "component" "postgresql" "default" "library/postgres")
+  Nested image: add "image" <dict> (and "suffix" for a Vigil image), e.g. Medic's gateway.
+Vigil's own: an empty repository derives <registry>/<imageNamespace>-<suffix>,
+the registry falling back to ghcr.io. Third-party: the chart's default
+repository ("default") moves to <registry>/<path> when global.imageRegistry is
+set, with any registry host stripped and Docker Hub's implied library/ written
+out; unset, it renders unchanged. A repository an operator sets is verbatim.
+A Vigil image's tag defaults to the appVersion; a set digest replaces the tag. The pinned
+third-party tags carry their digest ("16-alpine@sha256:..."), so an operator's
+tag replaces the pin. The "llmWorker" component reuses the backend image.
 */}}
 {{- define "vigil.image" -}}
 {{- $ctx := .context -}}
 {{- $comp := .component -}}
-{{- $compValues := get $ctx.Values $comp -}}
-{{- $repo := "" -}}
-{{- $tag := "" -}}
-{{- $pullPolicy := "" -}}
-{{- if $compValues -}}
-  {{- $img := get $compValues "image" | default dict -}}
-  {{- $repo = get $img "repository" | default "" -}}
-  {{- $tag = get $img "tag" | default "" -}}
-  {{- $pullPolicy = get $img "pullPolicy" | default "" -}}
-{{- end -}}
+{{- $img := .image | default (get (get $ctx.Values $comp | default dict) "image") | default dict -}}
+{{- $repo := $img.repository | default "" -}}
+{{- $tag := $img.tag | default "" | toString -}}
+{{- $digest := $img.digest | default "" -}}
+{{- $registry := $ctx.Values.global.imageRegistry | default "" -}}
 {{- /* llm-worker reuses the backend image when not set explicitly */ -}}
 {{- if and (eq $comp "llmWorker") (eq $repo "") -}}
   {{- $backendImg := $ctx.Values.backend.image | default dict -}}
-  {{- $repo = get $backendImg "repository" | default "" -}}
-  {{- if eq $tag "" -}}{{- $tag = get $backendImg "tag" | default "" -}}{{- end -}}
+  {{- $repo = $backendImg.repository | default "" -}}
+  {{- if eq $tag "" -}}{{- $tag = $backendImg.tag | default "" | toString -}}{{- end -}}
+  {{- $digest = $digest | default $backendImg.digest | default "" -}}
 {{- end -}}
-{{- /* Auto-derive repository from global.imageNamespace when still empty. */ -}}
-{{- if eq $repo "" -}}
-  {{- $registry := $ctx.Values.global.imageRegistry -}}
-  {{- $ns := $ctx.Values.global.imageNamespace -}}
-  {{- /* Map the chart component names to image suffixes */ -}}
-  {{- $suffix := "backend" -}}
-  {{- if eq $comp "daemon" -}}{{- $suffix = "daemon" -}}{{- end -}}
-  {{- if eq $comp "backend" -}}{{- $suffix = "backend" -}}{{- end -}}
-  {{- if eq $comp "llmWorker" -}}{{- $suffix = "backend" -}}{{- end -}}
-  {{- /* The agent layer is Node, not Python — it cannot reuse the backend
-         image the way llm-worker does, and the default above would silently
-         hand it one. Both components share the one image and differ only in
-         which command the Deployment runs (infra/docker/Dockerfile.agent). */ -}}
-  {{- if eq $comp "agentWorker" -}}{{- $suffix = "agent" -}}{{- end -}}
-  {{- if eq $comp "agentServe" -}}{{- $suffix = "agent" -}}{{- end -}}
-  {{- if eq $comp "mcpRunner" -}}{{- $suffix = "mcp-runner" -}}{{- end -}}
-  {{- $repo = printf "%s/%s-%s" $registry $ns $suffix -}}
+{{- if .default -}}
+  {{- if and $registry (or (eq $repo "") (eq $repo .default)) -}}
+    {{- $parts := splitList "/" .default -}}
+    {{- $host := first $parts -}}
+    {{- if and (gt (len $parts) 1) (or (contains "." $host) (contains ":" $host) (eq $host "localhost")) -}}
+      {{- $parts = rest $parts -}}
+    {{- end -}}
+    {{- if eq (len $parts) 1 -}}{{- $parts = prepend $parts "library" -}}{{- end -}}
+    {{- $repo = printf "%s/%s" $registry (join "/" $parts) -}}
+  {{- else if eq $repo "" -}}
+    {{- $repo = .default -}}
+  {{- end -}}
+{{- else if eq $repo "" -}}
+  {{- /* Map the chart component names to image suffixes. The agent layer is
+         Node, not Python: agentWorker/agentServe share the agent image and
+         differ only in their command (infra/docker/Dockerfile.agent). */ -}}
+  {{- $suffixes := dict "daemon" "daemon" "agentWorker" "agent" "agentServe" "agent" "mcpRunner" "mcp-runner" -}}
+  {{- $suffix := .suffix | default (get $suffixes $comp) | default "backend" -}}
+  {{- $repo = printf "%s/%s-%s" ($registry | default "ghcr.io") $ctx.Values.global.imageNamespace $suffix -}}
 {{- end -}}
-{{- if eq $tag "" -}}
-  {{- $tag = $ctx.Chart.AppVersion | toString -}}
+{{- if and (eq $tag "") (not .default) -}}{{- $tag = $ctx.Chart.AppVersion | toString -}}{{- end -}}
+{{- if $digest -}}
+  {{- printf "%s@%s" $repo $digest -}}
+{{- else if $tag -}}
+  {{- printf "%s:%s" $repo $tag -}}
+{{- else -}}
+  {{- $repo -}}
 {{- end -}}
-{{- printf "%s:%s" $repo $tag -}}
 {{- end -}}
 
 {{/*
-Resolve image pull policy for a component, inheriting from global.
+Resolve image pull policy for a component (or a passed "image"), inheriting from global.
 */}}
 {{- define "vigil.imagePullPolicy" -}}
 {{- $ctx := .context -}}
-{{- $comp := .component -}}
-{{- $compValues := get $ctx.Values $comp | default dict -}}
-{{- $img := get $compValues "image" | default dict -}}
-{{- $pp := get $img "pullPolicy" | default "" -}}
-{{- if eq $pp "" -}}
-  {{- $pp = $ctx.Values.global.imagePullPolicy | default "IfNotPresent" -}}
-{{- end -}}
-{{- $pp -}}
+{{- $img := .image | default (get (get $ctx.Values .component | default dict) "image") | default dict -}}
+{{- $img.pullPolicy | default $ctx.Values.global.imagePullPolicy | default "IfNotPresent" -}}
 {{- end -}}
 
 {{/*
@@ -383,6 +400,11 @@ when the operator brings their own: that Secret must also hold this key.
 
 {{- define "vigil.postgres.appPasswordSecretKey" -}}
 POSTGRES_APP_PASSWORD
+{{- end -}}
+
+{{/* vigil_agent's password, in the same Secret. Only the agent pods and the upgrade Job get it. */}}
+{{- define "vigil.postgres.agentPasswordSecretKey" -}}
+POSTGRES_AGENT_PASSWORD
 {{- end -}}
 
 {{/*

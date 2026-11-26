@@ -5,10 +5,18 @@ a type and a value; the key they join on is minted here, so a stored key and a
 queried key cannot be normalised by two rules that drift.
 
 The rule is ``defang`` (``core.storage.defang``) then case-fold, mirroring
-``services/agent/plugins/hunt/entities.ts``. The exception is the half that
-breaks silently: an ARN's resource part and an AWS key id are case-significant,
-so folding them makes two principals one key — and the join still returns rows,
-just the wrong ones.
+``services/agent/plugins/hunt/entities.ts``. ``user`` and ``email`` are
+case-folded on purpose, including keys a person types; the reason, and what
+that costs, is the Entity Key entry in CONTEXT.md. The exception is the half
+that breaks silently: an ARN's resource part and an AWS key id are
+case-significant, so folding them makes two principals one key — and the join
+still returns rows, just the wrong ones. Two types keep case in part (#4542):
+a ``process`` that is an absolute POSIX path keeps it whole, and a ``url``
+case-folds only its scheme and authority, since its path, query and fragment
+are case-significant.
+
+``scripts/check_entity_key_agreement.py`` runs this and the harness on the same
+inputs in CI and fails when they disagree; change a rule in both halves.
 """
 
 from __future__ import annotations
@@ -19,7 +27,34 @@ from typing import Iterable, List, Tuple
 
 from core.memory.recall_contract import ENTITY_KEY_TYPES, KEY_CASE_SENSITIVE_TYPES
 from core.memory.tlds import TLDS
-from core.storage.defang import defang
+from core.storage.defang import defang, trim_edges
+from core.storage.entity_context import (
+    CONTEXT_LISTS,
+    CONTEXT_SCALARS,
+    context_candidates,
+)
+
+
+def _fold(kind: str, text: str) -> str:
+    """Case-fold ``text`` as an Entity Key value of ``kind``.
+
+    Plain string operations, as in entities.ts: a URL parser re-serialises
+    (trailing slash, percent-encoding, port) and the two languages would drift.
+    ``user`` and ``email`` are case-folded on purpose. Keeping their case here,
+    in both halves, passes the parity check and splits account history. Why,
+    and what that costs, is the Entity Key entry in CONTEXT.md.
+    """
+    if kind in KEY_CASE_SENSITIVE_TYPES:
+        return text
+    if kind == "process" and text.startswith("/"):
+        return text  # an absolute POSIX path: case-significant on Linux
+    if kind == "url":
+        # Scheme and authority fold; from the first / ? # after them, case stays.
+        sep = text.find("://")
+        start = sep + 3 if sep >= 0 else 0
+        end = next((i for i in range(start, len(text)) if text[i] in "/?#"), len(text))
+        return text[:end].lower() + text[end:]
+    return text.lower()
 
 
 def entity_key(entity_type: str, value: str) -> str:
@@ -28,13 +63,11 @@ def entity_key(entity_type: str, value: str) -> str:
     An empty key is dropped by the caller rather than raising: one unusable
     candidate in a payload must not fail the investigation it arrived in.
     """
-    kind = (entity_type or "").strip().lower()
-    text = defang((value or "").strip())
+    kind = trim_edges(entity_type or "").lower()
+    text = defang(trim_edges(value or ""))
     if not kind or not text:
         return ""
-    if kind not in KEY_CASE_SENSITIVE_TYPES:
-        text = text.lower()
-    return f"{kind}:{text}"
+    return f"{kind}:{_fold(kind, text)}"
 
 
 def _deduped(minted: Iterable[str]) -> List[str]:
@@ -70,7 +103,7 @@ def normalise_key(key: str) -> str:
     and a value. Splitting on the *first* colon is what keeps a URL or an IPv6
     address whole: everything after the type belongs to the value.
     """
-    kind, _, value = (key or "").strip().partition(":")
+    kind, _, value = trim_edges(key or "").partition(":")
     return entity_key(kind, value)
 
 
@@ -143,9 +176,7 @@ def text_entity_keys(raw: str) -> List[str]:
     minted: List[str] = []
     for kind, pattern in _TEXT_PATTERNS:
         for match in pattern.finditer(text):
-            value = _TRAILING_PUNCT.sub("", match.group(0))
-            if kind not in KEY_CASE_SENSITIVE_TYPES:
-                value = value.lower()
+            value = _fold(kind, _TRAILING_PUNCT.sub("", match.group(0)))
             # A dotted quad after a version word is a release, not a host.
             before = text[max(0, match.start() - 12) : match.start()]
             if kind == "ip" and _VERSION_WORD.search(before):
@@ -155,35 +186,11 @@ def text_entity_keys(raw: str) -> List[str]:
     return _deduped(minted)
 
 
-# How a finding's entity context is spelled, in memory's vocabulary. One map, so
-# a new ingest field reaches cross-investigation correlation and memory recall at
-# once. Alternatives within a tuple are aliases: the first one present wins,
-# because sources disagree about `dest` and `dst` and mean the same thing.
-#
-# `host`, not `hostname`: this is memory's spelling. The shared-IOC minter aliases
-# it back on the way in, so the keys that subsystem writes are unchanged.
-_CONTEXT_LISTS: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
-    ("ip", ("src_ips",)),
-    ("ip", ("dest_ips", "dst_ips")),
-    ("host", ("hostnames",)),
-    ("user", ("usernames", "users")),
-    ("hash", ("file_hashes",)),
-    ("domain", ("domains",)),
-    ("process", ("processes",)),
-    ("url", ("urls",)),
-    ("email", ("emails",)),
-)
-
-_CONTEXT_SCALARS: Tuple[Tuple[str, str], ...] = (
-    ("ip", "src_ip"),
-    ("ip", "dst_ip"),
-    ("host", "hostname"),
-    ("user", "user"),
-)
-
-
-_CONTEXT_TYPES = {kind for kind, _ in _CONTEXT_LISTS} | {
-    kind for kind, _ in _CONTEXT_SCALARS
+# How a finding's entity context is spelled is `core.storage.entity_context`'s one
+# map, shared with cross-investigation correlation: a new ingest field reaches
+# it and memory recall at once.
+_CONTEXT_TYPES = {kind for kind, _, _ in CONTEXT_LISTS} | {
+    kind for kind, _, _ in CONTEXT_SCALARS
 }
 _OFF_VOCABULARY = _CONTEXT_TYPES - set(ENTITY_KEY_TYPES)
 if _OFF_VOCABULARY:
@@ -200,23 +207,7 @@ def entity_context_candidates(finding: object) -> List[Tuple[str, str]]:
     in, and there are two. Empty for a finding carrying no entity context, which
     is what keeps "nothing was asked" apart from "nothing is known".
     """
-    context = finding.get("entity_context") if isinstance(finding, dict) else None
-    if not isinstance(context, dict):
-        return []
-
-    candidates: List[Tuple[str, str]] = []
-    for kind, names in _CONTEXT_LISTS:
-        values = next((context[n] for n in names if context.get(n)), None) or []
-        if not isinstance(values, (list, tuple)):
-            continue
-        candidates.extend((kind, str(value)) for value in values)
-
-    for kind, name in _CONTEXT_SCALARS:
-        value = context.get(name)
-        if value:
-            candidates.append((kind, str(value)))
-
-    return candidates
+    return [(kind, value) for kind, value, _ in context_candidates(finding)]
 
 
 def finding_entity_keys(findings: object) -> List[str]:

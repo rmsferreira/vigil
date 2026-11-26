@@ -13,20 +13,26 @@ import asyncio
 import copy
 import json
 import logging
+import time
 import uuid
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 from typing import Any, Callable, Dict, List, Optional
 
-from sqlalchemy import func
+import httpx
+from sqlalchemy import func, select
 
 from core.agents.builtins import ORCHESTRATOR_ACTOR
+from core.agents.lost_runs import Cursor, end_lost_start_jobs
 from core.auth import sign_ins
-from core.auth.principals import agent_principal_id
 from core.cases.case_sla_service import case_title, open_case_holding
-from core.config import get_settings
+from core.config import get_settings, is_integration_enabled
+from core.daemon_config import OrchestratorConfig
+from core.integrations._base.config import resolve
+from core.integrations.slack.descriptor import SLACK
+from core.storage.case_insert import insert_case
+from core.storage.intake_queue import SEVERITY_BANDS, intake_severity_band
 from core.time import utcnow
-from services.daemon.config import OrchestratorConfig
 
 try:
     from opentelemetry.trace import SpanKind
@@ -81,12 +87,15 @@ except Exception:
     _inv_created = _inv_completed = _inv_failed = _dedup_prevented = _stuck_agents = (
         _intake_queue_depth
     ) = None  # type: ignore[assignment]
-from core.agents.operator_manifest import operator_request
-from core.agents.projections import read_projection, run_id_for
+from core.agents.operator_manifest import added_request, operator_request
+from core.agents.projections import (
+    THREAT_HUNT_WORKFLOW_ID,
+    read_projection,
+    run_id_for,
+)
 from core.agents.queue import RUN_KINDS, build_start_job, enqueue_run
 from core.findings.exclusions import cached_active_ips, excluded_ips_of
 from core.memory.entity_keys import finding_entity_keys, normalise_keys
-from core.response.approval_service import ApprovalService
 from core.response.checkpoints import raise_for_checkpoint
 from core.storage.connection import get_db_manager
 from core.storage.models import (
@@ -95,7 +104,11 @@ from core.storage.models import (
     IntakeTrigger,
     Investigation,
 )
-from core.storage.shared_ioc_repository import CaseMatch, SharedIOCRepository
+from core.storage.shared_ioc_repository import (
+    CaseMatch,
+    SharedIOCRepository,
+    reconcile_case_safely,
+)
 from core.threat_intel.mitre_lookup import (
     iter_techniques,
     resolve_technique,
@@ -103,7 +116,11 @@ from core.threat_intel.mitre_lookup import (
 )
 from core.workflows.enablement import is_enabled
 from core.workflows.hypothesis_subjects import kept_subjects
-from core.workflows.routing import FALLBACK_WORKFLOW, SHADOW_WORKFLOW_ID
+from core.workflows.routing import (
+    EMULATE_WORKFLOW,
+    FALLBACK_WORKFLOW,
+    SHADOW_WORKFLOW_ID,
+)
 from core.workflows.workflow_run_service import WorkflowRunService
 from core.workflows.workflows_service import AGENT_RUN_PREFIX, WorkflowsService
 from services.daemon.plan_generator import (
@@ -112,7 +129,6 @@ from services.daemon.plan_generator import (
     generate_initial_state,
     select_workflow,
 )
-from services.daemon.shared_intel import SharedIntelligence
 from services.daemon.workdir import WorkdirManager
 
 logger = logging.getLogger(__name__)
@@ -126,6 +142,9 @@ def _count_queued_intake_rows() -> int:
 # Proactive hunts (nightly, intel) never hold more than this many slots, so a
 # detection arriving on a quiet fleet still finds one free.
 SCHEDULE_RUN_CEILING = 1
+
+# Seconds between looks for runs whose start job was lost: the look scans the runs table.
+LOST_CHECK_EVERY = 60
 
 
 # A hunt parked out of turns or budget, waiting on Keep going. A park on an
@@ -180,14 +199,19 @@ def _count_schedule_runs_in_flight() -> int:
 
 
 MAX_CLOSED_LINKS = 5
+MAX_OPEN_LINKS = (
+    5  # counted apart, so a long closed history can't crowd out an open Case
+)
 
 
 # related_to: the type the case screen labels and an analyst's link defaults to.
 def _link_cases(case_a: str, case_b: str, notes: str) -> None:
+    from core.auth.permissions import builtin_reader
     from core.cases.case_records_service import link_cases
     from core.storage.connection import get_db_manager
 
-    with get_db_manager().session_scope() as session:
+    # Intake's own work: the built-in reader, which links restricted cases too.
+    with builtin_reader(), get_db_manager().session_scope() as session:
         link_cases(
             session,
             case_a,
@@ -212,8 +236,7 @@ def lift_ai_enrichment(finding: Dict) -> Dict:
     return lifted
 
 
-_SEVERITY_BANDS = ("critical", "high", "medium", "low", "unknown")
-_BAND_RANK = {name: i for i, name in enumerate(_SEVERITY_BANDS)}
+_BAND_RANK = {name: i for i, name in enumerate(SEVERITY_BANDS)}
 
 
 def _as_naive_utc(value: Any) -> Optional[datetime]:
@@ -240,18 +263,38 @@ def intake_age_seconds(row: Dict, now: datetime) -> float:
     return (now - created).total_seconds()
 
 
-def intake_severity_band(
-    kind: Optional[str],
-    *,
-    finding_severity: Optional[str] = None,
-    priority: Optional[str] = None,
-) -> str:
-    """Map a row onto a ranked band. Detection reads the finding; others the row."""
-    raw = finding_severity if kind == "detection" else priority
-    if raw is None or not str(raw).strip():
-        return "unknown"
-    name = str(raw).strip().lower()
-    return name if name in _BAND_RANK else "unknown"
+def intake_raised_by(row: Dict) -> Optional[Dict[str, Any]]:
+    """What raises a detection row ahead of older ones in its band, or None.
+
+    A crown jewel the applied site declares over one of the finding's Entity
+    Keys, else vStrike enrichment that says ``criticality: critical``. Schedule
+    and ask rows, and a row with no finding loaded, are never raised.
+    """
+    finding = row.get("_finding")
+    if row.get("kind") != "detection" or not isinstance(finding, dict):
+        return None
+    from core.memory.entity_keys import entity_context_candidates, entity_key
+    from core.site import match
+
+    keys = [
+        entity_key(kind, value) for kind, value in entity_context_candidates(finding)
+    ]
+    jewel = next((m for m in match(keys) if m["kind"] == "crown_jewels"), None)
+    if jewel is not None:
+        return {
+            "source": "crown_jewel",
+            "name": jewel.get("name"),
+            "file": jewel.get("file"),
+            "line": jewel.get("line"),
+            "revision": jewel.get("revision"),
+            "selector": jewel.get("selector"),
+            "key": jewel.get("key"),
+        }
+    context = finding.get("entity_context")
+    vstrike = context.get("vstrike") if isinstance(context, dict) else None
+    if isinstance(vstrike, dict) and vstrike.get("criticality") == "critical":
+        return {"source": "enrichment", "criticality": "critical"}
+    return None
 
 
 def intake_rank_inputs(
@@ -260,8 +303,8 @@ def intake_rank_inputs(
     now: datetime,
     ttl_seconds: int,
     promote_fraction: float,
-) -> tuple[str, bool, float]:
-    """``(band, promoted, age_seconds)`` of a row: what ``rank_intake_row`` sorts on.
+) -> tuple[str, bool, float, Optional[Dict[str, Any]]]:
+    """``(band, promoted, age_seconds, raised_by)``: what ``rank_intake_row`` sorts on.
 
     Detection rows read current finding severity from ``_finding``;
     ``schedule`` and ``human_ask`` read the row's ``priority``.
@@ -276,7 +319,7 @@ def intake_rank_inputs(
         finding_severity=finding_severity,
         priority=row.get("priority"),
     )
-    return band, promoted, age
+    return band, promoted, age, intake_raised_by(row)
 
 
 def rank_intake_row(
@@ -286,18 +329,20 @@ def rank_intake_row(
     ttl_seconds: int,
     promote_fraction: float,
 ) -> tuple:
-    """Sort key: last-quarter TTL promotion, then severity band, then oldest.
+    """Sort key: last-quarter TTL promotion, then severity band, then raised
+    (crown jewel or critical enrichment), then oldest.
 
     Lower sorts first. Never ``ORDER BY`` the severity string: alphabetically
     ``low`` precedes ``medium``.
     """
-    band, promoted, _ = intake_rank_inputs(
+    band, promoted, _, raised = intake_rank_inputs(
         row, now=now, ttl_seconds=ttl_seconds, promote_fraction=promote_fraction
     )
     created = _as_naive_utc(row.get("created_at"))
     return (
         0 if promoted else 1,
         _BAND_RANK[band],
+        0 if raised else 1,
         created if created is not None else now,
     )
 
@@ -330,6 +375,45 @@ def _caller(investigation_id: str) -> tuple[Optional[str], Optional[str]]:
     username = name if isinstance(name, str) and name else None
     principal = token if isinstance(token, str) and token else None
     return username, principal
+
+
+def caseless_run_of(investigation_id: str) -> Optional[Dict[str, Any]]:
+    """How to queue a rerun of a run that opened no Case: the daily gaps run (a
+    schedule intake, with its gap proposals) or a person's Emulate (a Human Ask on
+    the MITRE analyst). ``kind`` is the intake kind. None for any other run, or when
+    the row is gone.
+
+    A restart of either queues it as one, so it opens no Case, and the rules a gaps
+    run saves still attach to the gaps it was handed.
+    """
+    from core.storage.connection import get_db_manager
+    from core.storage.models import IntakeTrigger
+
+    with get_db_manager().session_scope() as session:
+        row = (
+            session.query(IntakeTrigger)
+            .filter(
+                IntakeTrigger.investigation_id == investigation_id,
+                IntakeTrigger.kind.in_(("schedule", "human_ask")),
+            )
+            .order_by(IntakeTrigger.id.desc())
+            .first()
+        )
+        kind = row.kind if row is not None else None
+        payload = row.payload if row is not None else None
+    if not isinstance(payload, dict) or not payload.get("no_case"):
+        return None
+    if kind == "human_ask":
+        if payload.get("workflow_id") != EMULATE_WORKFLOW:
+            return None
+        return {"kind": kind, "no_case": True}
+    return {
+        "kind": kind,
+        "no_case": True,
+        "gap_proposal_ids": [
+            i for i in payload.get("gap_proposal_ids") or () if isinstance(i, str) and i
+        ],
+    }
 
 
 def _stamp_phases(context: Dict[str, Any], workflow_id: str, workflows) -> None:
@@ -451,36 +535,14 @@ def _record_start(
         logger.warning("run %s started without a trail entry", run_id)
 
 
-def insert_intake_trigger(
-    *,
-    kind: str,
-    priority: str = "medium",
-    finding_id: Optional[str] = None,
-    payload: Optional[Dict[str, Any]] = None,
-) -> Optional[int]:
-    """Insert a queued trigger. ``None`` when a queued row for this finding already exists."""
-    from sqlalchemy.exc import IntegrityError
-
-    from core.storage.connection import get_db_manager
-    from core.storage.models import IntakeTrigger
+def _note_gap_run(proposal_ids: List[str], run_id: str) -> None:
+    """Record on the gaps run's proposals the run they were handed to."""
+    from core.detections.engineering import proposals
 
     try:
-        with get_db_manager().session_scope() as session:
-            row = IntakeTrigger(
-                kind=kind,
-                state="queued",
-                finding_id=finding_id,
-                priority=priority or "medium",
-                payload=payload or {},
-            )
-            session.add(row)
-            session.flush()
-            return row.id
-    except IntegrityError:
-        logger.info(
-            "intake already has a queued row for finding %s", finding_id or "(none)"
-        )
-        return None
+        proposals.gap_run_started(proposal_ids, run_id)
+    except Exception as exc:  # noqa: BLE001 -- the run starts without the record
+        logger.warning("could not record run %s on its gap proposals: %s", run_id, exc)
 
 
 def insert_not_offered(*, finding_id: str, priority: str, reason: str) -> None:
@@ -519,7 +581,56 @@ class CaseSpec:
     finding_ids: List[str]
     priority: str
     case_id: Optional[str] = None
-    mitre_techniques: Optional[List[str]] = None
+    # Who reads it, set when the case opens restricted; ``note`` joins its timeline.
+    readers: Optional[List[str]] = None
+    reader_teams: Optional[List[str]] = None
+    note: Optional[str] = None
+
+
+# What the lead list's findings run under: their own trigger type, so the shadow
+# run and the related-case links, which key on "finding", skip them.
+LEAD_TRIGGER = "insider_lead"
+
+
+@dataclass(frozen=True)
+class InsiderLead:
+    """A finding the lead list says to hunt on: what the hunt asks, who reads the case."""
+
+    accounts: List[str]
+    hypothesis: str
+    subjects: Dict[str, List[str]]
+    readers: List[str]
+    reader_teams: List[str]
+    why: str
+
+
+def _lead_readers() -> tuple[List[str], List[str]]:
+    """The list's readers and teams still there. No actor is re-checked: nobody acts."""
+    from core.auth import principals
+    from core.storage.models import Principal, Team
+    from core.workflows.insider_lead import configured_readers
+
+    names, team_ids = configured_readers()
+    with get_db_manager().session_scope() as session:
+        live = set(
+            session.scalars(
+                select(Principal.principal_id).where(
+                    Principal.principal_id.in_(names),
+                    Principal.deleted_at.is_(None),
+                    Principal.kind.in_((principals.PERSON, principals.SERVICE_ACCOUNT)),
+                )
+            )
+        )
+        teams = set(
+            session.scalars(
+                select(Team.team_id).where(
+                    Team.team_id.in_(team_ids),
+                    Team.archived_at.is_(None),
+                    Team.is_default.is_(False),
+                )
+            )
+        )
+    return [n for n in names if n in live], [t for t in team_ids if t in teams]
 
 
 def _new_case_id() -> str:
@@ -542,6 +653,8 @@ def _human_ask_case_title(
 # rather than by a column. A uuid5 of the suffixed id rather than a suffixed uuid:
 # agent_events.run_id is a uuid column and would refuse the string.
 SHADOW_HYPOTHESIS_FILE = "shadow_hypothesis.txt"
+# The detection proposals the daily gaps run opened for the run it queued.
+GAP_PROPOSALS_FILE = "gap_proposals.json"
 
 
 def shadow_run_id_for(investigation_id: str) -> str:
@@ -584,34 +697,28 @@ def _shadow_hypothesis(findings: List[Dict]) -> str:
 
 def _mint_case(session, spec: CaseSpec) -> str:
     """Insert a Case and its finding links on the caller's session. Does not commit."""
-    from sqlalchemy import select
-
-    from core.storage.models import Case, Finding
-
     case_id = spec.case_id or _new_case_id()
     now = utcnow()
-    case = Case(
+    case = insert_case(
+        session,
         case_id=case_id,
         title=(spec.title or "Investigation")[:200],
         description="",
         status="open",
         priority=spec.priority,
-        timeline=[{"timestamp": now.isoformat() + "Z", "event": "Case created"}],
-        mitre_techniques=spec.mitre_techniques or None,
+        timeline=[
+            {"timestamp": now.isoformat() + "Z", "event": "Case created"},
+            *(
+                [{"timestamp": now.isoformat() + "Z", "event": spec.note}]
+                if spec.note
+                else []
+            ),
+        ],
+        finding_ids=spec.finding_ids,
+        readers=spec.readers,
+        reader_teams=spec.reader_teams,
     )
-    session.add(case)
-    session.flush()
-    if spec.finding_ids:
-        rows = (
-            session.execute(
-                select(Finding).where(Finding.finding_id.in_(spec.finding_ids))
-            )
-            .scalars()
-            .all()
-        )
-        case.findings.extend(rows)
-        session.flush()
-    return case_id
+    return case.case_id
 
 
 # Intake rows only ever name Postgres findings, so these read Postgres directly
@@ -630,30 +737,76 @@ def _load_finding(finding_id: str) -> Optional[Dict]:
     return FindingSchema.dump(finding) if finding else None
 
 
+def _reindex_case(case_id: Optional[str]) -> None:
+    """Reconcile the Case's index rows in their own transaction; never raises."""
+    if not case_id:
+        return
+    try:
+        with get_db_manager().session_scope() as session:
+            reconcile_case_safely(session, case_id)
+    except Exception as e:
+        logger.error("Failed to index IOCs for case %s: %s", case_id, e)
+
+
 def _matching_cases(finding: Dict, *, open: bool) -> List[CaseMatch]:
     """Cases the finding belongs with, newest first. Raises on a failed read.
 
-    Not through ``SharedIntelligence._with_repo``: that turns an error into an
-    empty answer, and an empty answer opens a new Case.
+    A failed read must not become an empty answer: an empty answer opens a new Case.
     """
     with get_db_manager().session_scope() as session:
         return SharedIOCRepository(session).matching_cases(finding, open=open)
 
 
+def _removed_from(finding_id: str) -> set:
+    """Ids of the Cases a person removed this finding from. Raises on a failed read."""
+    from core.storage.models import CaseFindingRemoval
+
+    with get_db_manager().session_scope() as session:
+        return set(
+            session.scalars(
+                select(CaseFindingRemoval.case_id).where(
+                    CaseFindingRemoval.finding_id == finding_id
+                )
+            )
+        )
+
+
 def _link_note(match: CaseMatch) -> str:
-    """What matched, without the key's kind prefix: the phrasing of link notes and Triage."""
+    """What matched, without the key's kind prefix: the phrasing of attach notes and Triage."""
     kind, _, value = match.key.partition(":")
     if match.same_alert:
         return f"same alert on {value}"
-    return f"same attacker {value}" if kind == "ip" else f"same {kind} {value}"
+    if kind == "src_ip":
+        return f"same source IP {value}"
+    if kind == "dst_ip":
+        return f"{value} was a destination there"
+    if kind == "ip":  # an attach recorded before roles were
+        return f"IP {value} matched before roles were recorded"
+    return f"same {kind} {value}"
 
 
-def _record_merge_activity(case_id: str, finding: Dict, match: CaseMatch) -> None:
-    """Note on the Case that an alert joined it. Raises on failure."""
+def _related_note(match: CaseMatch, new_case: str) -> str:
+    """The note on a related-Case link; true read from either Case."""
+    kind, _, value = match.key.partition(":")
+    seen = {
+        "src_ip": "was a source",
+        "dst_ip": "was a destination",
+        "ip": "was seen, its role not recorded,",
+    }.get(kind)
+    if match.same_alert or seen is None:
+        return _link_note(match)
+    return (
+        f"{value} {seen} on {match.case_id} and is the source of an alert on {new_case}"
+    )
+
+
+def _record_case_activity(
+    case_id: str, activity_type: str, description: str, details: Dict
+) -> None:
+    """Add an entry to the Case's activity. Raises on failure."""
     from core.cases.agent_closure import activity_actor
     from core.storage.models import Case
 
-    title = finding.get("title") or finding.get("finding_id") or "alert"
     with get_db_manager().session_scope() as session:
         case = session.get(Case, case_id)
         if case is None:
@@ -662,16 +815,106 @@ def _record_merge_activity(case_id: str, finding: Dict, match: CaseMatch) -> Non
             *(case.activities or []),
             {
                 "timestamp": utcnow().isoformat() + "Z",
-                "activity_type": "alert_added",
-                "description": f"Alert `{title}` added: {_link_note(match)}",
-                "details": {
-                    "finding_id": finding.get("finding_id"),
-                    "matched_key": match.key,
-                    "same_alert": match.same_alert,
-                },
+                "activity_type": activity_type,
+                "description": description,
+                "details": details,
                 **activity_actor(ORCHESTRATOR_ACTOR, session),
             },
         ]
+
+
+def _record_merge_activity(case_id: str, finding: Dict, match: CaseMatch) -> None:
+    """Note on the Case that an alert joined it. Raises on failure."""
+    title = finding.get("title") or finding.get("finding_id") or "alert"
+    _record_case_activity(
+        case_id,
+        "alert_added",
+        f"Alert `{title}` added: {_link_note(match)}",
+        {
+            "finding_id": finding.get("finding_id"),
+            "matched_key": match.key,
+            "same_alert": match.same_alert,
+        },
+    )
+
+
+def _record_failure(case_id: str, description: str, details: Dict) -> None:
+    """Put a failure where an analyst reads it: the Case's activity. Never raises."""
+    try:
+        _record_case_activity(case_id, "intake_failure", description, details)
+    except Exception:
+        logger.exception("Could not record on case %s: %s", case_id, description)
+
+
+def _notify_joined(case_id: str, finding: Dict, match: CaseMatch) -> None:
+    """Tell the Case's assignee and watchers an alert joined it. Raises on failure.
+
+    One notice per person while an earlier join notice on this Case is unread.
+    A watcher who switched ``alert_joined`` off gets none, and a person who may
+    not read the Case gets none (``notify``'s ``about_case``). A Case with
+    neither assignee nor watchers tells the active people on its team instead.
+    """
+    from urllib.parse import quote
+
+    from core.cases.case_notification_service import principal_of
+    from core.platform.notices import notify, send_notices
+    from core.storage.models import Case, CaseNotification, CaseWatcher
+    from core.teams import members_of
+
+    title = finding.get("title") or finding.get("finding_id") or "alert"
+    with get_db_manager().session_scope() as session:
+        case = session.get(Case, case_id)
+        if case is None:
+            raise LookupError(f"case {case_id} is gone")
+        names = [case.assignee] if case.assignee else []
+        watchers = list(
+            session.scalars(select(CaseWatcher).where(CaseWatcher.case_id == case_id))
+        )
+        for watcher in watchers:
+            if (watcher.notification_preferences or {}).get("alert_joined", True):
+                names.append(watcher.user_id)
+        # A person who is assignee and watcher is told once.
+        principals = dict.fromkeys(
+            p for name in names if (p := principal_of(session, name))
+        )
+        if not case.assignee and not watchers:
+            # Nobody owns it: tell the team, active people only.
+            principals = dict.fromkeys(
+                u.principal_id
+                for u in members_of(session, case.team_id)
+                if u.is_active and not u.service_account
+            )
+        sent = []
+        for principal in principals:
+            unread = session.scalar(
+                select(CaseNotification.notification_id)
+                .where(
+                    CaseNotification.user_id == principal,
+                    CaseNotification.notification_type == "alert_joined",
+                    CaseNotification.is_read.is_(False),
+                    CaseNotification.notification_metadata["case_id"].astext == case_id,
+                )
+                .limit(1)
+            )
+            if unread is not None:
+                continue
+            notice_id = notify(
+                principal,
+                "alert_joined",
+                f"Case {case_id}",
+                f"Alert `{title}` joined this case: {_link_note(match)}.",
+                link=f"/cases?case={quote(case_id, safe='')}",
+                metadata={
+                    "case_id": case_id,
+                    "finding_id": finding.get("finding_id"),
+                },
+                session=session,
+                about_case=case_id,
+            )
+            if notice_id is not None:
+                sent.append(notice_id)
+    # Mail goes out only once the rows have committed.
+    send_notices(sent)
 
 
 def _raise_case_priority(case_id: str, severity: Optional[str]) -> None:
@@ -690,10 +933,13 @@ def _raise_case_priority(case_id: str, severity: Optional[str]) -> None:
 
 def _attach_finding(case_id: str, finding_id: str) -> bool:
     """Link the finding to the case. False on any failure, never raises."""
+    from core.auth.permissions import builtin_reader
     from core.storage.service import DatabaseService
 
     try:
-        return bool(DatabaseService().add_finding_to_case(case_id, finding_id))
+        # Intake attaches to a restricted case too: a built-in reader (#4354).
+        with builtin_reader():
+            return bool(DatabaseService().add_finding_to_case(case_id, finding_id))
     except Exception as e:
         logger.error(
             "Failed to attach finding %s to case %s: %s", finding_id, case_id, e
@@ -749,7 +995,6 @@ class Orchestrator:
     def __init__(
         self,
         config: OrchestratorConfig,
-        approvals: Optional[ApprovalService] = None,
         workflows: Optional[WorkflowsService] = None,
     ):
         self.config = config
@@ -757,12 +1002,12 @@ class Orchestrator:
         self._shutdown_event: Optional[asyncio.Event] = None
         # Set by the daemon: watch(name, task, shutdown_event) for /status loops.
         self.watch_loop: Optional[Callable[..., None]] = None
-        self._approvals = approvals or ApprovalService()
+        # Set by the daemon: counts one intake-loop pass on /health.
+        self.note_pass: Optional[Callable[[], None]] = None
         # Read for the run_kind a definition declares; the file cache needs no DB.
         self._workflows = workflows or WorkflowsService()
 
         self.workdir = WorkdirManager(config.workdir_base)
-        self.shared_intel = SharedIntelligence()
 
         self._hourly_paused = False
 
@@ -775,6 +1020,9 @@ class Orchestrator:
             "total_cost_usd": 0.0,
         }
         self._intake_surge_active = False
+        # Where the last look for lost start jobs stopped, and when it ran.
+        self._lost_cursor: Optional[Cursor] = None
+        self._lost_checked_at = 0.0
 
     @property
     def enabled(self) -> bool:
@@ -795,6 +1043,8 @@ class Orchestrator:
             "_intake_loop": self._intake_loop,
             "_supervision_loop": self._supervision_loop,
             "_distil_loop": self._distil_loop,
+            "_run_retry_loop": self._run_retry_loop,
+            "_indicator_catchup_loop": self._indicator_catchup_loop,
         }
         tasks = []
         for name, loop in loops.items():
@@ -868,6 +1118,10 @@ class Orchestrator:
     async def _intake_loop(self, shutdown_event: asyncio.Event):
         """Drain queued trigger rows and create new investigations."""
         while not shutdown_event.is_set():
+            # Intake only. The bookkeeping loop in run, and supervision and
+            # distil, do not count as this component making progress.
+            if self.note_pass is not None:
+                self.note_pass()
             try:
                 await self._drain_intake(shutdown_event)
                 if self._enabled:
@@ -974,6 +1228,8 @@ class Orchestrator:
                 row.get("id"),
                 state="expired",
                 reason="ttl_expired" if self._enabled else "ttl_expired_autoops_off",
+                # The open Case it matched, so the expiry names what a link would have.
+                merged_into=self._open_case_matched(row),
             )
             return None
         if row.get("kind") == "detection":
@@ -986,20 +1242,186 @@ class Orchestrator:
                     row.get("id"), state="expired", reason="excluded_ip"
                 )
                 return None
-            if finding is not None and self._merge_if_overlaps(finding, row.get("id")):
-                return None
+            if finding is not None:
+                held, lead = self._lead_or_attach(finding, row.get("id"))
+                row["_lead"] = lead
+                # A lead is never merged into an open case: it opens its own.
+                if held or (
+                    lead is None and self._merge_if_overlaps(finding, row.get("id"))
+                ):
+                    return None
         return row
 
-    def _merge_if_overlaps(self, finding: Dict, trigger_id: Optional[int]) -> bool:
+    def _lead_or_attach(
+        self, finding: Dict, trigger_id: Optional[int]
+    ) -> tuple[bool, Optional[InsiderLead]]:
+        """Whether the lead list makes this finding a lead: ``(held, lead)``.
+
+        ``held`` is True when the row is not launching this tick (attached to a
+        hunt already running on the account, or a read failed and the row stays
+        queued). ``(False, None)`` is an ordinary finding. A lead matches the
+        list and names a ``user`` Entity Key, with ``threat-hunt`` on, the finding
+        on no open case, and a reader left to open the case to.
+        """
+        from core.workflows import insider_lead
+
+        finding_id = finding.get("finding_id", "unknown")
+        try:
+            if not insider_lead.matches(finding):
+                return False, None
+            if not is_enabled(THREAT_HUNT_WORKFLOW_ID):
+                logger.info(
+                    "Finding %s matches the lead list; %s is off",
+                    finding_id,
+                    THREAT_HUNT_WORKFLOW_ID,
+                )
+                return False, None
+            if not insider_lead.account_keys(finding):
+                logger.info("Finding %s %s", finding_id, insider_lead.NO_ACCOUNT)
+                return False, None
+            if open_case_holding(finding_id):
+                return False, None  # already held: the merge path says so
+            lead = insider_lead.lead_for(finding_id, finding)
+            keys = lead["accounts"]
+            if self._attach_if_hunting(finding, keys, trigger_id):
+                return True, None
+            readers, teams = _lead_readers()
+            if not readers and not teams:
+                logger.warning(
+                    "Finding %s matches the lead list but none of its readers is left; "
+                    "not opening an unrestricted case",
+                    finding_id,
+                )
+                return False, None
+            row = insider_lead.leads()
+            source = finding.get("data_source")
+            by = (
+                f"source {source}"
+                if source in row["sources"]
+                else f"rule name {finding.get('title')}"
+            )
+            proposal = lead["proposal"]
+            return False, InsiderLead(
+                accounts=keys,
+                hypothesis=proposal["hypothesis"],
+                subjects=proposal["hypothesis_subjects"],
+                readers=readers,
+                reader_teams=teams,
+                why=f"The insider lead list opened this: its {by} matched",
+            )
+        except Exception as e:
+            logger.error(
+                "Failed to check finding %s against the lead list; leaving queued: %s",
+                finding_id,
+                e,
+            )
+            return True, None
+
+    def _attach_if_hunting(
+        self, finding: Dict, keys: List[str], trigger_id: Optional[int]
+    ) -> bool:
+        """Put a lead on the restricted case whose hunt is already running on one of
+        its accounts, and start nothing. True: the row is not launching (a failed
+        read or attach leaves it queued). Asked again at launch, so two leads on one
+        account in one drain start one hunt."""
+        from core.auth.permissions import builtin_reader, case_restricted
+        from core.memory.prior_hunts import list_prior_hunts
+        from core.storage.models import Case
+
+        finding_id = finding.get("finding_id", "unknown")
+        try:
+            # A Case this lead was taken off is not one to rejoin. A failed
+            # read leaves it queued: attaching would also clear the removal.
+            removed = _removed_from(finding_id) if finding.get("finding_id") else set()
+            # The built-in reader: a restricted run is what this must see.
+            with builtin_reader():
+                hunts = list_prior_hunts(keys)["in_flight"]
+                with get_db_manager().session_scope() as session:
+                    case_id = next(
+                        (
+                            h["case_id"]
+                            for h in hunts
+                            if h["matched_keys"]
+                            and h["case_id"]
+                            and h["case_id"] not in removed
+                            and (case := session.get(Case, h["case_id"])) is not None
+                            and case_restricted(case)
+                        ),
+                        None,
+                    )
+        except Exception as e:
+            logger.error(
+                "Failed to read hunts on %s for finding %s; leaving queued: %s",
+                keys,
+                finding_id,
+                e,
+            )
+            return True
+        if case_id is None:
+            return False
+        if not _attach_finding(case_id, finding_id):
+            logger.warning(
+                "Finding %s leads to the hunt on case %s but could not be attached; leaving queued",
+                finding_id,
+                case_id,
+            )
+            return True
+        logger.info("Finding %s attached to the hunt on case %s", finding_id, case_id)
+        why = f"Alert `{finding.get('title') or finding_id}` added: a hunt on {', '.join(keys)} is already running"
+        try:
+            _record_case_activity(
+                case_id,
+                "alert_added",
+                why,
+                {"finding_id": finding_id, "accounts": keys},
+            )
+        except Exception:
+            logger.exception(
+                "Finding %s joined case %s but could not note it", finding_id, case_id
+            )
+        self._count_dedup_prevented()
+        self._decide_trigger(
+            trigger_id, state="merged", reason=why, merged_into=case_id
+        )
+        return True
+
+    def _open_case_matched(self, row: Dict) -> Optional[str]:
+        """The newest open Case a queued detection matches, or None. Never raises."""
+        if row.get("kind") != "detection":
+            return None
+        try:
+            finding = self._hydrate_detection_finding(row)
+            matches = _matching_cases(finding, open=True) if finding else []
+            # A Case the alert was taken off is not what an expiry may name.
+            if finding and finding.get("finding_id") and matches:
+                removed = _removed_from(finding["finding_id"])
+                matches = [m for m in matches if m.case_id not in removed]
+        except Exception:
+            logger.warning(
+                "Failed to match expiring row %s", row.get("id"), exc_info=True
+            )
+            return None
+        return matches[0].case_id if matches else None
+
+    def _merge_if_overlaps(
+        self,
+        finding: Dict,
+        trigger_id: Optional[int],
+        links: Optional[List[CaseMatch]] = None,
+    ) -> bool:
         """True when this row is not launching this tick (merged, or held).
+
+        Open Cases the finding matches without attaching (an IP that was only a
+        destination there, or whose role was never recorded) are added to
+        ``links``, for the new Case to link to once it exists.
 
         A failed read or attach is not a merge: no ``dedup_prevented`` bump, no
         ``_decide_trigger``. Returning True still skips launch so the row
         stays ``queued`` and the next tick retries.
 
         A finding already on a not-closed Case merges into it (#2245), and so
-        does one that matches an open Case's entities (``matching_cases``),
-        whether or not that Case's run has finished. A closed Case does not
+        does one that matches an open Case's entities (``matching_cases``) as a
+        source, hash or hostname, whether or not that Case's run has finished. A closed Case does not
         count: the finding reopens.
         """
         finding_id = finding.get("finding_id", "unknown")
@@ -1023,7 +1445,14 @@ class Orchestrator:
             return True
 
         try:
-            matches = _matching_cases(finding, open=True)
+            # A Case a person took this finding off is not a match: the next
+            # match, or none, and the finding launches as it would unmatched.
+            removed = _removed_from(finding_id)
+            matches = [
+                m
+                for m in _matching_cases(finding, open=True)
+                if m.case_id not in removed
+            ]
         except Exception as e:
             logger.error(
                 "Failed to match finding %s to open cases; leaving queued: %s",
@@ -1031,9 +1460,11 @@ class Orchestrator:
                 e,
             )
             return True
-        if not matches:
+        match = next((m for m in matches if m.attaches), None)
+        if match is None:
+            if links is not None:
+                links += matches[:MAX_OPEN_LINKS]
             return False
-        match = matches[0]
         if not _attach_finding(match.case_id, finding_id):
             logger.warning(
                 "Finding %s matches case %s but could not be attached; leaving queued",
@@ -1050,10 +1481,6 @@ class Orchestrator:
         # The merge stands whatever happens below: the finding is on the Case.
         for what, write in (
             (
-                "index its entities",
-                lambda: self.shared_intel.record_on_case(match.case_id, finding),
-            ),
-            (
                 "note it on the case",
                 lambda: _record_merge_activity(match.case_id, finding, match),
             ),
@@ -1061,16 +1488,27 @@ class Orchestrator:
                 "raise the case priority",
                 lambda: _raise_case_priority(match.case_id, finding.get("severity")),
             ),
+            (
+                "tell the people on it",
+                lambda: _notify_joined(match.case_id, finding, match),
+            ),
         ):
             try:
                 write()
-            except Exception:
+            except Exception as e:
                 logger.exception(
                     "Finding %s merged into case %s but could not %s",
                     finding_id,
                     match.case_id,
                     what,
                 )
+                if what == "note it on the case":
+                    _record_failure(
+                        match.case_id,
+                        f"Alert `{finding.get('title') or finding_id}` was added "
+                        f"({_link_note(match)}) but its note could not be written: {e}",
+                        {"finding_id": finding_id, "matched_key": match.key},
+                    )
         self._count_dedup_prevented()
         self._decide_trigger(
             trigger_id,
@@ -1099,14 +1537,31 @@ class Orchestrator:
                     "intake row %s has no finding to launch; leaving queued", trigger_id
                 )
                 return
+            if "_lead" in row:
+                lead = row["_lead"]
+            else:
+                held, lead = self._lead_or_attach(finding, trigger_id)
+                if held:
+                    return
+            # An earlier row this drain may have started the hunt on its account.
+            if lead is not None and self._attach_if_hunting(
+                finding, lead.accounts, trigger_id
+            ):
+                return
             await self._create_investigation_for_finding(
-                finding, shutdown_event, trigger_id=trigger_id
+                finding, shutdown_event, trigger_id=trigger_id, lead=lead
             )
         elif kind in ("schedule", "human_ask"):
             item = dict(row.get("payload") or {})
             item["priority"] = row.get("priority") or item.get("priority") or "medium"
             if kind == "schedule":
                 item.setdefault("trigger_type", "scheduled")
+            else:
+                # Only the daily gaps run hands a run its gap proposals. A person's
+                # Emulate (the MITRE analyst) is the one Human Ask with no Case.
+                item.pop("gap_proposal_ids", None)
+                if item.get("workflow_id") != EMULATE_WORKFLOW:
+                    item.pop("no_case", None)
             await self._create_manual_investigation(
                 item, shutdown_event, trigger_id=trigger_id
             )
@@ -1118,8 +1573,10 @@ class Orchestrator:
         finding: Dict,
         shutdown_event: asyncio.Event,
         trigger_id: Optional[int] = None,
+        lead: Optional[InsiderLead] = None,
     ):
-        """Create an investigation for a finding, with dedup checks."""
+        """Create an investigation for a finding, with dedup checks. A ``lead`` (the
+        row's, checked before any merge) hunts on its account in a case of its own."""
         # Same band the ranker uses: empty or a name that is not a rating
         # is unknown, not an invented medium. A detection can arrive from
         # Gate 1 or from a live feed hit; neither path invents a medium.
@@ -1127,7 +1584,31 @@ class Orchestrator:
             "detection", finding_severity=finding.get("severity")
         )
 
-        if self._merge_if_overlaps(finding, trigger_id):
+        if lead is not None:
+            finding_id = finding.get("finding_id")
+            await self._create_investigation(
+                workflow_id=THREAT_HUNT_WORKFLOW_ID,
+                findings=[finding],
+                trigger_type=LEAD_TRIGGER,
+                priority=priority,
+                mint_case=CaseSpec(
+                    title=_infer_title(finding, THREAT_HUNT_WORKFLOW_ID)[:200],
+                    finding_ids=[finding_id] if finding_id else [],
+                    priority=priority,
+                    readers=lead.readers,
+                    reader_teams=lead.reader_teams,
+                    note=lead.why,
+                ),
+                hypothesis=lead.hypothesis,
+                hypothesis_subjects=lead.subjects,
+                shutdown_event=shutdown_event,
+                trigger_id=trigger_id,
+                trigger_reason=lead.why,
+            )
+            return
+
+        open_links: List[CaseMatch] = []
+        if self._merge_if_overlaps(finding, trigger_id, open_links):
             return
 
         workflow_id = select_workflow(finding)
@@ -1152,6 +1633,7 @@ class Orchestrator:
             ),
             shutdown_event=shutdown_event,
             trigger_id=trigger_id,
+            open_links=open_links,
         )
 
     async def _create_manual_investigation(
@@ -1170,13 +1652,14 @@ class Orchestrator:
         findings = [f for f in map(_load_finding, finding_ids) if f]
 
         mint = None
-        if not case_id:
+        # The daily gaps run keeps its record on the run and its detection
+        # proposals, and an Emulate on the run's coverage report; every other
+        # intake with no case_id gets a Case of its own.
+        if not case_id and not item.get("no_case"):
             mint = CaseSpec(
                 title=_human_ask_case_title(hypothesis, findings, workflow_id),
                 finding_ids=list(finding_ids),
                 priority=item.get("priority") or "medium",
-                # The daily gaps run names the techniques its Case is about.
-                mitre_techniques=list(item.get("case_techniques") or []) or None,
             )
 
         await self._create_investigation(
@@ -1192,6 +1675,7 @@ class Orchestrator:
             shutdown_event=shutdown_event,
             trigger_id=trigger_id,
             document=item.get("document"),
+            gap_proposal_ids=item.get("gap_proposal_ids"),
         )
 
     async def _create_investigation(
@@ -1207,6 +1691,9 @@ class Orchestrator:
         shutdown_event: Optional[asyncio.Event] = None,
         trigger_id: Optional[int] = None,
         document: Optional[str] = None,
+        gap_proposal_ids: Optional[List[str]] = None,
+        open_links: Optional[List[CaseMatch]] = None,
+        trigger_reason: Optional[str] = None,
     ):
         """Core investigation creation logic."""
         if mint_case is not None:
@@ -1250,6 +1737,12 @@ class Orchestrator:
         if hypothesis and hypothesis_subjects:
             self.workdir.write_file(
                 inv_id, "hypothesis_subjects.json", json.dumps(hypothesis_subjects)
+            )
+        # The daily gaps run's proposals, read back at enqueue onto the run's
+        # trigger_context, where a rule the run saves finds the gap it answers.
+        if gap_proposal_ids:
+            self.workdir.write_file(
+                inv_id, GAP_PROPOSALS_FILE, json.dumps(list(gap_proposal_ids))
             )
         # The shadow run's one hypothesis, derived here where the finding is in
         # hand and read back at enqueue, which sees only ids. Only a detection
@@ -1301,8 +1794,8 @@ class Orchestrator:
             "current_step": 1,
             "priority": priority,
             "max_iterations": self.config.max_iterations_per_agent,
-            "max_cost_usd": self.config.max_cost_per_investigation,
-            "max_runtime_seconds": self.config.max_runtime_per_investigation,
+            "max_cost_usd": self._max_cost(),
+            "max_runtime_seconds": self._max_runtime(),
             "otel_traceparent": _tp,
             "run_id": run_id_for(inv_id),
         }
@@ -1312,6 +1805,7 @@ class Orchestrator:
             trigger_id=trigger_id,
             mint_case=mint_case,
             document=document,
+            reason=trigger_reason,
         )
         if not saved:
             logger.warning(
@@ -1321,7 +1815,7 @@ class Orchestrator:
             )
             return
 
-        self.shared_intel.register_investigation(inv_id, findings)
+        _reindex_case(case_id)
         self.stats["investigations_created"] += 1
         if _inv_created is not None:
             _inv_created.add(1)
@@ -1348,7 +1842,9 @@ class Orchestrator:
 
         if trigger_type == "finding" and inv_record.get("case_id"):
             for finding in findings:
-                await self._link_closed_cases(inv_record["case_id"], finding)
+                await self._link_related_cases(
+                    inv_record["case_id"], finding, open_links or []
+                )
 
         if not self.config.dry_run and not shutting_down:
             await self._enqueue_investigation(inv_record)
@@ -1413,6 +1909,21 @@ class Orchestrator:
                             f"Investigation {w_inv_id} is paused pending human approval.",
                         )
 
+                # A run whose start job was lost has no lease for the worker's
+                # sweeper to find: ended here, as a failed enqueue is. About once a
+                # minute, since it scans the runs table.
+                if (
+                    not self.config.dry_run
+                    and time.monotonic() - self._lost_checked_at >= LOST_CHECK_EVERY
+                ):
+                    self._lost_checked_at = time.monotonic()
+                    try:
+                        self._lost_cursor = await end_lost_start_jobs(
+                            self._lost_cursor, self._fail_lost_investigation
+                        )
+                    except Exception:  # noqa: BLE001 - must not skip the checks below
+                        logger.exception("ending lost start jobs failed")
+
                 executing = self._get_investigations_by_status("executing")
                 now = utcnow()
 
@@ -1456,9 +1967,9 @@ class Orchestrator:
                             )
 
                     cost = inv_dict.get("cost_usd", 0.0)
-                    max_cost = inv_dict.get(
-                        "max_cost_usd", self.config.max_cost_per_investigation
-                    )
+                    max_cost = inv_dict.get("max_cost_usd")
+                    if max_cost is None:
+                        max_cost = self._max_cost()
                     if cost >= max_cost:
                         logger.warning(
                             "supervisor.kill cost inv_id=%s cost_usd=%.4f "
@@ -1487,6 +1998,14 @@ class Orchestrator:
     # -------------------------------------------------------------------------
 
     IN_FLIGHT = IN_FLIGHT_INVESTIGATION_STATUSES
+
+    def _fail_lost_investigation(self, inv_id: str) -> None:
+        try:
+            self._update_investigation_status(
+                inv_id, "failed", "Could not enqueue: the start job is no longer queued"
+            )
+        except Exception:  # noqa: BLE001 - the run is ended either way
+            logger.exception("could not fail investigation %s", inv_id)
 
     def _in_flight(self) -> int:
         try:
@@ -1543,6 +2062,12 @@ class Orchestrator:
         declared = self._read_sidecar_json(inv_id, "hypothesis_subjects.json")
         return {} if declared is None else kept_subjects(declared, stated)
 
+    def _gap_proposal_ids(self, inv_id: str) -> List[str]:
+        held = self._read_sidecar_json(inv_id, GAP_PROPOSALS_FILE)
+        if not isinstance(held, list):
+            return []
+        return [i for i in held if isinstance(i, str) and i]
+
     # normalise_keys carries the absent, the non-list and the unusable to the same
     # empty answer, which is what a run that recalls nothing is.
     def _recall_keys(self, inv_id: str) -> List[str]:
@@ -1591,8 +2116,15 @@ class Orchestrator:
             "overrides": {
                 "budgets": {
                     "max_calls": self.config.max_iterations_per_agent,
-                    "max_cost_usd": self.config.max_cost_per_investigation,
-                    "max_wall_ms": self.config.max_runtime_per_investigation * 1000,
+                    # The run's own budgets, set from the live settings at
+                    # creation; a record without them reads the live ones.
+                    "max_cost_usd": (
+                        inv_record.get("max_cost_usd") or self._max_cost()
+                    ),
+                    "max_wall_ms": (
+                        inv_record.get("max_runtime_seconds") or self._max_runtime()
+                    )
+                    * 1000,
                 }
             },
         }
@@ -1615,6 +2147,8 @@ class Orchestrator:
             return
         try:
             run_kind = self._declared_run_kind(inv_record["workflow_id"])
+            # Loaded once: the row's display name, version and the job's metadata.
+            workflow = self._workflows.get_workflow(inv_record["workflow_id"])
             try:
                 if runs.get_run(run_id) is None:
                     context: Dict[str, Any] = {
@@ -1626,15 +2160,18 @@ class Orchestrator:
                     case_id = inv_record.get("case_id")
                     if case_id:
                         context["case_id"] = case_id
+                    gap_proposal_ids = self._gap_proposal_ids(inv_id)
+                    if gap_proposal_ids:
+                        context["gap_proposal_ids"] = gap_proposal_ids
                     _stamp_phases(context, inv_record["workflow_id"], self._workflows)
                     row = runs.begin_run(
                         run_id=run_id,
                         workflow_id=inv_record["workflow_id"],
-                        workflow_name=inv_record["workflow_id"],
-                        workflow_source="agent",
-                        workflow_version=self._workflows.version_of(
-                            inv_record["workflow_id"]
+                        workflow_name=(
+                            workflow.name if workflow else inv_record["workflow_id"]
                         ),
+                        workflow_source="agent",
+                        workflow_version=workflow.version if workflow else None,
                         trigger_context=context,
                         triggered_by=started_by or "orchestrator",
                         triggered_by_principal_id=_principal_of(started_by, principal),
@@ -1642,6 +2179,8 @@ class Orchestrator:
                     )
                     if row is None:
                         logger.warning("no workflow_runs row for %s", run_id)
+                    elif gap_proposal_ids:
+                        _note_gap_run(gap_proposal_ids, run_id)
                 else:
                     logger.info("run %s already recorded; not rewriting", run_id)
             except Exception as exc:  # noqa: BLE001 — a refused row still enqueues
@@ -1654,11 +2193,17 @@ class Orchestrator:
             if row is not None:
                 _record_start(run_id, actor, origin, person, request)
             # A custom agent's manifest and skills ride the job, not the trail entry.
-            workflow = self._workflows.get_workflow(inv_record["workflow_id"])
             job = build_start_job(
                 run_id,
                 run_kind,
-                {**request, **operator_request(workflow.metadata if workflow else {})},
+                {
+                    **request,
+                    **await asyncio.to_thread(
+                        operator_request,
+                        workflow.metadata if workflow else {},
+                        run_kind,
+                    ),
+                },
                 enqueued_by=started_by or "orchestrator",
                 principal=token,
                 actor=actor,
@@ -1781,7 +2326,8 @@ class Orchestrator:
         job = build_start_job(
             shadow_id,
             "adjudicate",
-            shadow,
+            # The skills an operator added ride the job, not the trail entry.
+            {**shadow, **await asyncio.to_thread(added_request, "adjudicate")},
             enqueued_by=started_by or "orchestrator",
             principal=token,
             actor=actor,
@@ -1911,10 +2457,11 @@ class Orchestrator:
             logger.error(f"Failed to read hourly cost: {e}")
             return None
 
-    def _hourly_cost_limit(self) -> float:
-        """The cap as saved in Settings, falling back to startup config.
+    def _live_setting(self, name: str, cast, fallback):
+        """One value as saved in ``orchestrator.settings``, else startup config.
 
-        Read live so a saved change reaches the running daemon at once.
+        Read live so a saved change (Settings, or an applied INTENT.md
+        revision) reaches the running daemon at once.
         """
         try:
             from core.storage.connection import get_db_manager
@@ -1927,12 +2474,31 @@ class Orchestrator:
                     .first()
                 )
                 if cfg and isinstance(cfg.value, dict):
-                    saved = cfg.value.get("max_total_hourly_cost")
+                    saved = cfg.value.get(name)
                     if saved is not None:
-                        return float(saved)
+                        return cast(saved)
         except Exception as e:
-            logger.warning("Hourly cost limit read failed, using config: %s", e)
-        return self.config.max_total_hourly_cost
+            logger.warning("Orchestrator %s read failed, using config: %s", name, e)
+        return fallback
+
+    def _hourly_cost_limit(self) -> float:
+        return self._live_setting(
+            "max_total_hourly_cost", float, self.config.max_total_hourly_cost
+        )
+
+    def _max_cost(self) -> float:
+        return self._live_setting(
+            "max_cost_per_investigation",
+            float,
+            self.config.max_cost_per_investigation,
+        )
+
+    def _max_runtime(self) -> int:
+        return self._live_setting(
+            "max_runtime_per_investigation",
+            int,
+            self.config.max_runtime_per_investigation,
+        )
 
     def _hourly_budget_exhausted(self) -> bool:
         """Gate intake on the rolling hour; logs once per pause/resume transition.
@@ -2010,6 +2576,104 @@ class Orchestrator:
 
             await self._sleep(shutdown_event, self.config.loop_interval)
 
+    async def _run_retry_loop(self, shutdown_event: asyncio.Event):
+        """Run again each case investigation that failed for a passing reason."""
+        while not shutdown_event.is_set():
+            try:
+                # A dry run opens no runs, so a retry would never stop being due.
+                if self._enabled and not self.config.dry_run:
+                    settings = get_settings()
+                    await self._run_retry_tick(
+                        timedelta(seconds=settings.case_run_retry_after_seconds),
+                        settings.case_run_retries,
+                    )
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Run retry loop error: {e}", exc_info=True)
+
+            await self._sleep(shutdown_event, self.config.loop_interval)
+
+    async def _indicator_catchup_loop(self, shutdown_event: asyncio.Event):
+        """Reconcile existing, hand-opened and drifted Cases into the shared IOC index (#4734).
+
+        Runs whether AutoOps is on or off: intake joins alerts through the index.
+        """
+        from core.storage.indicator_catchup import catch_up_once
+
+        while not shutdown_event.is_set():
+            try:
+                started = time.monotonic()
+                done = await asyncio.to_thread(catch_up_once)
+                if done.reconciled or done.failed:
+                    logger.info(
+                        "Indicator catch-up: %s reconciled, %s failed, %s skipped in %.2fs",
+                        done.reconciled,
+                        done.failed,
+                        done.skipped,
+                        time.monotonic() - started,
+                    )
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Indicator catch-up loop error: {e}", exc_info=True)
+
+            await self._sleep(shutdown_event, self.config.loop_interval)
+
+    async def _run_retry_tick(self, after: timedelta, attempts: int) -> int:
+        """Launch again each case investigation that failed for a passing reason
+        (core/cases/run_retry.py), through the same path intake uses, while there
+        is capacity and budget."""
+        from core.cases.run_retry import note_retry, retries_due
+
+        def due():
+            with get_db_manager().session_scope() as session:
+                return retries_due(session, after, attempts)
+
+        launched = 0
+        for item in await asyncio.to_thread(due):
+            if self._running() >= self.config.max_concurrent_agents:
+                break
+            if self._hourly_budget_exhausted():
+                break
+            findings = [
+                lift_ai_enrichment(f)
+                for f in await asyncio.to_thread(
+                    lambda: [_load_finding(i) for i in item["finding_ids"]]
+                )
+                if f
+            ]
+            if not findings:
+                continue
+            workflow_id = item["workflow_id"]
+            if not is_enabled(workflow_id):
+                workflow_id = FALLBACK_WORKFLOW
+            await self._create_investigation(
+                workflow_id=workflow_id,
+                findings=findings,
+                trigger_type="finding",
+                priority=item["priority"],
+                case_id=item["case_id"],
+                shutdown_event=self._shutdown_event,
+            )
+
+            def note():
+                with get_db_manager().session_scope() as session:
+                    note_retry(session, item)
+
+            try:
+                await asyncio.to_thread(note)
+            except Exception:  # noqa: BLE001 — the run launched either way
+                logger.warning("could not note the retry on %s", item["case_id"])
+            logger.info(
+                "Case %s run %s failed (%s); launched again",
+                item["case_id"],
+                item["run_id"],
+                str(item["reason"])[:120],
+            )
+            launched += 1
+        return launched
+
     async def _case_distil_tick(self):
         """Turn closed Cases into Verdicts (#733).
 
@@ -2068,95 +2732,69 @@ class Orchestrator:
             return
 
         state = self.workdir.read_state(inv_id)
-        proposed_actions = state.get("proposed_actions", [])
 
         self.stats["investigations_completed"] += 1
         if _inv_completed is not None:
             _inv_completed.add(1)
-        self.shared_intel.close_investigation(inv_id, state.get("case_id"))
+        _reindex_case(state.get("case_id"))
 
-        self.workdir.append_log(
-            inv_id,
-            {
-                "event": "investigation_completed",
-                "proposed_actions_count": len(proposed_actions),
-            },
-        )
+        self.workdir.append_log(inv_id, {"event": "investigation_completed"})
 
-        logger.info(
-            f"Investigation {inv_id} COMPLETED ({len(proposed_actions)} actions)"
-        )
+        logger.info(f"Investigation {inv_id} COMPLETED")
 
         self._send_notification(
             inv_id,
             "investigation_complete",
             f"Investigation {inv_id} completed",
-            f"Investigation completed with {len(proposed_actions)} proposed actions.",
+            "Investigation completed.",
             priority="normal",
         )
 
-        if proposed_actions:
-            for action in proposed_actions:
-                if action.get("requires_approval"):
-                    await self._create_approval_action(inv_id, action)
-
-    async def _create_approval_action(self, inv_id: str, action: Dict):
-        """Create an approval action for proposed response."""
-        try:
-            from core.response.approval_service import ActionType
-
-            service = self._approvals
-
-            action_str = action.get("action", "unknown")
-            try:
-                action_type = ActionType(action_str)
-            except ValueError:
-                action_type = ActionType.CUSTOM
-
-            service.create_action(
-                action_type=action_type,
-                title=f"Auto-investigation action: {action_str}",
-                description=f"Investigation {inv_id} proposes: {action.get('reason', '')}",
-                target=action.get("target", "unknown"),
-                confidence=0.8,
-                reason=f"[Auto-investigation {inv_id}] {action.get('reason', '')}",
-                evidence=[inv_id],
-                created_by=ORCHESTRATOR_ACTOR,
-                # The id string only; no principal row is seeded or minted for it.
-                created_by_principal_id=agent_principal_id(ORCHESTRATOR_ACTOR),
-                # The 0.8 is a constant, and the proposal is the agent's.
-                human_only=True,
-            )
-            logger.info(f"Created approval action for {inv_id}: {action_str}")
-        except Exception as e:
-            logger.error(f"Failed to create approval action: {e}")
-
     # -------------------------------------------------------------------------
-    # Closed-Case links
+    # Related-Case links
     # -------------------------------------------------------------------------
 
-    async def _link_closed_cases(self, case_id: str, finding: Dict):
-        """Link a new Case to the most recent closed Cases its finding matches.
+    async def _link_related_cases(
+        self, case_id: str, finding: Dict, open_links: List[CaseMatch]
+    ):
+        """Link a new Case to the Cases its finding matches without attaching.
 
-        Never raises: a failed lookup or link costs the link, not the Case.
+        The most recent closed ones (looked up now), then the open ones intake
+        carried: one that closed since is already linked as closed, counted there.
+        Never raises: a failed lookup or link costs the link, not the Case, and is
+        recorded on the new Case.
         """
         try:
-            matches = await asyncio.to_thread(_matching_cases, finding, open=False)
-        except Exception:
+            closed = await asyncio.to_thread(_matching_cases, finding, open=False)
+        except Exception as e:
             logger.warning(
                 "Failed to look up closed cases for %s", case_id, exc_info=True
             )
-            return
-        for match in [m for m in matches if m.case_id != case_id][:MAX_CLOSED_LINKS]:
-            note = _link_note(match)
+            await asyncio.to_thread(
+                _record_failure,
+                case_id,
+                f"Could not look up closed cases to link: {e}",
+                {"finding_id": finding.get("finding_id")},
+            )
+            closed = []
+        closed = [m for m in closed if m.case_id != case_id][:MAX_CLOSED_LINKS]
+        tried = {m.case_id for m in closed}
+        for match in closed + [m for m in open_links if m.case_id not in tried]:
             try:
+                note = _related_note(match, case_id)
                 await asyncio.to_thread(_link_cases, case_id, match.case_id, note)
-            except Exception:
+            except Exception as e:
                 logger.warning(
                     "Failed to link case %s to %s",
                     case_id,
                     match.case_id,
                     exc_info=True,
+                )
+                await asyncio.to_thread(
+                    _record_failure,
+                    case_id,
+                    f"Could not link to case {match.case_id}: {e}",
+                    {"related_case_id": match.case_id, "matched_key": match.key},
                 )
 
     # -------------------------------------------------------------------------
@@ -2183,6 +2821,14 @@ class Orchestrator:
                     .first()
                 )
                 case_id = inv.case_id if inv else None
+                from core.cases.case_notification_service import may_receive
+                from core.storage.models import Case
+
+                # A restricted case's notices go only to its readers.
+                if case_id and not may_receive(
+                    session, session.get(Case, case_id), "admin"
+                ):
+                    return
 
                 notif = CaseNotification(
                     case_id=case_id,
@@ -2206,14 +2852,13 @@ class Orchestrator:
         try:
             if get_settings().daemon_slack_enabled is not True:
                 return
+            # resolve returns secrets even when the integration is disabled.
+            if not is_integration_enabled("slack"):
+                return
 
-            import httpx
-
-            from core.config import get_integration_config
-
-            config = get_integration_config("slack")
+            config = resolve(SLACK)
             token = config.get("bot_token")
-            channel = config.get("default_channel", "#soc-alerts")
+            channel = config.get("default_channel") or "#soc-alerts"
             if not token:
                 return
 
@@ -2253,6 +2898,7 @@ class Orchestrator:
         trigger_id: Optional[int] = None,
         mint_case: Optional[CaseSpec] = None,
         document: Optional[str] = None,
+        reason: Optional[str] = None,
     ) -> bool:
         """Save a new investigation; with a trigger id, CAS it launched in the same transaction.
 
@@ -2283,6 +2929,8 @@ class Orchestrator:
                     max_iterations=inv_record.get(
                         "max_iterations", self.config.max_iterations_per_agent
                     ),
+                    # Set by the caller from the live budgets; the fallbacks
+                    # are the startup config.
                     max_cost_usd=inv_record.get(
                         "max_cost_usd", self.config.max_cost_per_investigation
                     ),
@@ -2306,6 +2954,7 @@ class Orchestrator:
                         investigation_id=inv_record["investigation_id"],
                         case_id=inv_record.get("case_id"),
                         decided_at=utcnow(),
+                        **({"reason": reason} if reason else {}),
                     )
                     .returning(IntakeTrigger.id)
                 ).scalar_one_or_none()
@@ -2357,9 +3006,32 @@ class Orchestrator:
             from sqlalchemy import update
 
             from core.storage.connection import get_db_manager
-            from core.storage.models import IntakeTrigger
+            from core.storage.models import IntakeTrigger, case_findings
 
             with get_db_manager().session_scope() as session:
+                row = session.get(IntakeTrigger, trigger_id)
+                if row is None or row.state != "queued":
+                    return
+                # Record a merge only while this transaction still sees the
+                # alert on that Case. The removal locks the same link row, so
+                # one of the two commits first (#4850).
+                if state == "merged" and merged_into and row.finding_id:
+                    held = session.execute(
+                        select(case_findings.c.finding_id)
+                        .where(
+                            case_findings.c.case_id == merged_into,
+                            case_findings.c.finding_id == row.finding_id,
+                        )
+                        .with_for_update()
+                    ).first()
+                    if held is None:
+                        logger.info(
+                            "intake row %s stays queued: finding %s is not on case %s",
+                            trigger_id,
+                            row.finding_id,
+                            merged_into,
+                        )
+                        return
                 session.execute(
                     update(IntakeTrigger)
                     .where(
@@ -2505,7 +3177,7 @@ class Orchestrator:
             # never touches, so the pause is reported here.
             "hourly_paused": self._hourly_pause_decision(spent, limit),
             "hourly_limit_usd": round(limit, 4),
-            "per_investigation_limit": self.config.max_cost_per_investigation,
+            "per_investigation_limit": self._max_cost(),
         }
 
     async def purge_all_investigations(self) -> Dict[str, Any]:
@@ -2547,8 +3219,6 @@ class Orchestrator:
             base.mkdir(parents=True, exist_ok=True)
         except Exception as e:
             logger.warning(f"Workdir cleanup failed after purge: {e}")
-
-        self.shared_intel = SharedIntelligence()
 
         logger.warning(
             f"Purged {deleted} investigations and reset workdir tree at {self.workdir.base_dir}"

@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
-import { useLocation, useNavigate } from 'react-router-dom'
-import { useAuth, type LoginResult, type MfaOffer } from '../../contexts/AuthContext'
+import { parsePath, useLocation, useNavigate } from 'react-router-dom'
+import { useAuth, type KeyAnswer, type LoginResult, type MfaOffer } from '../../contexts/AuthContext'
+import { basePath } from '../../config/basePath'
 import { authApi, bootstrapApi } from '../../services/api'
 import { assertWith, cancelPrompt, KeyProblem, NoKeyUsed, SECURITY_KEYS_DOCS } from '../../services/webauthn'
 import { Icon } from '../../shared/icons'
@@ -9,13 +10,45 @@ import { KeyWaiting } from '../../shell/SecurityKeyParts'
 import AuthLayout from './AuthLayout'
 import { requestErrorMessage } from './requestErrorMessage'
 
+// The provider's callback lands on /login?sso_error=<code>; the real reason is on the trail (decision 7).
+const SSO_ERRORS: Record<string, string> = {
+  failed: "Vigil couldn't sign you in with SSO. Try again. If it keeps failing, tell your Vigil administrator.",
+  deactivated: 'Your Vigil account is deactivated. Ask your Vigil administrator to turn it back on.',
+  email_not_verified:
+    "Your company sign-in hasn't verified your email address, so Vigil can't sign you in. Ask your IT team to verify it.",
+  not_provisioned:
+    "Your account hasn't been set up in Vigil from your identity provider yet. If this lasts, ask your admin.",
+  break_glass_email:
+    "This address belongs to a break-glass account. Ask an account manager to change that account's email to a mailbox your identity provider doesn't use.",
+  break_glass_linked: 'This identity is linked to a break-glass account; ask the operator to move the mark.',
+  expired: 'Your SSO sign-in waited too long for its second step. Sign in with SSO again.',
+}
+// The callback lands on /login?sso_step=1 when the provider's token didn't confirm MFA (#4757).
+const SSO_STEP_NOTE = "Your identity provider didn't confirm a second factor for this sign-in, so Vigil asks for its own."
+// A plain navigation: the server answers with the provider's redirect.
+const SSO_START = `${basePath}/api/auth/sso/start`
+// A path the server returned, basePath included, as the router's location.
+const fromFull = (path: string) => {
+  const parsed = parsePath(basePath && (path === basePath || path.startsWith(basePath + '/')) ? path.slice(basePath.length) || '/' : path)
+  return { pathname: parsed.pathname ?? '/', search: parsed.search, hash: parsed.hash }
+}
+
 export default function LoginScreen() {
   const navigate = useNavigate()
   const location = useLocation()
-  const { login } = useAuth()
+  const { login, finishSso } = useAuth()
   // the address a signed-out person was on; sign-in returns there
-  const from = (location.state as { from?: { pathname: string; search?: string; hash?: string } } | null)?.from
+  // (#4789) the SSO round trip can't keep router state: the callback hands it back as ?return=, a full path
+  const returned = new URLSearchParams(location.search).get('return')
+  const from =
+    (location.state as { from?: { pathname: string; search?: string; hash?: string } } | null)?.from ??
+    (returned?.startsWith('/') && !returned.startsWith('//') ? fromFull(returned) : undefined)
   const goBack = () => navigate(from && from.pathname !== '/login' ? { pathname: from.pathname, search: from.search, hash: from.hash } : '/')
+  // SSO is a full-page trip: the server carries the address back through its state cookie
+  const ssoHref =
+    from && from.pathname !== '/login' && from.pathname !== '/'
+      ? `${SSO_START}?next=${encodeURIComponent(basePath + from.pathname + (from.search ?? ''))}`
+      : SSO_START
 
   const [usernameOrEmail, setUsernameOrEmail] = useState('')
   const [password, setPassword] = useState('')
@@ -35,7 +68,17 @@ export default function LoginScreen() {
   // a recovery code removed this person's methods: setup opens over this screen
   const [setupOpen, setSetupOpen] = useState(false)
   const [loading, setLoading] = useState(false)
-  const [error, setError] = useState('')
+  const ssoError = new URLSearchParams(location.search).get('sso_error')
+  // a sign-in through the provider waiting on the person's own factor
+  const [ssoStep, setSsoStep] = useState(() => new URLSearchParams(location.search).get('sso_step') === '1')
+  const [error, setError] = useState(ssoError ? SSO_ERRORS[ssoError] ?? SSO_ERRORS.failed : '')
+  const [ssoEnabled, setSsoEnabled] = useState(false)
+  // Require single sign-on: the page offers "Sign in with SSO", and a password form
+  // only on the secondary break-glass route.
+  const [requireSso, setRequireSso] = useState(false)
+  const [passwordRoute, setPasswordRoute] = useState(false)
+  // a break-glass account's reason, sent with its code or key
+  const [reason, setReason] = useState('')
   // the reset screen hands off a "password updated" notice, or asks to open
   // the forgot-password view
   const navState = location.state as { notice?: string; forgot?: boolean } | null
@@ -44,7 +87,8 @@ export default function LoginScreen() {
 
   // drop the handoff from history so a reload doesn't replay it
   useEffect(() => {
-    if (navState?.notice || navState?.forgot) navigate('.', { replace: true, state: from ? { from } : null })
+    if (navState?.notice || navState?.forgot || ssoError || ssoStep)
+      navigate('.', { replace: true, state: from ? { from } : null })
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
   const [resetSent, setResetSent] = useState(false)
@@ -65,7 +109,11 @@ export default function LoginScreen() {
     // creation on an instance that already has users.
     bootstrapApi
       .status()
-      .then((res) => setNeedsBootstrap(res.data.required))
+      .then((res) => {
+        setNeedsBootstrap(res.data.required)
+        setSsoEnabled(!!res.data.sso_enabled)
+        setRequireSso(!!res.data.require_sso)
+      })
       .catch(() => setNeedsBootstrap(false))
   }, [])
 
@@ -89,6 +137,10 @@ export default function LoginScreen() {
     }
   }
 
+  // One answer to the second step: after the password, or after the SSO provider.
+  const attempt = (code?: string, key?: KeyAnswer, why?: string) =>
+    ssoStep ? finishSso(code, key) : login(usernameOrEmail, password, code, key, why)
+
   const finish = ({ recoveryCodes, mfaRemoved }: LoginResult) => {
     if (mfaRemoved) setSetupOpen(true)
     else if (recoveryCodes?.length) setNewCodes(recoveryCodes)
@@ -106,7 +158,7 @@ export default function LoginScreen() {
       const assertion = await assertWith(o.securityKey.options)
       if (id !== prompting.current) return
       setLoading(true)
-      finish(await login(usernameOrEmail, password, undefined, { assertion, challenge: o.securityKey.challenge }))
+      finish(await attempt(undefined, { assertion, challenge: o.securityKey.challenge }, o.breakGlass ? reason : undefined))
     } catch (err: any) {
       if (id !== prompting.current) return
       if (err instanceof KeyProblem && !(err instanceof NoKeyUsed)) setError(err.message)
@@ -133,7 +185,7 @@ export default function LoginScreen() {
     setUseKey(true)
     setLoading(true)
     try {
-      finish(await login(usernameOrEmail, password))
+      finish(await attempt())
     } catch (err: any) {
       // left the key view while this was in flight: no prompt
       if (id !== prompting.current) return
@@ -151,20 +203,16 @@ export default function LoginScreen() {
     setError('')
     setLoading(true)
     try {
-      finish(await login(usernameOrEmail, password, showMfa ? mfaCode : undefined))
+      finish(await attempt(showMfa ? mfaCode : undefined, undefined, showMfa && offer?.breakGlass ? reason : undefined))
     } catch (err: any) {
       if (forcedChange(err)) return
-      if (err?.message === 'MFA_REQUIRED') {
-        const o: MfaOffer = err.offer
-        const key = !!o.securityKey
-        const app = o.methods.includes('authenticator_app')
-        setOffer(o)
-        setShowMfa(true)
-        setMfaCode('')
-        setUseKey(key)
-        setRecovery(false)
-        if (key) void askKey(o)
-        else setError(!app && o.detail ? o.detail : 'Enter your 2FA code to continue.')
+      if (err?.message === 'MFA_REQUIRED') offered(err.offer)
+      else if (ssoRefused(err)) return
+      else if (err?.response?.data?.detail?.code === 'password_reset_required') {
+        // the key that protected the stored password is gone: nothing was counted, a reset is the way in
+        const d = err.response.data.detail
+        if (d.by_mail) openForgot()
+        setError(d.message)
       } else {
         setError(
           requestErrorMessage(
@@ -180,9 +228,52 @@ export default function LoginScreen() {
     }
   }
 
+  // The second step's offer: the code field, or straight to the key prompt.
+  const offered = (o: MfaOffer) => {
+    // break-glass: the reason comes first, so a key waits until it is asked for
+    const key = !!o.securityKey && !o.breakGlass
+    const app = o.methods.includes('authenticator_app')
+    setOffer(o)
+    setShowMfa(true)
+    setMfaCode('')
+    setReason('')
+    setUseKey(key)
+    setRecovery(o.breakGlass && !app)
+    if (key) void askKey(o)
+    else if (!o.breakGlass) setError(!app && o.detail ? o.detail : 'Enter your 2FA code to continue.')
+  }
+
+  // The waiting SSO sign-in can't finish (expired, account changed): its message, and back to the start.
+  const ssoRefused = (err: any) => {
+    const d = err?.response?.data?.detail
+    if (!ssoStep || d?.code !== 'sso_refused') return false
+    backToCredentials()
+    setError(SSO_ERRORS[d.sso_error] ?? SSO_ERRORS.failed)
+    return true
+  }
+
+  // Arriving from the provider: the first call answers with what the person can give.
+  useEffect(() => {
+    if (!ssoStep) return
+    setLoading(true)
+    finishSso()
+      .then(finish)
+      .catch((err: any) => {
+        if (err?.message === 'MFA_REQUIRED') offered(err.offer)
+        else if (!ssoRefused(err)) {
+          backToCredentials()
+          setError(requestErrorMessage(err, SSO_ERRORS.failed))
+        }
+      })
+      .finally(() => setLoading(false))
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
   // no app and no usable key (keys are off for this install): nothing to answer with, the server says why
   const app = !!offer?.methods.includes('authenticator_app')
-  const noMethod = !!offer && !offer.securityKey && !app
+  // a break-glass account always has its codes to give
+  const breakGlass = !!offer?.breakGlass
+  const noMethod = !!offer && !breakGlass && !offer.securityKey && !app
 
   // off the key view: its prompt ends, and nothing it answers later counts
   const leaveKey = () => {
@@ -193,11 +284,13 @@ export default function LoginScreen() {
   }
 
   const backToCredentials = () => {
+    setSsoStep(false)
     leaveKey()
     setShowMfa(false)
     setRecovery(false)
     setOffer(null)
     setMfaCode('')
+    setReason('')
     setError('')
   }
 
@@ -238,32 +331,48 @@ export default function LoginScreen() {
     setError('')
   }
 
+  // Require single sign-on's landing: not on the password route, and not mid-way through the SSO second step
+  const ssoLanding = requireSso && !passwordRoute && !ssoStep
   const title = newCodes
     ? 'New recovery codes'
     : needsBootstrap
     ? 'Create your account'
+    : ssoLanding
+    ? 'Sign in'
     : forgot
       ? 'Reset your password'
       : showMfa
-        ? recovery
-          ? 'Use a recovery code'
-          : 'Two-factor authentication'
+        ? breakGlass
+          ? 'Break-glass sign-in'
+          : recovery
+            ? 'Use a recovery code'
+            : 'Two-factor authentication'
         : 'Sign in'
   const subtitle = newCodes
     ? 'Your old recovery codes no longer work. Keep these instead.'
     : needsBootstrap
     ? 'No account exists yet. Set up the first administrator.'
+    : ssoLanding
+    ? 'Your organization signs in with SSO.'
     : forgot
       ? 'Enter the email on your account to request a reset link.'
       : showMfa
-        ? recovery
-          ? 'This removes your sign-in methods and signs you out everywhere else.'
-          : 'Confirm your identity to finish signing in.'
-        : 'Authenticate to access the operations console.'
+        ? breakGlass
+          ? 'This is a break-glass account. Every account manager is told who signed in, why, and from where.'
+          : recovery
+            ? 'This removes your sign-in methods and signs you out everywhere else.'
+            : ssoStep
+              ? SSO_STEP_NOTE
+              : 'Confirm your identity to finish signing in.'
+        : requireSso
+          ? 'For break-glass accounts only. Everyone else signs in with SSO.'
+          : ssoEnabled
+          ? 'Use your company sign-in or your Vigil password.'
+          : 'Authenticate to access the operations console.'
 
   return (
     <AuthLayout
-      screenLabel={forgot ? 'Forgot password' : 'Sign in'}
+      screenLabel={forgot && !ssoLanding ? 'Forgot password' : 'Sign in'}
       overlay={
         setupOpen && (
           <TwoStepDialog
@@ -389,6 +498,25 @@ export default function LoginScreen() {
             )}
           </button>
         </form>
+      ) : ssoLanding ? (
+        <>
+          <a className="btn-signin" href={ssoHref}>
+            <Icon name="key" size={17} />
+            Sign in with SSO
+          </a>
+          <div className="mfa-back">
+            <button
+              type="button"
+              className="link"
+              onClick={() => {
+                setPasswordRoute(true)
+                setError('')
+              }}
+            >
+              Sign in with a password (break-glass accounts)
+            </button>
+          </div>
+        </>
       ) : forgot ? (
         <form onSubmit={handleResetRequest} autoComplete="on" noValidate>
           {!resetSent && (
@@ -437,6 +565,17 @@ export default function LoginScreen() {
       <form onSubmit={handleSubmit} autoComplete="on" noValidate>
         {!showMfa ? (
           <>
+            {ssoEnabled && !requireSso && (
+              <>
+                <a className="btn-sso" href={ssoHref}>
+                  <Icon name="key" size={17} />
+                  Sign in with SSO
+                </a>
+                <div className="auth-divider" role="separator">
+                  <span>or use your password</span>
+                </div>
+              </>
+            )}
             <div className="field">
               <label htmlFor="auth-user">Username or email</label>
               <div className="ctrl">
@@ -481,11 +620,27 @@ export default function LoginScreen() {
               </div>
             </div>
 
-            <div className="row-end">
-              <button type="button" className="link" onClick={openForgot}>
-                Forgot password?
-              </button>
-            </div>
+            {requireSso ? (
+              // mailed resets are refused under Require; a break-glass reset comes from the host
+              <div className="row-end">
+                <button
+                  type="button"
+                  className="link"
+                  onClick={() => {
+                    setPasswordRoute(false)
+                    setError('')
+                  }}
+                >
+                  ← Sign in with SSO
+                </button>
+              </div>
+            ) : (
+              <div className="row-end">
+                <button type="button" className="link" onClick={openForgot}>
+                  Forgot password?
+                </button>
+              </div>
+            )}
           </>
         ) : useKey ? (
           <div className="field">
@@ -496,10 +651,12 @@ export default function LoginScreen() {
                 </button>
               )}
               {app && (
+                <button type="button" className="link" onClick={leaveKey}>
+                  Use an authenticator code instead
+                </button>
+              )}
+              {(app || breakGlass) && (
                 <>
-                  <button type="button" className="link" onClick={leaveKey}>
-                    Use an authenticator code instead
-                  </button>
                   <button
                     type="button"
                     className="link"
@@ -555,11 +712,35 @@ export default function LoginScreen() {
                 }}
               />
             </div>
-            {recovery && (
-              <p className="field-hint">
-                The code is spent. You will set up two-step sign-in again next, and get a new set of
-                recovery codes.
-              </p>
+            {breakGlass ? (
+              recovery && <p className="field-hint">Spends one code; removes nothing.</p>
+            ) : (
+              recovery && (
+                <p className="field-hint">
+                  The code is spent. You will set up two-step sign-in again next, and get a new set of
+                  recovery codes.
+                </p>
+              )
+            )}
+            {breakGlass && (
+              <div className="field">
+                <label htmlFor="auth-reason">Reason</label>
+                <div className="ctrl">
+                  <Icon name="edit" className="lead" />
+                  <input
+                    id="auth-reason"
+                    name="reason"
+                    type="text"
+                    placeholder="Why you need this account now"
+                    autoComplete="off"
+                    maxLength={500}
+                    disabled={loading}
+                    value={reason}
+                    onChange={(e) => setReason(e.target.value)}
+                  />
+                </div>
+                <p className="field-hint">Sent to every account manager and kept on the audit trail.</p>
+              </div>
             )}
             <div className="mfa-back">
               <button type="button" className="link" onClick={backToCredentials}>
@@ -568,7 +749,12 @@ export default function LoginScreen() {
             </div>
             {offer?.methods.includes('security_key') && offer.securityKey && (
               <div className="mfa-back">
-                <button type="button" className="link" onClick={() => void retryKey()}>
+                <button
+                  type="button"
+                  className="link"
+                  disabled={breakGlass && !reason.trim()}
+                  onClick={() => void retryKey()}
+                >
                   Use a security key or passkey instead
                 </button>
               </div>
@@ -587,13 +773,21 @@ export default function LoginScreen() {
         <button
           className="btn-signin"
           type="submit"
-          disabled={loading || (showMfa && !(recovery ? [16] : [6, 8, 16]).includes(mfaCode.length))}
+          disabled={
+            loading ||
+            (showMfa && !(recovery ? [16] : [6, 8, 16]).includes(mfaCode.length)) ||
+            (showMfa && breakGlass && !reason.trim())
+          }
         >
           {loading ? (
             <span className="spin" aria-hidden="true" />
           ) : (
             <>
-              {showMfa ? (recovery ? 'Remove my methods & sign in' : 'Verify & sign in') : 'Sign in'}
+              {showMfa
+                ? recovery && !breakGlass
+                  ? 'Remove my methods & sign in'
+                  : 'Verify & sign in'
+                : 'Sign in'}
               <Icon name="arrowR" />
             </>
           )}

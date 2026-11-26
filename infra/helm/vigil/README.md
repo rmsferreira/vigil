@@ -15,20 +15,28 @@ Two passwords, and they must differ.
 and mounted only on the in-chart Postgres and the upgrade Jobs. It is not in the
 application Secret those pods load with `envFrom`.
 
-`secrets.vigilAppPassword` is the `vigil_app` role. The backend, daemon, workers
-and agents log in as that role and receive only this password, as
+`secrets.vigilAppPassword` is the `vigil_app` role. The backend, daemon and
+workers log in as that role and receive only this password, as
 `POSTGRES_PASSWORD`. The upgrade Jobs set it with `ALTER ROLE vigil_app` on
 install and upgrade.
 
-Neither has a default. Set both (`openssl rand -hex 24`). With
+`secrets.vigilAgentPassword` is the `vigil_agent` role. agent-serve and
+agent-worker log in as that role, which holds only the agent ledger, run leases
+and directives, and receive this password by name. They do not load the
+application Secret. The upgrade Jobs set it beside `vigil_app`'s.
+
+None has a default, except that an unset `secrets.vigilAgentPassword` is
+generated once and kept across upgrades with `lookup` (set it under
+`helm template` or a GitOps controller, where `lookup` sees nothing). Set all
+three (`openssl rand -hex 24`). With
 `secrets.existingSecret` or `secrets.externalSecret`, that Secret must contain
-`POSTGRES_APP_PASSWORD`. Put the owner password in `postgresql.auth.existingSecret`
+`POSTGRES_APP_PASSWORD` and `POSTGRES_AGENT_PASSWORD`. Put the owner password in `postgresql.auth.existingSecret`
 (or `postgresql.external.existingSecret`) rather than in the application Secret.
 If the application Secret also holds `POSTGRES_PASSWORD`, the workload env
 replaces that variable with `POSTGRES_APP_PASSWORD` before the process starts.
 The chart refuses to render the old published default
-`change-me-before-production`, and it refuses to render when the two values
-are equal.
+`change-me-before-production`, and it refuses to render when any two of the
+three values are equal.
 
 A database whose owner password is still that published default must be changed
 in Postgres first (`ALTER ROLE` for `postgresql.auth.username`). The chart does
@@ -78,22 +86,31 @@ their image's revision. See [docs/upgrading.md](../../../docs/upgrading.md#helm)
 
 `agentShell` (on by default) runs the read-only case shell behind the backend's
 `read_case_shell` tool: the agent image's `node dist/shell.js`, on port 6992. The
-backend gets `SHELL_URL`; with the shell off the tool leaves the catalogue.
+backend gets `SHELL_URL` and `SHELL_TOKEN`; with the shell off the tool leaves
+the catalogue.
 
 | Value | Default | |
 |---|---|---|
 | `agentShell.enabled` | `true` | Render the shell Deployment, Service and NetworkPolicy. |
 | `agentShell.replicas` | `1` | Each replica runs up to 8 calls at once. |
 | `agentShell.resources` | 50m / 128Mi requests, 1Gi limit | The limit also bounds `/work`, an in-memory emptyDir. |
+| `secrets.agentShellToken` | generated | The bearer the backend presents to the shell, in `<fullname>-agent-shell`. |
 
 - **No network but the backend's calls.** Its NetworkPolicy admits backend pods
   on 6992 and denies all egress, and renders whatever `networkPolicies.enabled`
   says; the chart's `-deny-all` policy leaves the shell out, as its open egress
   would undo that. Only a network plugin that enforces NetworkPolicy makes this
   real.
+- **Token.** `POST /run` requires `Authorization: Bearer $SHELL_TOKEN`, so a pod
+  the policy fails to keep out still cannot run commands. Generated and kept as
+  `secrets.mcpRunnerToken` is (set it under `helm template` or GitOps). With
+  `secrets.existingSecret` or `secrets.externalSecret.enabled` that Secret must
+  carry a `SHELL_TOKEN` key; without it the shell pod does not start and
+  `read_case_shell` reports unavailable. The token opens nothing but the shell.
 - **Runs as root** with only SETUID, SETGID and KILL, to drop each call to its
   own uid: `baseline` Pod Security admits it, `restricted` does not. No
-  credentials, secrets or service account token are mounted.
+  credentials or service account token are mounted; `SHELL_TOKEN` is its only
+  secret, and no command it runs sees it.
 
 ## MCP runner
 
@@ -123,3 +140,99 @@ to those two pods when `networkPolicies.enabled` is set.
 - **A server on its own runner** is a second runner Deployment plus
   `MCP_RUNNER_URL_<SERVER>` on the backend and daemon. The chart does not
   render that yet.
+
+## Declared intent directory
+
+Set `VIGIL_INTENT_DIR` on the daemon to a directory holding `INTENT.md` and
+`REVISION`, and the daemon applies each new revision without a restart. Unset,
+`INTENT.md` stays observe-only. The daemon is the one applier, and the backend
+reads what it applied from the database; mount the directory elsewhere only
+for skills (below).
+
+| Value | Default | |
+|---|---|---|
+| `daemon.extraVolumes` | `[]` | The volume holding the directory. |
+| `daemon.extraVolumeMounts` | `[]` | Where the daemon sees it; read-only is enough. |
+| `daemon.extraEnv` | `[]` | `VIGIL_INTENT_DIR`, the mount path. |
+
+```yaml
+daemon:
+  extraVolumes:
+    - name: intent
+      configMap:
+        name: vigil-intent   # INTENT.md and REVISION, rendered by Flux or Argo CD
+  extraVolumeMounts:
+    - name: intent
+      mountPath: /etc/vigil/intent
+      readOnly: true
+  extraEnv:
+    - {name: VIGIL_INTENT_DIR, value: /etc/vigil/intent}
+```
+
+- **Revision.** The first line of `REVISION` names it, and the change reason of
+  each `config.change` entry the apply writes says it. Vigil does not read
+  `.git` and does not verify it. A GitOps controller writes the commit into the
+  ConfigMap; a plain checkout writes it in a post-merge hook
+  (`git rev-parse HEAD > REVISION`). Without the file the revision is `unknown`.
+- **Polling.** The daemon re-reads both files every 30 seconds and acts only
+  when their content changes, so a ConfigMap's symlink swap is picked up.
+- **What a revision does.** It is rejected whole, naming the file and line, if
+  the frontmatter does not parse, names an unknown key or has a value of the
+  wrong type. Otherwise only the keys whose declared value changed are written;
+  a tightening applies at once, a loosening is recorded as pending and waits
+  for a person. A missing directory keeps the last revision, state `degraded`.
+  `GET /api/config/intent` shows the revision, its state and the pending keys.
+
+- **Intent without `INTENT.md`.** A directory with no `INTENT.md` reads intent
+  as `degraded`; an `INTENT.md` with empty front matter declares nothing.
+
+### Site context in the declared directory
+
+Files under `site/*.md` in the same directory declare zones, crown jewels,
+owners and blind spots by selector (format and rules: the "Enforced: a
+declared directory" section of the repo's `INTENT.md`). The daemon applies
+them in the same poll, on their own verdict, to the `site.applied` row, with
+or without `INTENT.md`; a refused site revision names the file and line and
+keeps the last good one, and never holds up an `INTENT.md` change. Unsetting
+`VIGIL_INTENT_DIR` clears the site at the daemon's next start.
+`GET /api/config/site` and the /mcp tool `get_site_context` (`platform.read`)
+show what runs. A ConfigMap is flat, so give the files keys such as
+`site-zones.md` and mount them with `items`:
+
+```yaml
+daemon:
+  extraVolumes:
+    - name: intent
+      configMap:
+        name: vigil-intent
+        items:
+          - {key: INTENT.md, path: INTENT.md}
+          - {key: REVISION, path: REVISION}
+          - {key: site-zones.md, path: site/zones.md}
+```
+
+### Skills in the declared directory
+
+Keep skills in the same checkout (`skills/<name>/SKILL.md`) and point
+`VIGIL_SKILLS_PATH` under the mount, and they are managed by it: the Skills
+screen and `GET /api/skills` show the directory and its revision, and Vigil
+refuses every save, upload, delete, repo install and library update there.
+They change by commit; a changed skill is held until its scan clears it, as
+any other. Every process that loads skills needs the mount and both settings:
+
+```yaml
+config:
+  VIGIL_SKILLS_PATH: /etc/vigil/intent/skills
+backend:
+  extraVolumes: [{name: intent, configMap: {name: vigil-intent}}]
+  extraVolumeMounts: [{name: intent, mountPath: /etc/vigil/intent, readOnly: true}]
+  extraEnv: [{name: VIGIL_INTENT_DIR, value: /etc/vigil/intent}]
+llmWorker:
+  extraVolumes: [{name: intent, configMap: {name: vigil-intent}}]
+  extraVolumeMounts: [{name: intent, mountPath: /etc/vigil/intent, readOnly: true}]
+# daemon: as above.
+```
+
+A ConfigMap is flat, so a skill folder needs a volume that keeps directories
+(a git-sync sidecar's emptyDir, or a ReadOnlyMany claim) rather than one
+ConfigMap.

@@ -57,6 +57,206 @@ A vendor slice carries both: `ingestion.py` subclasses `SIEMIngestionService`,
 and `adapter.py` wraps that service to satisfy the Federation contract.
 _Avoid_: polling, sync, multi-tenancy (it is not Vigil-to-Vigil federation)
 
+**Integration Health**:
+One stored record per source (`source_health`, `core/storage/source_health.py`)
+and the one state judged from it (`core/integrations/health.py` `judge`, served
+at `GET /api/integration-health`). A source is an integration, keyed by its
+integration id, or one of Vigil's own inputs under an id that can't collide with
+one: `kafka`, `webhook:daemon`, `webhook:darktrace`, `webhook:cloudflare`,
+`detection_source:<id>`. The record holds the last attempt with its outcome and
+error kind, consecutive failures, dropped records (cumulative and the current
+hour), how many findings its severity floor has skipped (``filtered_total``,
+cumulative, kept across a reset the way dropped records are), last data
+received, the last real check, a reset mark, and the labels
+senders put on webhook events (information only; the judge does not read
+them). A floor skip is the operator's filter, not a drop and not an unreadable
+record: the judge does not read ``filtered_total``, and it never makes a source
+unhealthy. Scheduled collection, Test, detection-source syncs and the push sources
+(Kafka, the daemon webhook, the Darktrace and Cloudflare receivers) write it.
+A push source writes a change of state at once and its counts at most once a
+minute. Switching an integration on or changing its endpoint or credential
+resets it to "no attempt yet". The states are healthy, no attempt yet, unhealthy (3 failures in a row, or dropped
+records in the last hour), failing once, requires a test, not checked (with a
+reason), switched off, and unknown since a time, for a record its writer has
+stopped refreshing. Federation's health fields and the integrations API's
+`last_test` are read from it. Medic does not use the judge.
+_Avoid_: status (a detection source's file field), last test (only one writer)
+
+**Install Readiness**:
+Whether a new install is actually working, computed when it is read
+(`core/integrations/readiness.py`, served at `GET /api/install-readiness`
+under `platform.read`). It is ready when the background service is running,
+the provider assigned to reporting (or to chat, when reporting has no row) is
+routable, at least one alert source is switched on, every switched-on source
+is healthy, and every alert source is collected by scheduled collection or an
+enabled receiver. An input that cannot be read makes the whole state unknown.
+Unknown is not ready. It blocks nothing: Home shows each unmet item and its
+fix, and an hourly sweep on the API records one audit entry when readiness is
+reached or lost. That sweep also re-checks one switched-on integration a day.
+On the desktop app, which has no background service, it reads "not available
+on the desktop app: no background service".
+_Avoid_: `/readyz`, `/api/health/ready` (those say whether this process is up)
+
+**Production Start**:
+The moment a person declares that Vigil works this install's live alerts as
+part of the real SOC process. It is never inferred. One system setting,
+`production.start`, holds `started_at` (the moment they name, now or earlier)
+and `declared_at` (when they wrote it). Clearing writes both empty. Home shows
+"In production since" that time, or "Not in production", and a person holding
+`platform.write` declares, changes, or clears it there. It is not a detection
+rule's live stage: "go live" and "live" belong to rule rollout.
+_Avoid_: live, go live
+
+**Production Start Report**:
+A stored report of the install's first stretch in production, run from the
+same Install Readiness sweep as the Day 1 Report. It runs once, trigger
+`production`, at the first tick at or after Production Start plus 48 hours.
+A start already that old is due on the next tick. A cleared start starts
+nothing, and a change after that one run does not start another. Someone
+holding `platform.write` can run it on demand (`production_on_demand`) once a
+start is declared; before that, the action reads "Not in production yet". An
+on-demand run does not take the place of the automatic one. The record stores
+the start it used and the window in `evidence["production"]`. The page is
+`/report`, the same screen as the Day 1 Report, rendered from the trigger.
+Home, beside the Production Start line, offers Run when the latest report
+used a different start, and Re-run when the automatic start did not finish.
+An automatic run sends one link-only notice to `platform.write` holders; an
+on-demand run notifies the person who started it.
+_Avoid_: Day 1 Report (that report is the install before this window)
+
+**Day 1 Report**:
+A stored report of what a new install can see, run from the Install Readiness
+sweep (`services/api/readiness.py` calls `core/reporting/day1.py`). It runs
+once when readiness is first reached, or 24 hours after the later of setup's
+recorded finish (or the earliest person account, when setup was not finished)
+and the upgrade that added the report. One run when both fall due together,
+marked readiness. A report that ran earlier runs again on first readiness.
+Someone holding `platform.write` can run it on demand. The page is
+`/report`, read at `GET /api/day1-report` under `platform.read`. Home shows a
+run this process is still writing, a start that didn't complete (with Re-run),
+and a link to the latest report. An automatic run sends one link-only notice
+to `platform.write` holders; an on-demand run notifies the person who started
+it.
+_Avoid_: Install Readiness (that decides when this runs; it is not a module)
+
+**Jurisdiction**:
+The operator's statement of whose rules they are subject to, stored with
+the Data or Organisation Kinds on one `system_config` row
+(`day1_report.selection`). This release offers the United States, New York,
+the European Union and Australia. New York's parent is the United States:
+selecting New York stores the United States, and clearing a jurisdiction
+clears its sub-jurisdictions and their kinds. Read at
+`GET /api/day1-report/selection` under `platform.read`; a `platform.write`
+holder changes it with `PUT`, which the settings service already audits.
+A missing row is no jurisdiction. A row that does not parse is a failed
+read, and is never replaced with the empty selection.
+_Avoid_: sector, region (where a provider processes)
+
+**Data or Organisation Kind**:
+The operator's statement of what this Vigil install handles, or what the
+organisation is, worded as its source names it. Eleven kinds ship in this
+release, each listed under the jurisdiction its source names; PCI DSS names
+none. The cardholder-data-environment kind brings the PCI DSS assessment
+kind. The two New York kinds exclude each other. Stored on the same row as
+Jurisdiction. A missing row is no kind. A stored id this release does not
+offer is kept and reported as no longer offered; a save of offered ids drops
+it. A stored kind whose jurisdiction is not selected is kept and flagged,
+and changes nothing.
+_Avoid_: sector, regulated activity
+
+**Report Record**:
+One completed Day 1 Report run (`report_records`), inserted once and never
+rewritten. `vigil_app` may insert and read it, not update, delete or truncate
+it. It holds the modules that ran, each check's outcome with its evidence and
+reason, what started the run (readiness, the fallback time, a person's Day 1
+run, the automatic Production Start Report, or an on-demand one), the time
+and Vigil's version. The run's start is its own row
+(`report_runs`), so a start with no record can be shown. People are stored as
+account ids and shown by name when the record is read.
+_Avoid_: result store (outcomes live only here)
+
+**Report Check**:
+One entry in the check registry (`core/reporting/checks.py`): Vigil's own id,
+its module, the permission that gates its source, and its rule. A settings
+check also carries its scoped values. Each value names jurisdictions and
+kinds, or every install, and carries a ceiling, floor or level, whether it
+is in force or proposed, the source id, the clause, the link, the date it
+was checked, and Vigil's own wording. There is no field for quoted text. The
+registry holds the checks for what Vigil can see, for Vigil's own settings,
+for detection coverage, and for what CrowdStrike, Defender and Wazuh still
+list. Outcomes are not stored on the entry.
+_Avoid_: rule check, credential check (those are other checks)
+
+**Applicable Value**:
+The one in-force value a settings check is scored against on a report run.
+It is the tightest value whose scope the selection holds in full. A scope is
+held in full when every jurisdiction and kind it names is selected. When no
+scoped value is held, the every-install value is used. A scoped value is
+used even when it equals the every-install value. Two equal scoped values:
+the scope that names more of the selection, else the registry order. A
+proposed value inside the selection is shown and is not scored. When none
+is in force, the check stores no cited value. That is not a Check Outcome:
+the row says "no cited value for your selection", shows no pass or fail, and
+stays out of the summary's actions. The selection and the Applicable Value
+are written onto the Report Record when the run is stored. A record that
+stored no citation keeps the citation text from before values were scoped.
+_Avoid_: check outcome, compliance
+
+**Provider Statement**:
+What the operator states about a model provider type, recorded on the
+provider's settings under AI models with `platform.write`: self-hosted (the
+model runs on hardware the operator controls; stored as `config.self_hosted`,
+which pricing reads too), a signed BAA, the HIPAA-eligible account mode, the
+processing and support region, a FedRAMP authorization and an EU transfer
+basis. Each takes a value from a list, "not stated" included. It is held per
+provider type: it counts only when every active row of the type carries it.
+Each keeps the account id that made it, the date, and a hash of the addresses
+the provider's calls reach (`core.llm.residency`); a different hash clears it,
+as a change to Vigil's copy of the Vertex region clears a region statement. A
+credential set or cleared since makes the check "needs a person" until
+someone re-confirms it. Read by one check, where model processing runs; never
+exported, never a vendor's claim. An address is never a self-hosted statement.
+_Avoid_: attestation, certification, verified
+
+**Check Outcome**:
+What one Report Check returned on one Report Record: pass, fail, not checked
+(with the reason), or needs a person. Not checked never reads as a pass.
+_Avoid_: result, finding
+
+**Report Module**:
+One section of the Day 1 Report. What Vigil can see (`integrations.read`)
+lists each source's health and reason, what it brings in (alerts, lookups or
+rules), when data last arrived, and the labels seen on webhook events, all as
+information, plus switched-off integrations and the state of collection, the
+background service and the model. Vigil's own settings compares each live
+session and retention value with its Applicable Value, and shows that
+comparison, the citation, a link to the setting and, for MFA, a count of
+accounts.
+Detection coverage (`detections.read`) lists techniques that are not proven,
+blind spots, techniques covered on paper only, rules that fail to run or whose
+data is silent, and Quiet, Noisy and Silent results that are not a pass. A
+category with none of those passes. A result the sweep did not store reads not
+checked: search budget; a rule that is too new reads not checked: too new. The
+stored record stays complete; a reader who lacks the module's permission is
+not shown that section. On a demo-data install the report's first line says
+it describes the install, not the demo data. Demo findings are not read as
+data received.
+_Avoid_: Visibility Gap, Declared Gap (those are run-scoped)
+
+**Report Section**:
+A Report Module whose output is figures and lists, with no checks and no
+outcome. It is absent from the one-page summary and from comparison. Your
+"before" (`history.before`), the re-check list (`history.recheck`) and tuning
+candidates (`history.tuning`) are Report Sections, each read under
+`findings.read`. Their figures, counts and ticket references are stored on the
+Report Record's evidence, under the module id. Titles, entity values and
+unmapped disposition text are read from the import when the report is viewed,
+and only for a reader who holds `automation.read`. A section that cannot be
+read says not checked and the reason, and the rest of the report completes.
+The stored record stays complete; a reader who lacks `findings.read` is not
+shown the section.
+_Avoid_: Report Check (a section has no checks)
+
 **Workflow** (`workflows`):
 The user-facing product noun — a named, multi-agent procedure an analyst runs
 from the Workflows screen. Authored as a **Playbook**, executed by **Compose**.
@@ -146,6 +346,41 @@ exception, and what ranks an entity up is accumulation of them across
 investigations, never being one.
 _Avoid_: visibility gap (that is a tool that could not answer), unknown, null result
 
+**Declared Site**:
+What the operator states about the site as files under change control:
+`site/*.md` in the declared directory (`VIGIL_INTENT_DIR`), beside `INTENT.md`.
+Four lists, each item by **Selector**: zones, crown jewels with the mission they
+serve, owners naming a Vigil team, and **Site Blind Spots**. The daemon applies
+each revision on its own verdict (`site.applied`), refuses a broken one whole
+with file and line and keeps the last good one. It ranks and informs; it never
+closes, permits or acts. A crown jewel is held for a person (`crown_jewel_held`
+in `core/response/ceiling.py`, `hold_crown_jewels` on the ceiling, on by
+default): no model closes a case whose findings name it, and a run no person
+started may not add an exception, dismiss a finding or make a reversible or
+irreversible outside call naming it. Limits: a vendor device id is not read; a
+crown jewel declared only by name does not match a range, so declare its
+addresses too; a case whose findings name no crown jewel is not held; an
+exception keyed on no host, address or account is not read. One module holds
+the site: `core/site.py`.
+_Avoid_: inventory, asset list, CMDB (Vigil keeps no list of hosts)
+
+**Selector**:
+A plain string naming entities in the **Declared Site**: `cidr:<range>`, which
+matches `ip:` keys, or an **Entity Key** of a kind in `ENTITY_KEY_TYPES`,
+normalised as `normalise_key` mints it, where `*` in the value matches any run
+of characters. No other wildcard, no regex, and no group, tag or cloud
+selectors: a revision's validity never depends on a source being connected.
+Matched only in Python, by `core.site.match` and `core.site.crown_jewel`.
+_Avoid_: filter, query, pattern
+
+**Site Blind Spot**:
+A place the operator states Vigil cannot see, declared in `site/*.md` with its
+selectors and what is not seen there. It reaches a hunt as an operator gap.
+Not a coverage blind spot (a data source no rule reads), not a **Visibility
+Gap** (a tool a run could not use) and not a **Declared Gap** (a question an
+investigation left open): those are found by Vigil, this is stated by a person.
+_Avoid_: blind spot (alone), visibility gap, declared gap
+
 **Episodic Memory** (`memory`):
 What earlier investigations saw and concluded, so a later run stops re-deriving
 a settled answer. A hunt's is derived from its **Ledger** at the terminal; a
@@ -167,12 +402,53 @@ What closing a **Case** determined: `resolved`, `false_positive`, `duplicate`,
 is a recorded absence, not a determination.
 _Avoid_: resolution, disposition, reason
 
+**False-Positive Cause** (`cases`):
+Which kind of fix a false-positive determination is: `expected` (the activity
+was expected or authorized), `too_broad` (the rule's logic needs work), `data`
+(a field, parser or source is wrong), or `other`. It refines a **Closure
+Category** of `false_positive` and a noise mark. Absence is a null column, not
+a member of the set.
+_Avoid_: not given, reason, disposition
+
 **Entity Key**:
 The `type:value` string an **Episodic Memory** row is written and queried on --
-`ip:10.0.0.5`, `host:dc01`. Minted by one rule, defang then case-fold, sparing the
-types where case is significant, so a stored key and a queried key cannot be
-normalised two ways. A `shared_iocs` key is the same shape on a different
-vocabulary and is not one of these.
+`ip:10.0.0.5`, `host:dc01`. Minted by one rule, defang then case-fold, so a stored
+key and a queried key cannot be normalised two ways. `arn` and `aws_key` keep
+case whole. `process` keeps it for an absolute POSIX path, and `url` keeps it
+in its path, query and fragment. `user` and `email` are case-folded by design,
+on every path a key enters by, including keys a person types.
+
+Whether two spellings are one account depends on the system that owns it, and
+a key sees only a type and a value. Most account systems Vigil sees match names
+without case: Windows and Active Directory, Entra ID, AWS IAM, Okta, Google
+Workspace and most SaaS, and LDAP. Linux and Unix local accounts are
+case-sensitive; their names are lower case by convention, so two that differ
+only in case are rare. A bare name such as `deploy` looks the same in a Windows
+logon event and in an sshd log, and the key cannot tell them apart. Keeping
+case would silently split the history of most accounts. Case-folding merges
+that rare pair. The key is a matching index. The finding keeps its spelling, so
+an investigation still rests on the original. Recall, entity facts and the hunt
+graph inform an investigation and never decide it. The insider-lead path is
+where the case-fold steers an action, and there it narrows: a lead joins a hunt
+already running instead of starting a second one, and the attach is recorded on
+that case's activity. The parity check compares the two halves and holds no
+expected keys, so the same change made in both passes it. No operator has
+reported a wrong recall from merged case-variant accounts.
+
+Two accounts on a case-sensitive system (Linux or Unix local accounts) that
+differ only in case share one history. A Sighting shows its source system, not
+the spelling. A Verdict, Gap or note shows the spelling only where its prose
+does. A lead on one such account joins a hunt already running on the other
+instead of starting its own, and the attach is recorded on that case's
+activity. A hunt opened from a lead names the account in lower case. The
+finding on its case keeps the original spelling. An email's local part can be
+case-sensitive by its standard (RFC 5321), but providers and email-style
+identity systems match it without case, so `email` is case-folded the same way
+as `user`. The case-fold is lower-casing. The parity check compares ASCII
+inputs; non-ASCII names follow each runtime's own case tables.
+
+A `shared_iocs` key is the same shape on a different vocabulary and is not one
+of these.
 _Avoid_: IOC key, indicator, entity id
 
 **Recall**:
@@ -218,6 +494,25 @@ aid and not an input.
 _Avoid_: failed recall, empty recall, **Declared Gap** (that is a question an
 investigation left open, not a read that did not happen), **Visibility Gap** (that
 is a tool that could not answer about the estate)
+
+**Facts Event**:
+The **Ledger** record of the entity facts an investigation opened on (#4742): what
+Entra, Okta and Falcon said about the users and hosts its trigger findings name,
+read by the harness at run start beside **Recall** and on the same terms -- not a
+granted tool, once per run, on the trigger findings' **Entity Keys**. A read that
+was served carries each row with its source and `fetched_at`, and each source that
+could not answer with its reason; a read that could not happen at all -- the
+endpoint failed or refused, or the run may not read its Case -- carries the keys
+and the reason and none of the rest, and the run carries it for its life as it
+would an **Unavailable Read**. A run on a Case reads that Case's own rows, copying
+a fresh caseless row onto the Case before asking a source. It also carries
+"Declared" rows from the applied site revision for every key the run names, `ip:`
+keys included, each with its kind, name, owner, file, line and revision; they come
+from no source and are never stored. The prefix block and a replay render from
+this event, never from the table. Facts inform and settle nothing; a hunt reads
+declared rows only.
+_Avoid_: enrichment, entity context, Recall (facts are what a source says now, not
+what past work concluded)
 
 **Sighting**:
 What one investigation observed about one entity from one source. One row per
@@ -317,8 +612,9 @@ collide with the capability domains above often enough to belong beside them.
 **Ledger**:
 The append-only event log of one run, and its only durable record. Every other
 view of a run is derived from it rather than stored beside it. The application
-role `vigil_app` may `SELECT` and `INSERT`; `UPDATE`, `DELETE` and `TRUNCATE`
-are revoked at the database.
+role `vigil_app` and the agent layer's own role `vigil_agent` may `SELECT` and
+`INSERT`; `UPDATE`, `DELETE` and `TRUNCATE` are revoked at the database.
+`vigil_agent` holds nothing beyond the agent tables.
 _Avoid_: journal, audit log, history
 
 **Fold**:
@@ -582,7 +878,8 @@ _Avoid_: page, tab, view
   still exist. A hunt run by current code can be a regression snapshot, never a
   Golden.
 - **`type:value` keys are minted by two rules that disagree.** An **Entity Key**
-  (`core/memory/entity_keys.py`) keeps case for `arn` and `aws_key`; a
+  (`core/memory/entity_keys.py`) keeps case whole for `arn` and `aws_key`, and
+  in part for `process` and `url`; a
   `shared_iocs` key (`core/storage/shared_ioc_repository.py`) folds everything,
   and spells a host `hostname` where memory spells it `host`. Both defang, by the
   one rule in `core/storage/defang.py`. Handing one subsystem's

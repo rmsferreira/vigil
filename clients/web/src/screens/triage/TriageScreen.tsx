@@ -12,7 +12,7 @@ import { utcClock } from '../../shared/utc'
 import type { ConsoleScreenProps } from '../../shared/types'
 import { parseSourceEvidence } from '../../data/sourceEvidence'
 import { SourceEvidenceSection } from '../dashboard/SourceEvidenceSection'
-import { triageApi, type TriagePayload, type TriageQuery, type TriageRow, type TriageSource, type TriageVerdict } from '../../services/api'
+import { triageApi, type TriagePayload, type TriageQuery, type TriageRow, type TriageRaisedBy, type TriageSource, type TriageVerdict, type ThreatIntelCheck } from '../../services/api'
 import { SeverityMark } from '../../shared/SeverityMark'
 import FindingDetails from '../../shared/FindingDetails'
 import { IntakeBanners } from '../../shared/AutoOpsOffBanner'
@@ -332,6 +332,27 @@ function WorkDone({ row, openCase }: { row: TriageRow; openCase: (id: string) =>
   )
 }
 
+const TI_OUTCOMES: Record<ThreatIntelCheck['outcome'], string> = {
+  hit: 'Feed hit',
+  no_hit: 'Checked, no match',
+  nothing_to_check: 'Nothing to check: no IPs, domains or hashes',
+  could_not_check: 'Could not run',
+}
+
+// what the feed answered; a failed or partial check names what failed
+function threatIntelText(check: ThreatIntelCheck | null): string {
+  if (!check) return 'Not recorded: no feed enabled, or enrichment did not run'
+  const label = TI_OUTCOMES[check.outcome]
+  return check.detail ? `${label} (${check.detail})` : label
+}
+
+// what launches the row ahead of older rows in its band, named where it was declared
+function raisedText(raised: TriageRaisedBy | null): string {
+  if (!raised) return 'No'
+  if (raised.source === 'enrichment') return `enrichment: ${raised.criticality}`
+  return `Crown jewel ${raised.name} (${raised.file}:${raised.line} @ ${raised.revision ?? 'unknown'})`
+}
+
 function Expanded({ row, data, openCase }: { row: TriageRow; data: TriagePayload; openCase: (id: string) => void }) {
   const tips = data.breakdown_info
   return (
@@ -339,8 +360,10 @@ function Expanded({ row, data, openCase }: { row: TriageRow; data: TriagePayload
       {row.reason && <BreakdownRow label="Why it was not picked up">{row.reason}</BreakdownRow>}
       <WorkDone row={row} openCase={openCase} />
       {row.triage && <VerdictPanel verdict={row.triage} />}
+      {row.kind === 'detection' && <BreakdownRow label="Threat-intel check">{threatIntelText(row.threat_intel_check)}</BreakdownRow>}
       <span className="tq-h">How the ranking was worked out</span>
       <BreakdownRow label="Severity band">{row.severity_band}</BreakdownRow>
+      {row.kind === 'detection' && <BreakdownRow label="Raised in its band">{raisedText(row.raised_by)}</BreakdownRow>}
       <BreakdownRow label="Age">{fmtDuration(row.age_seconds)}</BreakdownRow>
       <BreakdownRow label="Time to live">{fmtDuration(row.ttl_seconds)}</BreakdownRow>
       <BreakdownRow label="In the last quarter of its wait">{row.last_quarter ? 'Yes' : 'No'}</BreakdownRow>

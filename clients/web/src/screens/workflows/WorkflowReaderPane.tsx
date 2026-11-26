@@ -29,6 +29,8 @@ interface Preflight {
   permissions: Permission[]
   permissions_note: string | null
   budgets: Budgets
+  /** Set when the deployment wall was a number outside its range and was ignored. */
+  wall_note?: string | null
   checkpoints: Record<string, 'ask' | 'auto'>
   checkpoints_note: string | null
 }
@@ -403,6 +405,7 @@ function StopsAndCheckpoints({ definition, single, pre, stage, selected, missing
           <span className="text-accent inline-flex pt-0.5"><Icon name="info" size={10} /></span>{line}
         </span>
       ))}
+      {pre.wall_note && <span className="text-[12px] leading-[1.4]" style={{ color: 'var(--high)' }}>{pre.wall_note}</span>}
       <SubLabel>Checkpoints</SubLabel>
       {!pre.checkpoints && <Muted>{missing}</Muted>}
       {classes.map((c) => (
@@ -566,7 +569,8 @@ function Header({ name, wf, actions, definition, onSave, onChangeDescription }: 
   )
 }
 
-export default function WorkflowReaderPane(props: ReaderProps) {
+/** `children` close the pane, under the stages (the threat-hunt lead list). */
+export default function WorkflowReaderPane(props: ReaderProps & { children?: ReactNode }) {
   const draft = 'draft' in props ? props.draft : null
   const { phase, definition, pre, missing } = useSource('wf' in props ? props.wf.id : null, draft, 'draft' in props ? props.grants : [])
   const [selected, setSelected] = useState<number | null>(null)
@@ -616,6 +620,7 @@ export default function WorkflowReaderPane(props: ReaderProps) {
                 {panels}
               </>
             )}
+            {props.children}
           </>
         )}
       </div>

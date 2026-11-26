@@ -1,10 +1,14 @@
 # Vigil SOC
 
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
+[![Latest release](https://img.shields.io/github/v/release/Vigil-SOC/vigil)](https://github.com/Vigil-SOC/vigil/releases/latest)
+[![CI/CD Pipeline](https://github.com/Vigil-SOC/vigil/actions/workflows/ci-cd.yml/badge.svg)](https://github.com/Vigil-SOC/vigil/actions/workflows/ci-cd.yml)
+
 Vigil is an open source, agentic AI SOC released under Apache 2.0. Your playbooks are plain-text Markdown files, your agent logic is readable code, and your integrations use an open standard ([MCP](https://modelcontextprotocol.io/)). It is a capability you own, not a black box you rent.
 
 Vigil runs on its own: a local clone, Docker, and any supported LLM provider (a local Ollama model works). [LogLM](https://www.deeptempo.ai/platform), DeepTempo's cybersecurity foundation model for [behavioral anomaly detection](https://www.deeptempo.ai/learning-center/behavioral-anomaly-detection), is an optional MCP integration you enable in Settings, not a prerequisite. Docs and community: [vigilsoc.org](https://vigilsoc.org).
 
-**Vigil 1.0 is coming.** We believe it will be the first AI SOC built for a human *on* the loop rather than *in* it. Join the upcoming office hours for a preview.
+**Vigil is GA.** Stable releases and a daily beta of `main` are published on the [releases page](https://github.com/Vigil-SOC/vigil/releases/latest). We believe it is the first AI SOC built for a human *on* the loop rather than *in* it.
 
 The project draws on the founders' experience building [StackStorm](https://github.com/StackStorm/st2) and supporting teams, including Netflix, that used it to reach high levels of automation carefully. One lesson carries through: the system can only demote its own autonomy, and only humans can promote it. Vigil checks projected cost and confidence before acting, and asks a human when either looks off.
 
@@ -104,9 +108,17 @@ Some integrations are marked **Experimental** in Settings. These are CrowdStrike
 
 Enable and configure integrations under **Settings → Integrations**, or generate one from API docs with the **Custom Integration Builder**. If you build an integration you find useful, someone else will too. Please contribute it.
 
-**Vigil's own MCP server.** Vigil serves its SOC operations (findings, cases, approvals, hunts) at `/mcp`, the same tools its agents use. The finding, case, and approval tools that mirror frozen `/api/v1` operations are frozen: their names and input schemas are pinned in [`tools/mcp/frozen_tools.snapshot.json`](tools/mcp/frozen_tools.snapshot.json). The rest are served under the `0.x` terms in [`SECURITY.md`](SECURITY.md#supported-versions).
+**Vigil's own MCP server.** Vigil serves its SOC operations (findings, cases, approvals, hunts) at `/mcp`, the same tools its agents use. The finding, case, and approval tools that mirror frozen `/api/v1` operations are frozen: their names and input schemas are pinned in [`tools/mcp/frozen_tools.snapshot.json`](tools/mcp/frozen_tools.snapshot.json). The rest are served under the `0.x` terms in [`SECURITY.md`](SECURITY.md#supported-versions). To work Vigil from a Claude Code session, install [the Claude Code client](clients/claude-code/README.md): `claude plugin marketplace add Vigil-SOC/vigil@v<your Vigil version> --sparse .claude-plugin clients/claude-code`, then `claude plugin install vigil-soc@vigil`.
 
 **Detection rules.** The detection-engineering integration ([security-detections-mcp](https://www.npmjs.com/package/security-detections-mcp)) indexes community rule sets (Sigma, Splunk ESCU, Elastic, KQL) for search, coverage analysis, and gap identification. Vigil does not ship the rules; fetch them with `./scripts/setup_detection_repos.sh` (or `SETUP_DETECTION_REPOS=1 ./setup_dev.sh`).
+
+---
+
+## What Vigil is not
+
+- **Not a SIEM or log store.** Vigil works on findings from your existing tools, connected over MCP. It does not ingest or retain raw telemetry.
+- **Not a detection-rule pack.** Community rule sets (Sigma, Splunk ESCU, Elastic, KQL) are fetched separately and indexed for search, coverage analysis, and gap identification. Vigil does not ship the rules and does not execute them.
+- **Not autonomous response.** Response actions are proposed as approval requests and wait for an analyst. No confidence score auto-approves an action.
 
 ---
 
@@ -127,18 +139,34 @@ Security keys (WebAuthn) are tied to the hostname the console is reached at: set
 `start.sh` provisions the pinned Python with [uv](https://docs.astral.sh/uv/), installs dependencies, starts PostgreSQL, Redis, and the Bifrost LLM gateway in Docker, starts a host Ollama if one is installed (optional), initializes the schema and reference data, and launches the API, the agent layer, and the frontend. No LogLM or cloud API key is needed to reach a running UI.
 
 - **`AGENT_INTERNAL_TOKEN`** lets the agent layer talk to the API. `start.sh` (and `setup_dev.sh`) creates `.env` from `env.example` and fills an empty token with a random one; a value already set is kept. Without it the agent layer does not start: workflow runs stay queued and chat answers 503.
+- **Database passwords.** `POSTGRES_PASSWORD` (the database owner), `POSTGRES_APP_PASSWORD` (the `vigil_app` login the backend, daemon and workers use) and `POSTGRES_AGENT_PASSWORD` (the `vigil_agent` login the agent layer uses) are generated per install and kept in `.env`. `start.sh` fills an empty one, replaces one still holding a value an older `env.example` shipped, and sets the database to match `.env` on every start; Compose and the backend refuse a published value unless `DEV_MODE=true`.
 - **The SOC daemon** (alert polling, auto-triage) runs only with `./start.sh -d`; the foreground start says so. Setup's system checks show whether the daemon and the agent layer are running.
 - **Authentication is on by default.** No account or default password ships; the first visit creates the admin, using the setup code the API prints at startup while no account exists. `start.sh` creates the JWT signing secret at `~/.vigil/jwt_secret`. For an unauthenticated instance on your own machine, set `DEV_MODE=true` in `.env`; the backend announces the bypass on every startup.
 
-> **Stable vs. development build:** `main` is the active development branch. For a tested build, check out a release tag (`git checkout v<version>`) or pull a published image (`docker pull ghcr.io/vigil-soc/vigil-backend:<version>`). Releases are listed on the [releases page](https://github.com/Vigil-SOC/vigil/releases/latest).
+> **Stable vs. development build:** `main` is the active development branch. For a tested build, check out a release tag (`git checkout v<version>`) or pull a published image. Releases are listed on the [releases page](https://github.com/Vigil-SOC/vigil/releases/latest); how they are cut is in [releasing](docs/releasing.md).
 >
-> Released images are signed keyless by [`.github/workflows/release.yml`](.github/workflows/release.yml). To verify (the image tag drops the leading `v`; the certificate identity uses the git tag):
+> | Image tag | Points to | Who it's for |
+> |---|---|---|
+> | `1.2.1`, `1.2` | An exact version | Production (recommended) |
+> | `stable` (same as `latest`) | The newest stable release | Anyone who wants stable without pinning |
+> | `beta` | The newest daily build of `main` | Our own deployments, testers |
+>
+> Every `ghcr.io/vigil-soc/vigil-*` image (`backend`, `daemon`, `agent`, `mcp-runner`, `medic`, `medic-gateway`, `medic-dockerproxy`) is tagged this way. A beta also carries its own version, like `1.2.0-beta.20261115.42`; it never gets `latest` or `stable`, and that version tag is deleted 14 days after it is built, so pin to one only for a short test. `beta` is a daily build of `main` that may include database changes, and it is one-way: a database that has run a beta can't go back to the previous stable release.
+>
+> Each release and beta also publishes, under its version only: the Helm chart at `oci://ghcr.io/vigil-soc/charts/vigil`, its dependencies vendored, and `ghcr.io/vigil-soc/vigil-release`, a scratch image holding `list.json` (every image an install runs, Vigil's and third-party, by index digest and per-platform digest) and the source tree it was built from. The release notes list each artifact's digest.
+>
+> All of them are signed keyless: releases by [`.github/workflows/release.yml`](.github/workflows/release.yml), betas by [`beta.yml`](.github/workflows/beta.yml). Images are signed per index and per platform manifest. Verify an image, one of its platform manifests, the chart and the list (image tags drop the leading `v`; the certificate identity uses the git tag):
 >
 > ```bash
-> cosign verify \
->   --certificate-identity https://github.com/Vigil-SOC/vigil/.github/workflows/release.yml@refs/tags/v<version> \
->   --certificate-oidc-issuer https://token.actions.githubusercontent.com \
->   ghcr.io/vigil-soc/vigil-backend:<version>
+> ID=https://github.com/Vigil-SOC/vigil/.github/workflows/release.yml@refs/tags/v<version>
+> # A beta instead: ID=https://github.com/Vigil-SOC/vigil/.github/workflows/beta.yml@refs/heads/main
+> ISSUER=https://token.actions.githubusercontent.com
+> cosign verify --certificate-identity "$ID" --certificate-oidc-issuer "$ISSUER" ghcr.io/vigil-soc/vigil-backend:<version>
+> AMD64=$(docker buildx imagetools inspect --raw ghcr.io/vigil-soc/vigil-backend:<version> \
+>   | jq -r '.manifests[] | select(.platform.architecture == "amd64") | .digest')
+> cosign verify --certificate-identity "$ID" --certificate-oidc-issuer "$ISSUER" "ghcr.io/vigil-soc/vigil-backend@$AMD64"
+> cosign verify --certificate-identity "$ID" --certificate-oidc-issuer "$ISSUER" ghcr.io/vigil-soc/charts/vigil:<version>
+> cosign verify --certificate-identity "$ID" --certificate-oidc-issuer "$ISSUER" ghcr.io/vigil-soc/vigil-release:<version>
 > ```
 
 ### Prerequisites
@@ -237,7 +265,7 @@ cd clients/web && npm install && npm run dev
 docker compose --env-file .env -f infra/docker/docker-compose.yml up -d
 ```
 
-Pass the repo-root `.env` explicitly, or `AGENT_INTERNAL_TOKEN` reaches the containers empty (`./setup_dev.sh` fills an empty one in `.env`). The `backend` container refuses to start without `JWT_SECRET_KEY`. Set it in `.env`, for example `export JWT_SECRET_KEY="$(cat ~/.vigil/jwt_secret)"` if `start.sh` has run before, or `openssl rand -base64 48`.
+Run `./start.sh` (or `./setup_dev.sh` on a fresh checkout) once first: it writes the three database passwords into `.env`, and `up` stops with a one-line message while any is empty. Pass the repo-root `.env` explicitly, or the containers get none of its values and `AGENT_INTERNAL_TOKEN` reaches them empty. The `backend` container refuses to start without `JWT_SECRET_KEY`. Set it in `.env`, for example `export JWT_SECRET_KEY="$(cat ~/.vigil/jwt_secret)"` if `start.sh` has run before, or `openssl rand -base64 48`.
 
 The default set runs the database, cache, gateway, backup, API, and agent layer: everything a chat-driven workflow needs. Opt-in profiles add more: `daemon` (the SOC daemon plus the ARQ worker, for headless 24/7 monitoring), `dev`, `observability`, `splunk`, `kafka`, `elastic`, and `misp`:
 
@@ -245,7 +273,52 @@ The default set runs the database, cache, gateway, backup, API, and agent layer:
 docker compose --env-file .env -f infra/docker/docker-compose.yml --profile daemon up -d
 ```
 
+**Change a database password.** Postgres keeps the owner password in its volume from the first start, so editing `.env` alone locks the owner out. Edit `POSTGRES_PASSWORD`, `POSTGRES_APP_PASSWORD` or `POSTGRES_AGENT_PASSWORD` in `.env` (keep them all different), then run `./start.sh`: it sets all three in the database from `.env` before anything logs in. Without `start.sh`, set them yourself first, then restart the stack:
+
+```bash
+docker exec -i deeptempo-postgres psql -U deeptempo -d deeptempo_soc <<'SQL'
+ALTER ROLE deeptempo PASSWORD '<new owner password>';
+ALTER ROLE vigil_app PASSWORD '<new vigil_app password>';
+ALTER ROLE vigil_agent PASSWORD '<new vigil_agent password>';
+SQL
+```
+
 On the host, `./start.sh -d` also runs the daemon (`services/daemon/main.py`), or run it alone against a running stack with `python services/daemon/main.py`.
+
+### Run released images
+
+Compose can run a release's images with nothing built on the host. Every image comes from one variable, each defaulting to what a checkout builds or pulls today:
+
+| Variable | Services | Default |
+|---|---|---|
+| `VIGIL_BACKEND_IMAGE` | `upgrade`, `backend`, `backup`, `backup-pre-upgrade`, `llm-worker` | `vigil-backend:local` |
+| `VIGIL_DAEMON_IMAGE` | `soc-daemon` | `vigil-daemon:local` |
+| `VIGIL_AGENT_IMAGE` | `agent-worker`, `agent-serve`, `agent-shell` | `vigil-agent:local` |
+| `VIGIL_MCP_RUNNER_IMAGE` | `mcp-runner-token`, `metrics-token`, `mcp-runner` | `vigil-mcp-runner:local` |
+| `VIGIL_MEDIC_IMAGE` | `medic` | `vigil-medic:local` |
+| `VIGIL_MEDIC_GATEWAY_IMAGE` | `medic-gateway` | `vigil-medic-gateway:local` |
+| `VIGIL_MEDIC_DOCKERPROXY_IMAGE` | `medic-dockerproxy` | `vigil-medic-dockerproxy:local` |
+| `VIGIL_POSTGRES_IMAGE` | `postgres` | `postgres:16-alpine@sha256:…` (pinned) |
+| `VIGIL_REDIS_IMAGE` | `redis` | `redis:7-alpine@sha256:…` (pinned) |
+| `VIGIL_BIFROST_IMAGE` | `bifrost` | `maximhq/bifrost:${BIFROST_IMAGE_TAG:-v2.2.1@sha256:…}` (pinned) |
+
+Load (or pull) the images first, set the variables in `.env` or the shell, then mint this install's secrets and start. `./start.sh secrets` needs only openssl, awk and Docker: no virtualenv, no package install, nothing started. It prints the two `export` lines below, because the JWT secret and the Redis password stay in `~/.vigil`, never in `.env`:
+
+```bash
+./start.sh secrets
+export JWT_SECRET_KEY="$(cat ~/.vigil/jwt_secret)"
+export REDIS_PASSWORD="$(cat ~/.vigil/redis_password)"
+scripts/medic/enable-compose.sh --secrets-only   # with Medic only
+docker compose --env-file .env --env-file ~/.vigil-medic/secrets/compose.env \
+  -f infra/docker/docker-compose.yml -f infra/docker/medic/docker-compose.medic.yml \
+  --profile daemon --profile medic up -d --no-build
+```
+
+Without Medic, leave out its `compose.env`, its Compose file and `--profile medic`. `--no-build` makes a missing image an error that names it (`No such image: …`) instead of a build. `scripts/medic/enable-compose.sh` builds no Medic image while any of the three Medic variables is set.
+
+**On Compose, an image's integrity holds when it is loaded, not when it runs.** Compose starts whatever the tag points at when the container is created, and anyone with Docker on the host can retag it afterwards. Verify each image when you load it (`cosign verify`, see [SECURITY.md](SECURITY.md)), and name it by digest (`ghcr.io/vigil-soc/vigil-backend@sha256:…`) to make a retag visible.
+
+The optional profiles (`dev`, `observability`, `splunk`, `kafka`, `elastic`, `misp`, `wazuh-sandbox`) are not covered: their images keep their fixed references and are pulled from their registries.
 
 ### Install on Kubernetes
 
@@ -288,6 +361,8 @@ Re-run with `sudo` to include system logs that need elevation; the bundle still 
 > **DATA NOTICE:** the bundle holds host information: hostname, the full process list with command lines, system logs, and disk usage. Known credential formats are redacted, but secrets in free log text cannot be guaranteed caught. Review it before you share it.
 
 When it finds a Vigil install, the bundle also collects its configuration, health output, container status, and logs. Secrets, keys, and database contents are never included; `SUMMARY.txt` lists what was left out. See [`scripts/vigil-support/README.md`](scripts/vigil-support/README.md).
+
+Pass `--medic` to also write Medic's section for the `--since` window: `medic/section.json` inside the archive, for the site's own team, and `<archive>.medic.json` beside it, the part that can go on a public defect report. Without the flag the run is unchanged, and the archive itself stays the site file the data notice describes.
 
 ---
 
@@ -360,6 +435,7 @@ Guides live at **[vigilsoc.org/docs](https://vigilsoc.org/docs/)**:
 | [Contributing](https://vigilsoc.org/docs/contributing/) | How to contribute, DCO |
 | [Security keys](docs/security-keys.md) | The hostname and HTTPS rule, an internal CA for air-gapped consoles, and what "keys unavailable" means |
 | [Operator endpoints](docs/operator-endpoints.md) | API routes with no console screen: secrets backend status, dotenv → encrypted migration |
+| [Audit trail](docs/audit-trail.md) | What the trail keeps and does not rewrite, what a backup or a forwarded copy still holds, and that an account has no set end date |
 | [SECURITY.md](SECURITY.md) | Vulnerability reporting, supported versions, disclosure |
 | [VERSIONING.md](VERSIONING.md) | What is frozen, what is not, and how the contract changes |
 | [Adoption figures](docs/metrics.md) | Daily views, clones, stars, forks, and contributor history, published unaltered at [Vigil-SOC/metrics](https://github.com/Vigil-SOC/metrics) |

@@ -4,10 +4,18 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import time
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
+
+# One health write per integration per process. A lookup a minute is enough
+# to keep last success current; the calls in between are the same source.
+_LOOKUP_GAP = 60.0
+_lookup_noted: Dict[str, float] = {}
+_lookup_tasks: set = set()
 
 if TYPE_CHECKING:
     from core.integrations.mcp.registry import MCPRegistry
@@ -71,6 +79,44 @@ def rows_from(result: Dict[str, Any]) -> List[Any]:
     return rows
 
 
+def row_error(rows: Optional[List[Any]]) -> Optional[str]:
+    """The failure a tool's rows are carrying, or None when they are data.
+
+    An ``error`` key, or a text-only reply that is an error message. Okta's
+    server reports a failed call that way (``### Error executing tool``)
+    rather than an ``error`` field, and that text is not a successful read.
+    """
+    rows = rows or []
+    for row in rows:
+        if isinstance(row, dict) and row.get("error"):
+            error = row["error"]
+            detail = str(error)
+            if isinstance(error, str) and error.isidentifier():
+                message = next(
+                    (
+                        r.get("message")
+                        for r in rows
+                        if isinstance(r, dict) and r.get("message")
+                    ),
+                    "",
+                )
+                detail = str(message or error)
+            return detail
+    texts: List[str] = []
+    for row in rows:
+        if not isinstance(row, dict) or set(row) - {"text"}:
+            return None
+        if row.get("text"):
+            texts.append(str(row["text"]))
+    if not texts:
+        return None
+    blob = " ".join(texts)
+    lowered = blob.lower()
+    if "error executing tool" in lowered or lowered.startswith("error"):
+        return blob
+    return None
+
+
 def _failure_kind(text: str) -> str:
     lowered = text.lower()
     if "timed out" in lowered or "timeout" in lowered:
@@ -92,6 +138,66 @@ def _text_of(result: Dict[str, Any]) -> str:
             return " ".join(parts)
     error = result.get("error")
     return error if isinstance(error, str) else "the server reported an error"
+
+
+def _error_row(rows: Any) -> bool:
+    if isinstance(rows, dict):
+        return bool(rows.get("error"))
+    if not isinstance(rows, list):
+        return False
+    return any(isinstance(row, dict) and row.get("error") for row in rows)
+
+
+def _integration_for(server: str) -> Optional[str]:
+    """The one integration that owns ``server``, or None."""
+    from core.integrations._base.descriptor import iter_descriptors
+    from core.integrations.mcp.surface import VIGIL_SERVER
+
+    if server == VIGIL_SERVER:
+        return None
+    found = [
+        descriptor.id
+        for descriptor in iter_descriptors()
+        if server in descriptor.mcp_server_names
+    ]
+    if len(found) != 1:
+        return None
+    return found[0]
+
+
+def _note_lookup(server: str, rows: Any) -> None:
+    """A successful read notes that integration, at most once a minute.
+
+    A source scheduled collection polls ignores the note. Every other
+    integration records the read as a success. A bad indicator is not a health
+    signal, so an error row writes nothing. Nothing here raises into the tool
+    call, and nothing from the row is logged.
+    """
+    try:
+        if _error_row(rows):
+            return
+        source_id = _integration_for(server)
+        if source_id is None:
+            return
+        now = time.monotonic()
+        last = _lookup_noted.get(source_id)
+        if last is not None and now - last < _LOOKUP_GAP:
+            return
+        _lookup_noted[source_id] = now
+        task = asyncio.ensure_future(_write_lookup(source_id))
+        _lookup_tasks.add(task)
+        task.add_done_callback(_lookup_tasks.discard)
+    except Exception:  # noqa: BLE001 - the tool result stands without its note
+        logger.debug("Lookup health note skipped for %s", server)
+
+
+async def _write_lookup(source_id: str) -> None:
+    from core.storage.source_health import record_lookup
+
+    try:
+        await asyncio.to_thread(record_lookup, source_id)
+    except Exception:  # noqa: BLE001
+        logger.debug("Lookup health write skipped for %s", source_id)
 
 
 # Returns (rows, handled). handled is False only when no active server carries
@@ -135,9 +241,11 @@ async def execute_mcp_tool(
 
         result = await client.call_tool(server, tool, args, timeout=timeout_s)
     if not isinstance(result, dict):
-        return [result], True
-    if result.get("error"):
+        rows: Any = [result]
+    elif result.get("error"):
         detail = _text_of(result)
         raise MCPFailure(_failure_kind(detail), detail)
-
-    return rows_from(result), True
+    else:
+        rows = rows_from(result)
+    _note_lookup(server, rows)
+    return rows, True

@@ -1,4 +1,4 @@
-"""Password strength validation using zxcvbn entropy scoring (NIST 800-63B)."""
+"""Password strength validation using zxcvbn entropy scoring."""
 
 import logging
 import math
@@ -11,7 +11,6 @@ from zxcvbn import zxcvbn
 
 from core.auth import breached_list, session_policy
 from core.auth.password_hash import MAX_PASSWORD_LENGTH
-from core.config import get_settings
 from core.platform import notices
 from core.storage.models import User
 from core.storage.unit_of_work import unit_of_work
@@ -145,16 +144,15 @@ def validate_password_strength(
 ) -> None:
     """Raise PasswordPolicyError if password fails policy.
 
-    The minimum length and character rule come from the session policy; the
-    kwargs override for tests.
+    The minimum length, character rule and strength score come from the session
+    policy. ``min_length`` and ``min_score`` override the two numbers. A score
+    of 0 requires none.
     user_inputs: terms (username, email) zxcvbn penalizes if embedded.
     """
     policy = session_policy.policy()
     limit = min_length if min_length is not None else policy.password_min_length
-    threshold = (
-        min_score if min_score is not None else get_settings().auth_min_zxcvbn_score
-    )
-    # zxcvbn scores run 0-4; clamp so a misconfigured 5+ can't reject every
+    threshold = min_score if min_score is not None else policy.password_min_score
+    # zxcvbn scores run 0-4; clamp so a caller's 5+ can't reject every
     # password and a negative value can't underflow the check.
     threshold = max(0, min(4, threshold))
 
@@ -172,6 +170,8 @@ def validate_password_strength(
 
     check_character_rules(password, policy.password_character_rules)
     check_not_listed(password, user_inputs=user_inputs, blocklist=blocklist)
+    if threshold == 0:
+        return
 
     result = zxcvbn(
         password, user_inputs=user_inputs or [], max_length=MAX_PASSWORD_LENGTH
@@ -234,7 +234,10 @@ def _days(n: int) -> str:
 def expiry_warning(user: User) -> list[dict[str, str]]:
     """The bell's condition for a person whose password expires within a week."""
     due = expires_at(user, session_policy.policy().password_max_age_days)
-    if due is None or user.service_account is True:
+    # No password (SSO-only person; stored as "") means nothing to change
+    if due is None or user.service_account is True or not user.password_hash:
+        return []
+    if user.break_glass_at is not None:  # a break-glass password never expires
         return []
     left = math.ceil((due - utcnow()).total_seconds() / 86400)
     if left > WARN_DAYS:
@@ -262,8 +265,11 @@ def stale_service_accounts(user: User) -> list[dict[str, str]]:
             .filter(User.is_active.is_(True), User.service_account.is_(True))
             .all()
         )
+        # Token-only accounts have no password to rotate
         names = sorted(
-            a.username for a in accounts if expires_at(a, max_age) <= utcnow()
+            a.username
+            for a in accounts
+            if a.password_hash and expires_at(a, max_age) <= utcnow()
         )
     if not names:
         return []

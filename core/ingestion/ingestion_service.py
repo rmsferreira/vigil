@@ -23,12 +23,16 @@ from typing import Any, Dict, Iterable, List, Optional, Union
 
 import ijson
 
+from core.auth.permissions import builtin_reader
+from core.cases.assignee import AssigneeRefused, resolve_assignee
+from core.findings import netflow_describe
 from core.findings.source_evidence import (
     loglm_row_evidence,
     normalize_finding_source_evidence,
 )
 from core.ingestion.triage_signal import MAX_IDS
 from core.storage.score import optional_float as _optional_float
+from core.storage.unit_of_work import unit_of_work
 from core.time import utcnow
 
 logger = logging.getLogger(__name__)
@@ -138,20 +142,84 @@ def _blank(value: Any) -> bool:
 _NEWLINE = re.compile(rb"\r\n?")
 _LINE = re.compile(rb"[^\n]*\n|[^\n]+")
 
+# A line-oriented record is parsed whole and a findings batch is held whole, so
+# both are bounded in bytes as well as rows; a record can parse to many times its size.
+MAX_RECORD_BYTES = 1024 * 1024
+MAX_BATCH_BYTES = 8 * 1024 * 1024
+BATCH_ROWS = 1000
 
-def _utf8_lines(path: Path):
+
+def _utf8_lines(path: Path, max_line: int = MAX_RECORD_BYTES):
     """Yield each line as text, decoded as UTF-8, with universal newlines.
 
     A text-mode read fills an 8KiB chunk and raises UnicodeDecodeError for a
     bad byte before it yields any line from that chunk, so a short file drops
     every row that was already well formed. Decoding one line at a time keeps
     those rows. UTF-8 never uses the bytes ``\\r`` or ``\\n`` inside a
-    character, so splitting on them first is safe.
+    character, so splitting on them first is safe. The file is read in blocks,
+    and a line longer than ``max_line`` raises ValueError before it is held whole.
     """
     with open(path, "rb") as raw:
-        for chunk in raw:
-            for line in _LINE.findall(_NEWLINE.sub(b"\n", chunk)):
+        buf = b""
+        while block := raw.read(64 * 1024):
+            buf += block
+            # A trailing \r may be the first half of a \r\n split across blocks.
+            held = b"\r" if buf.endswith(b"\r") else b""
+            body = _NEWLINE.sub(b"\n", buf[: len(buf) - len(held)])
+            end = body.rfind(b"\n") + 1
+            for line in _LINE.findall(body[:end]):
+                if len(line) > max_line + 1:
+                    raise ValueError(f"a line is longer than {max_line} bytes")
                 yield line.decode("utf-8")
+            buf = body[end:] + held
+            if len(buf) > max_line + 1:
+                raise ValueError(f"a line is longer than {max_line} bytes")
+        if buf:
+            yield _NEWLINE.sub(b"\n", buf).decode("utf-8")
+
+
+class _RowBudget:
+    """Lines for csv.DictReader that refuse a row (quoted fields may span
+    lines) longer than ``limit`` characters; ``used`` is reset per row."""
+
+    def __init__(self, lines: Iterable[str], limit: int = MAX_RECORD_BYTES):
+        self.lines, self.limit, self.used = iter(lines), limit, 0
+
+    def __iter__(self):
+        return self
+
+    def __next__(self) -> str:
+        line = next(self.lines)
+        self.used += len(line)
+        if self.used > self.limit:
+            raise ValueError(f"a CSV row is longer than {self.limit} bytes")
+        return line
+
+
+def _csv_rows(lines: Iterable[str]):
+    """Yield (row, size) for each CSV row, each row bounded by MAX_RECORD_BYTES."""
+    budget = _RowBudget(lines)
+    reader = csv.DictReader(budget)
+    if reader.fieldnames is None:  # reads the header before rows are counted
+        return
+    budget.used = 0
+    for row in reader:
+        size, budget.used = budget.used, 0
+        yield row, size
+
+
+def _in_memory_cap() -> int:
+    from core.config import get_settings
+
+    return get_settings().max_in_memory_import_mb * 1024 * 1024
+
+
+def _file_digest(path: Path) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        while block := f.read(1024 * 1024):
+            h.update(block)
+    return h.hexdigest()
 
 
 def _json_object(value: Any) -> Any:
@@ -565,12 +633,27 @@ class IngestionService:
 
         try:
             if self.use_database and self.db_service:
-                # Check if case already exists
-                existing = self.db_service.get_case(case_id)
+                # Check if case already exists, restricted or not: intake is
+                # a built-in reader (#4354).
+                with builtin_reader():
+                    existing = self.db_service.get_case(case_id)
                 if existing:
                     logger.debug(f"Case {case_id} already exists, skipping")
                     self.stats["cases_skipped"] += 1
                     return True
+
+                # Stored as the username it names; a refusal keeps the trimmed
+                # text, and a non-string is kept as its text (the column and
+                # the owner lookup are strings), so no case drops over it.
+                assignee = case_data.get("assignee")
+                if isinstance(assignee, str):
+                    try:
+                        with unit_of_work() as session:
+                            assignee = resolve_assignee(session, assignee)
+                    except AssigneeRefused:
+                        assignee = assignee.strip()
+                elif assignee is not None:
+                    assignee = str(assignee)
 
                 # Create case in database
                 case = self.db_service.create_case(
@@ -580,7 +663,7 @@ class IngestionService:
                     description=case_data.get("description", ""),
                     status=case_data.get("status", "new"),
                     priority=case_data.get("priority", "medium"),
-                    assignee=case_data.get("assignee"),
+                    assignee=assignee,
                     tags=case_data.get("tags", []),
                     notes=notes,
                     timeline=case_data.get("timeline", []),
@@ -620,7 +703,13 @@ class IngestionService:
                 self._ingest_json_streaming(file_path)
             except ijson.JSONError:
                 # ijson rejects NaN and Infinity, which json.load accepts.
-                # Ingest only the items the stream did not reach.
+                # Ingest only the items the stream did not reach. json.load holds
+                # the whole file, so only a file under the in-memory cap is retried.
+                if file_path.stat().st_size > _in_memory_cap():
+                    raise ValueError(
+                        f"not valid JSON, and over {_in_memory_cap() // (1024 * 1024)}MB "
+                        "to retry in memory (NaN and Infinity need the retry)"
+                    )
                 with open(file_path, "r", encoding="utf-8") as f:
                     data = json.load(f)
                 findings, cases = [], []
@@ -731,7 +820,7 @@ class IngestionService:
         return self.stats
 
     def _ingest_jsonl_lines(self, lines: Iterable[str], data_type: str) -> None:
-        finding_batch = []
+        finding_batch, batch_bytes = [], 0
         try:
             for line_num, line in enumerate(lines, 1):
                 line = line.strip()
@@ -744,9 +833,14 @@ class IngestionService:
                     if data_type == "finding":
                         self.stats["findings_total"] += 1
                         finding_batch.append(data)
-                        if len(finding_batch) >= 1000:
-                            full, finding_batch = finding_batch, []
+                        batch_bytes += len(line)
+                        if (
+                            len(finding_batch) >= BATCH_ROWS
+                            or batch_bytes >= MAX_BATCH_BYTES
+                        ):
+                            full, finding_batch, batch_bytes = finding_batch, [], 0
                             self._ingest_finding_batch(full)
+                            del full
                     elif data_type == "case":
                         self.stats["cases_total"] += 1
                         self.ingest_case(data)
@@ -782,16 +876,21 @@ class IngestionService:
         return self.stats
 
     def _ingest_csv_rows(self, text: Iterable[str], data_type: str) -> None:
-        finding_batch = []
+        finding_batch, batch_bytes = [], 0
         try:
-            for row_num, row in enumerate(csv.DictReader(text), 1):
+            for row_num, (row, size) in enumerate(_csv_rows(text), 1):
                 try:
                     if data_type == "finding":
                         self.stats["findings_total"] += 1
                         finding_batch.append(self._csv_row_to_finding(row))
-                        if len(finding_batch) >= 1000:
-                            full, finding_batch = finding_batch, []
+                        batch_bytes += size
+                        if (
+                            len(finding_batch) >= BATCH_ROWS
+                            or batch_bytes >= MAX_BATCH_BYTES
+                        ):
+                            full, finding_batch, batch_bytes = finding_batch, [], 0
                             self._ingest_finding_batch(full)
+                            del full
                     elif data_type == "case":
                         self.stats["cases_total"] += 1
                         case_data = self._csv_row_to_case(row)
@@ -1118,7 +1217,7 @@ class IngestionService:
         attack_id = row.get("attack_id")
         cluster_id = attack_id if attack_id else None
 
-        return {
+        finding = {
             "finding_id": finding_id,
             "mitre_predictions": mitre_predictions,
             "anomaly_score": anomaly_score,
@@ -1129,6 +1228,18 @@ class IngestionService:
             "cluster_id": cluster_id,
             "severity": row.get("severity") or None,
         }
+        # What the flows show, in plain words, so the finding doesn't read as
+        # its bare id; never the detector's verdict or score.
+        if netflow_digest is not None:
+            focal, engaged = row.get("focal_ip"), row.get("engaged_ip")
+            described = {
+                "title": netflow_describe.title(netflow_digest, focal, engaged),
+                "description": netflow_describe.description(
+                    netflow_digest, focal, engaged
+                ),
+            }
+            finding.update({k: v for k, v in described.items() if v})
+        return finding
 
     def _detect_parquet_schema(self, col_names: set) -> str:
         """'loglm' for DeepTempo embedding exports, else 'generic'."""
@@ -1214,7 +1325,7 @@ class IngestionService:
                     except ValueError:
                         yield None, None
         elif fmt == "csv":
-            yield from ((None, row) for row in csv.DictReader(_utf8_lines(file_path)))
+            yield from ((None, row) for row, _ in _csv_rows(_utf8_lines(file_path)))
         elif fmt == "parquet":
             import pyarrow.parquet as pq
 
@@ -1225,12 +1336,25 @@ class IngestionService:
         self, file_path: Path, fmt: str, source_system: str, actor: str
     ) -> Dict[str, Any]:
         """Alerts and closed tickets become one import in episodic memory."""
-        from core.memory.imported_history import import_id, write_import
+        from core.memory.imported_history import (
+            fail_run,
+            import_id,
+            start_run,
+            write_import,
+        )
         from core.storage.unit_of_work import unit_of_work
 
         self.reset_stats()
         self.stats.update(alerts_total=0, tickets_total=0, rows_unreadable=0)
         rows: Dict[str, List[Dict[str, Any]]] = {"alerts": [], "tickets": []}
+        # Every row is held for the one-transaction write, so the file must fit.
+        cap = _in_memory_cap()
+        if file_path.stat().st_size > cap:
+            self._record_error(
+                f"History files are limited to {cap // (1024 * 1024)}MB; split the file."
+            )
+            self.stats["rows_unreadable"] += 1
+            return self.stats
         try:
             for kind, row in self._history_rows(file_path, fmt):
                 if not isinstance(row, dict):
@@ -1249,18 +1373,26 @@ class IngestionService:
             return self.stats
 
         investigation_id = import_id(
-            rows["alerts"] + rows["tickets"], file_path.read_bytes(), source_system
+            rows["alerts"] + rows["tickets"], _file_digest(file_path), source_system
         )
-        with unit_of_work() as session:
-            write_import(
-                session,
-                investigation_id=investigation_id,
-                alerts=rows["alerts"],
-                tickets=rows["tickets"],
-                actor=actor,
-                stats=self.stats,
-            )
+        # The caller holds the import lock (ingestion_jobs.run_job).
+        start_run(investigation_id)
+        try:
+            with unit_of_work() as session:
+                result = write_import(
+                    session,
+                    investigation_id=investigation_id,
+                    alerts=rows["alerts"],
+                    tickets=rows["tickets"],
+                    actor=actor,
+                    stats=self.stats,
+                )
+        except Exception as e:
+            fail_run(investigation_id, f"Import failed: {e}")
+            raise
         self.import_id = investigation_id
+        self.unmapped = result["unmapped"]
+        self.dropped_columns = result["dropped_columns"]
         logger.info("History import %s complete: %s", investigation_id, self.stats)
         return self.stats
 

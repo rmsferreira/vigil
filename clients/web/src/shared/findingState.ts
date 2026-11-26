@@ -1,6 +1,7 @@
 // A finding's terminal state (core.findings.alert_outcomes) in the board's five
-// words: New, Waiting for triage, Case NNNN, Resolved, Dropped, plus Excluded. Both finding popups and the
+// words: New, Waiting for triage, its case id, Resolved, Dropped, plus Excluded. Both finding popups and the
 // Findings table read it from here.
+import { caseLabel } from './caseLabel'
 export type TerminalState =
   | 'waiting'
   | 'scoring'
@@ -12,8 +13,8 @@ export type TerminalState =
   | 'dismissed'
   | 'excluded'
 
-/** The board's word; a live case reads as its id. */
-export function stateWord(state: string | null | undefined, caseId?: string | null): string {
+/** The board's word; a live case reads as its id, or "a restricted case" when the reader can't see it. */
+export function stateWord(state: string | null | undefined, caseId?: string | null, restricted?: boolean): string {
   switch (state) {
     case 'waiting':
       return 'New'
@@ -22,7 +23,7 @@ export function stateWord(state: string | null | undefined, caseId?: string | nu
     case 'working':
     case 'case_idle':
     case 'needs_you':
-      return caseId ? `Case ${caseId}` : 'In a case'
+      return caseId ? caseLabel(caseId) : restricted ? 'In a restricted case' : 'In a case'
     case 'resolved_auto':
     case 'resolved_person':
       return 'Resolved'

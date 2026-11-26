@@ -11,7 +11,8 @@ from core.agents.run_stats import agent_run_stats
 from core.llm.providers.registry import get_registry, model_display_name
 from core.response.ceiling import asks_first
 from core.response.config import ResponseConfig
-from core.skills.skill_library import READ_SKILL_TOOL, load_skills, skill_roots
+from core.skills.skill_hold import agent_skills
+from core.skills.skill_library import READ_SKILL_TOOL, Skill, load_skills, skill_roots
 
 logger = logging.getLogger(__name__)
 
@@ -21,7 +22,9 @@ AGENT_COMPONENT = "investigation"
 
 
 def profile_from_manifest(
-    row: dict, response_config: Optional[ResponseConfig] = None
+    row: dict,
+    response_config: Optional[ResponseConfig] = None,
+    skills: Optional[List[Skill]] = None,
 ) -> AgentProfile:
     """An agent as its manifest says, built-in or operator, and nothing else.
 
@@ -29,6 +32,11 @@ def profile_from_manifest(
     the id without its prefix; description and needs are the manifest's, and
     the prompt is its ``system`` rendered. Only an operator (custom-) agent keeps
     the manifest on its profile: phase tools and the skills column branch on it.
+
+    The skills index is rendered here, from the skills not held by the scan, so
+    a profile is only as current as its build. Every caller that hands a prompt
+    to a model builds the profile fresh; ``skills`` lets a caller building many
+    share one read of the verdicts.
     """
     text = row.get("manifest") or ""
     doc = read_manifest(text)
@@ -39,7 +47,7 @@ def profile_from_manifest(
         or row["id"].removeprefix(CUSTOM_AGENT_ID_PREFIX),
         description=str(doc.get("description") or ""),
         system_prompt=render_system(
-            str(doc.get("system") or ""), needs, response_config
+            str(doc.get("system") or ""), needs, response_config, skills
         ),
         recommended_tools=needs,
         manifest=text if row["id"].startswith(CUSTOM_AGENT_ID_PREFIX) else None,
@@ -55,8 +63,11 @@ class SOCAgentLibrary:
     ) -> Dict[str, AgentProfile]:
         # One read of the thresholds for the whole set (#916).
         config = response_config or ResponseConfig.from_settings()
+        skills = agent_skills()
         return {
-            agent_id: profile_from_manifest({"id": agent_id, "manifest": text}, config)
+            agent_id: profile_from_manifest(
+                {"id": agent_id, "manifest": text}, config, skills
+            )
             for agent_id, text in builtin_manifests().items()
         }
 
@@ -70,7 +81,8 @@ class SOCAgentLibrary:
 
 class AgentManager:
     def __init__(self):
-        self.agents = SOCAgentLibrary.get_all_agents()
+        self._band = ResponseConfig.from_settings()
+        self._agents = SOCAgentLibrary.get_all_agents(self._band)
         # Load DB-backed custom agents at startup so /agents/agents returns
         # a unified list without waiting for a later CRUD call to trigger
         # refresh. Failures (DB not ready) are logged inside the helper,
@@ -98,13 +110,14 @@ class AgentManager:
             return 0
 
         try:
-            config = ResponseConfig.from_settings()
+            config = self._band
+            skills = agent_skills()
             db_manager = get_db_manager()
             with db_manager.session_scope() as session:
                 for row in session.query(CustomAgent).all():
                     try:
                         profile = profile_from_manifest(
-                            CustomAgentSchema.dump(row), config
+                            CustomAgentSchema.dump(row), config, skills
                         )
                         customs[profile.id] = profile
                     except Exception as e:
@@ -115,13 +128,33 @@ class AgentManager:
         self._swap_customs(customs)
         return len(customs)
 
+    @property
+    def agents(self) -> Dict[str, AgentProfile]:
+        """Every profile; rebuilt when the confidence band their prompts carry
+        changes (an applied INTENT.md revision), so no restart is needed."""
+        band = ResponseConfig.from_settings()
+        if band != self._band:
+            self._band = band
+            builtins = SOCAgentLibrary.get_all_agents(band)
+            # Built-ins swap in with the current customs, never alone.
+            self._agents = {
+                **builtins,
+                **{
+                    k: v
+                    for k, v in self._agents.items()
+                    if k.startswith(CUSTOM_AGENT_ID_PREFIX)
+                },
+            }
+            self.refresh_custom_agents()
+        return self._agents
+
     def _swap_customs(self, customs: Dict[str, AgentProfile]) -> None:
         builtins = {
             k: v
-            for k, v in list(self.agents.items())
+            for k, v in list(self._agents.items())
             if not k.startswith(CUSTOM_AGENT_ID_PREFIX)
         }
-        self.agents = {**builtins, **customs}
+        self._agents = {**builtins, **customs}
 
     def get_agent_list(self) -> List[Dict]:
         """One row per agent, with what the Agents tab shows beside it.
@@ -146,9 +179,16 @@ class AgentManager:
         except Exception as e:
             logger.warning(f"Agent run stats unavailable: {e}")
             stats = None
-        # One lookup for every agent's tools.
+        from core.workflows.playbook_resolver import CAPABILITIES, EMULATION
+
+        # One lookup for every agent's tools. A capability binds tools at run time and
+        # is no tool name, so it is left out -- but emulation's tools act on hosts, and
+        # it stays in to read as asking first.
         asking = asks_first(
-            t for a in self.agents.values() for t in a.recommended_tools
+            t
+            for a in self.agents.values()
+            for t in a.recommended_tools
+            if t not in CAPABILITIES or t == EMULATION
         )
         rows = []
         for a in self.agents.values():

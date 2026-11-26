@@ -138,6 +138,12 @@ class Settings(BaseSettings):
     demo_mode: Optional[bool] = None
     autostart_services: Optional[str] = None
     max_upload_size_mb: int = 500
+    # Any request body over this is refused before the app reads it; only the
+    # upload routes, for a signed-in caller, take more (services/api/middleware/body_limit.py).
+    max_request_body_mb: int = 10
+    # Uploads parsed whole in the API process (a history import, or a findings
+    # JSON file the streaming reader rejects) are held to this smaller cap.
+    max_in_memory_import_mb: int = 25
     # os.pathsep-separated roots beyond the home directory that local detection
     # rule sources may live under.
     vigil_detection_local_roots: str = ""
@@ -145,13 +151,46 @@ class Settings(BaseSettings):
     vigil_frontend_url: str = ""
     # Empty means the repo-root INTENT.md, as core.platform.autostart_config does.
     vigil_intent_path: str = ""
+    # A directory holding INTENT.md and a REVISION marker. When set, the daemon
+    # applies each new revision (services/daemon/intent_apply.py); empty is
+    # observe mode only.
+    vigil_intent_dir: str = ""
     # One extra root of SKILL.md directories, read alongside core/skills/library
-    # and written by the skills API. Unset (None) is the State Directory's
-    # skills/ folder; empty turns operator skills off, as the Helm chart does.
+    # and written by the skills API. A top-level folder without its own SKILL.md
+    # is searched where `npx skills add` searches a repo, so category folders
+    # and whole cloned skills repos load; a skill folder's subfolders are never
+    # skills. Unset (None) is the State Directory's skills/ folder; empty turns
+    # operator skills off, as the Helm chart does.
     vigil_skills_path: Optional[str] = None
+    # Hosts skills and detection rule libraries may be read from as a git repo
+    # (core.skills.skill_sources), over https only; SKILL_SOURCE_<HOST>_USER/_TOKEN
+    # credentials apply to both. Empty turns reading from a repo off.
+    vigil_skill_source_hosts: Annotated[List[str], NoDecode] = ["github.com"]
+    # The SkillSpector program that scans a skill folder (core.skills.skill_scan).
+    # Empty, the default, turns scanning off; the backend image sets it to the
+    # copy it installs. A path that does not exist reads as "scanner
+    # unavailable", never a crash.
+    vigil_skill_scanner: str = ""
+    # Hold each new repo rule or version from coverage until the import check
+    # (core.detections.inventory.import_check) passes it or a person approves it.
+    # Off, new versions are written 'unchecked' and count, and the daemon's sweep
+    # turns pending ones unchecked; back on, it judges them. The API and daemon
+    # must agree.
+    vigil_rule_import_check: bool = True
+    # Let the scanner look up a skill's declared dependencies on osv.dev. Off, it
+    # uses its bundled list of known-bad packages and sends nothing out.
+    vigil_skill_scanner_osv: bool = False
+    # A Bifrost model id (e.g. vertex/gemini-2.5-pro) to run the scanner's
+    # model-backed analyzers with, sending each skill's full content to it.
+    # Empty, the default, keeps the scan static with no model calls. The hold's
+    # rule depends on the mode, so every process must agree on it.
+    vigil_skill_scanner_model: str = ""
     # python -m core.upgrade: run history directory (unset = none kept), and
     # the version-bound acknowledgement that stands in for a restore point.
     vigil_upgrade_dir: Optional[str] = None
+    # Where erased-principals.txt lives, shared by every backend replica.
+    # Unset falls back to vigil_upgrade_dir.
+    vigil_erasure_dir: Optional[str] = None
     vigil_upgrade_ack_version: str = ""
     vigil_upgrade_ack_reason: str = ""
 
@@ -202,6 +241,9 @@ class Settings(BaseSettings):
     # nobody asked for should not be listening. This is the floor an operator
     # sets before boot; the Settings toggle overrides it at runtime.
     vigil_mcp_enabled: bool = False
+    # OAuth on that surface (#4763), the floor for the Settings toggle. Only takes
+    # effect with the surface open and an https or loopback VIGIL_FRONTEND_URL.
+    vigil_mcp_oauth_enabled: bool = False
     # Medic's master switch (C8), read by Medic and by the backend so Off never
     # shows as Down. A string, parsed by core/platform/medic_status.py exactly as
     # Medic parses it: a bool here would accept spellings Medic reads as off and
@@ -223,15 +265,11 @@ class Settings(BaseSettings):
     vigil_console_hostname: str = ""
 
     # Auth
-    jwt_access_expiration_minutes: int = 30
-    jwt_refresh_expiration_days: int = 7
     # Comma-separated IPs and CIDRs of reverse proxies allowed to set
     # X-Forwarded-For. Empty trusts the TCP peer only. "*" is ignored:
     # a client who can reach the backend directly could otherwise choose
     # the address the anonymous rate-limit buckets use.
     vigil_trusted_proxies: str = ""
-    auth_min_zxcvbn_score: int = 3
-    password_reset_ttl_seconds: int = 3600
 
     # Vigil's own Wazuh manager, the wazuh-sandbox compose profile (#4099): it
     # counts shadow Wazuh copies with wazuh-logtest. Empty: no sandbox.
@@ -260,6 +298,9 @@ class Settings(BaseSettings):
     mcp_auto_connect_on_startup: Optional[bool] = None
     # The MCP runner; empty runs each server as a stdio child (start.sh).
     mcp_runner_url: str = ""
+    # Root of the pinned MCP connectors (npm/ and uv-tools/ under it), installed
+    # from infra/docker/mcp-packages. start.sh sets it to the repo's .mcp/.
+    vigil_mcp_prefix: str = "/opt/vigil/mcp"
     llm_budget_unlimited: bool = False
     extension_connector_allowlist: Annotated[List[str], NoDecode] = []
 
@@ -319,6 +360,10 @@ class Settings(BaseSettings):
     # Known-answer probes (#923): an hourly sweep, injected once a day by id.
     daemon_probes_enabled: bool = True
     daemon_probe_interval: int = 3600
+    # The supervisory model's scheduled check. Off by default until its page (#5157)
+    # and its hold on a dismissed or undone suggestion (#5262) land. Off: no check runs.
+    daemon_supervisory_enabled: bool = False
+    daemon_supervisory_interval: int = 3600
     daemon_cleanup_retention_days: int = 90
     # Separate from cleanup_retention_days on purpose: that only ages out the
     # episodic read log, while an unanswered containment proposal goes stale
@@ -327,6 +372,10 @@ class Settings(BaseSettings):
     daemon_metrics_enabled: bool = True
     daemon_metrics_port: int = 9090
     daemon_health_host: str = "localhost"
+    # Set only on the desktop stack (clients/desktop/standalone/docker-compose.yml),
+    # which ships no background service. Install readiness then says so, instead
+    # of probing a daemon that was never part of that install.
+    vigil_desktop_app: bool = False
     # Address the daemon's own listeners bind to (health/status/metrics/webhook).
     # Separate from daemon_health_host, which is the client address the backend
     # uses. Containers need 0.0.0.0; host-native installs should use 127.0.0.1.
@@ -345,9 +394,19 @@ class Settings(BaseSettings):
     orchestrator_max_cost: float = 5.0
     orchestrator_max_hourly_cost: float = 20.0
     orchestrator_max_runtime: int = 3600
+    # Wall for an investigate or compose run whose start names none, in seconds.
+    # Unset is 30 minutes. A number outside 60–86400 is ignored and the run keeps
+    # 30 minutes (core.workflows.playbook_resolver.deployment_wall_ms); it does not
+    # stop this process. Autonomous runs keep orchestrator_max_runtime.
+    workflow_default_wall_seconds: int = 1800
     orchestrator_stale_threshold: int = 300
     orchestrator_workdir: str = "data/investigations"
     orchestrator_dry_run: bool = False
+    # A case investigation that failed for a passing reason (a provider 5xx, a
+    # timeout) is launched again once it is case_run_retry_after_seconds old, at
+    # most case_run_retries times in a row (core/cases/run_retry.py). 0 turns it off.
+    case_run_retries: int = 1
+    case_run_retry_after_seconds: int = 300
 
     # Kafka ingestion. Credentials go through the secrets store, not here.
     kafka_enabled: bool = False
@@ -384,6 +443,7 @@ class Settings(BaseSettings):
 
     @field_validator(
         "extension_connector_allowlist",
+        "vigil_skill_source_hosts",
         "daemon_investigate_severities",
         "kafka_topics",
         mode="before",
@@ -478,16 +538,6 @@ def load_integrations_config(config_service: Any = None) -> dict[str, Any]:
             ],
             "integrations": {
                 row["integration_id"]: row.get("config") or {} for row in rows
-            },
-            # Only rows that were ever tested; the file fallback has none.
-            "last_test": {
-                row["integration_id"]: {
-                    "at": row["last_test_at"],
-                    "success": row.get("last_test_success"),
-                    "error": row.get("last_error"),
-                }
-                for row in rows
-                if row.get("last_test_at")
             },
         }
     return _integrations_from_file()

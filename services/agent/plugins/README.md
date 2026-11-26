@@ -43,9 +43,8 @@ skills: [investigate-case]          # core/skills/library/<name>/SKILL.md, loade
 conclusion:                         # or `conclusion: prose`
   summary_field: summary
   citations_field: citations        # optional; numbers results so the answer can cite them
-  severity_field: severity          # optional; an enum of low|medium|high|critical, raises the case's priority
   confidence_field: confidence      # optional; an enum of low|medium|high, scored against the case's closure
-  disposition_field: disposition    # optional; the verdict after the guard, benign|false_positive closes the case
+  disposition_field: disposition    # optional; an enum drawn from malicious|suspicious|benign|false_positive|inconclusive|needs_review; benign|false_positive closes the case where autonomy lets the run act
   schema: { ... }                   # JSON schema the final answer must match
 guard:                              # optional second look before a guarded answer stands
   field: disposition
@@ -53,6 +52,10 @@ guard:                              # optional second look before a guarded answ
   fallback: needs_review
   reviewer_prompt: |
     ...
+  min_hypotheses: 2                 # optional; conclude refuses a guarded answer once while the record holds fewer claims
+  min_sources: 2                    # optional; the answer stands only over cited, served, non-empty results from this many capabilities, counted by the kernel
+  uncounted: [shell, get_finding]   # optional; capabilities that never count toward min_sources (the subject's own record)
+escalation_guard: { ... }           # optional; the same shape for the other end (investigate guards malicious and suspicious, falls back to needs_review); a disposition guard may fall back only to a hold such as needs_review or inconclusive, never to a dismissal or an alarm word; no value may be guarded by both
 max_turns: 24                       # optional; else the deployment's runtime.max_turns
 record: required                    # off | available (the default) | required
 min_results: 4                      # optional; see below
@@ -101,6 +104,11 @@ Every hook is optional, and the kernel calls each at a fixed point:
 `runSubturn` runs one turn under a role, prompt and grants of the plugin's
 choosing, journaling its calls under that role. It is for work that is an
 authored sequence rather than one agent's judgement. Compose's phases use it.
+With `resume` set, as compose sets it, a step picked up again continues from the
+calls journaled under its role, and a call it parked on that a person approved
+runs once from its checkpoint before the step's first model call; a later
+identical ask is served from the ledger. Rootcause v3 reuses roles across turns
+on purpose, so it leaves `resume` off and each turn starts from its task alone.
 
 ## The plugins
 

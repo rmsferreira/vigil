@@ -12,8 +12,10 @@ SHA-256 of it. Nothing can recover it, so an operator who loses one mints
 another and revokes the first -- which is the behaviour we want anyway, and the
 reason revocation is cheap.
 
-Two prefixes share the table. ``vgl_api_`` is what is minted now and reaches the
+Four prefixes share the table. ``vgl_api_`` is what is minted now and reaches the
 HTTP API as well as MCP; ``vgl_mcp_`` is an earlier token and stays MCP-only.
+An OAuth grant (``core.auth.oauth_server``) is a row too: its ``vgl_oat_`` access
+token reaches MCP only, and its ``vgl_ort_`` refresh token is never a bearer.
 """
 
 from __future__ import annotations
@@ -28,7 +30,7 @@ from typing import List, NamedTuple, Optional
 
 from sqlalchemy.orm import Session
 
-from core.auth import trail_events
+from core.auth import session_policy, token_policy, token_unused, trail_events
 from core.storage.models import McpCredential, User
 from core.storage.unit_of_work import unit_of_work
 from core.time import utcnow
@@ -41,11 +43,16 @@ logger = logging.getLogger(__name__)
 # reach the HTTP API is a property of its prefix.
 TOKEN_PREFIX = "vgl_api_"
 MCP_TOKEN_PREFIX = "vgl_mcp_"
+GRANT_ACCESS_PREFIX = "vgl_oat_"
+GRANT_REFRESH_PREFIX = "vgl_ort_"
+# Refused by name on the HTTP API: a working credential in the wrong place.
+_MCP_ONLY = (MCP_TOKEN_PREFIX, GRANT_ACCESS_PREFIX, GRANT_REFRESH_PREFIX)
 
-# How long a token lives, by who holds it. There is no "never".
+# A person's token lasts this long unless they ask for less, and never longer than
+# the maximum the session policy sets (token_policy). There is no "never".
 PERSON_DEFAULT_DAYS = 90
+# The ceiling the policy's maximums can be set to; the request models' ceiling too.
 PERSON_MAX_DAYS = 365
-SERVICE_ACCOUNT_DAYS = 365
 # What a rotated token keeps working for, unless it is suspected compromised.
 ROTATION_GRACE = timedelta(hours=24)
 
@@ -70,16 +77,18 @@ class AuthenticatedCredential(NamedTuple):
 
     user: User
     credential_id: str
+    # An OAuth grant's resource; None on a personal token.
+    resource: Optional[str] = None
 
 
 def looks_like_mcp_token(value: str) -> bool:
-    """Whether ``value`` is presented as an MCP-only token.
+    """Whether ``value`` is presented as an MCP-only token (an OAuth one included).
 
     Used to refuse it somewhere it does not belong, which is a different
     answer from "this is not valid" and should read differently to whoever
     sent it.
     """
-    return bool(value) and value.startswith(MCP_TOKEN_PREFIX)
+    return bool(value) and value.startswith(_MCP_ONLY)
 
 
 def looks_like_api_token(value: str) -> bool:
@@ -88,24 +97,40 @@ def looks_like_api_token(value: str) -> bool:
 
 
 def looks_like_token(value: str) -> bool:
-    return looks_like_api_token(value) or looks_like_mcp_token(value)
+    """A bearer this table may answer for. A refresh token never is one."""
+    return (
+        looks_like_api_token(value) or looks_like_mcp_token(value)
+    ) and not value.startswith(GRANT_REFRESH_PREFIX)
 
 
 class NotRotatable(Exception):
     """The token is rotated, revoked or expired already."""
 
 
-def lifetime(user: User, days: Optional[int] = None) -> timedelta:
-    """How long a token for ``user`` lives; ValueError for a request out of range.
+def default_days(user: User, policy: session_policy.SessionPolicy) -> int:
+    """What a token for ``user`` lasts when no length is asked for."""
+    most = token_policy.maximum_days(user, policy)
+    return most if user.service_account is True else min(PERSON_DEFAULT_DAYS, most)
 
-    One rule for every minter: a person's defaults to 90 days and is 365 at most;
-    a service account's is 365.
+
+def lifetime(
+    user: User, days: Optional[int], policy: session_policy.SessionPolicy
+) -> timedelta:
+    """How long a token for ``user`` lives under ``policy``; ValueError for a
+    request out of range, naming the maximum.
+
+    One rule for every minter: a person's defaults to 90 days, or the maximum when
+    that is lower; a service account's is its maximum, with no choice.
     """
+    most = token_policy.maximum_days(user, policy)
     if user.service_account is True:
-        return timedelta(days=SERVICE_ACCOUNT_DAYS)
-    days = PERSON_DEFAULT_DAYS if days is None else days
-    if not 1 <= days <= PERSON_MAX_DAYS:
-        raise ValueError(f"A token lasts 1 to {PERSON_MAX_DAYS} days")
+        return timedelta(days=most)
+    days = default_days(user, policy) if days is None else days
+    if not 1 <= days <= most:
+        raise ValueError(
+            f"A token lasts 1 to {most} days: {most} is the most the session "
+            "policy allows for this account"
+        )
     return timedelta(days=days)
 
 
@@ -119,20 +144,24 @@ def mint(
     days: Optional[int] = None,
     session: Optional[Session] = None,
     actor: Optional[str] = None,
+    sign_in: Optional[str] = None,
 ) -> Optional[MintedCredential]:
     """Issue a token for ``user_id``. Returns None if there is no such user.
 
     It expires after :func:`lifetime` of ``days``. The caller must show the token
     to the operator now; it is not recoverable. ``actor`` is the principal minting
-    it; its trail entry commits with it.
+    it; its trail entry commits with it and names ``sign_in`` when a person
+    signed in to mint it. The policy is read in this transaction
+    (PolicyUnreadable if it cannot be: nothing falls back to defaults).
     """
     with unit_of_work(session) as session:
+        policy = token_policy.current(session)
         user = session.query(User).filter(User.user_id == user_id).first()
         if user is None:
             logger.warning("Refusing to mint a token for unknown user")
             return None
 
-        expires_at = utcnow() + lifetime(user, days)
+        expires_at = utcnow() + lifetime(user, days, policy)
         token = TOKEN_PREFIX + secrets.token_urlsafe(_TOKEN_BYTES)
         record = McpCredential(
             credential_id=f"mcpc-{uuid.uuid4().hex[:16]}",
@@ -150,6 +179,7 @@ def mint(
             principal=user.principal_id,
             credential_id=record.credential_id,
             expires_at=expires_at.isoformat(),
+            sign_in=sign_in,
         )
 
         logger.info(
@@ -185,6 +215,12 @@ def authenticate(
             )
             if record is None or record.revoked_at is not None:
                 return None
+            # An OAuth access token lasts an hour inside its grant. Its end is
+            # routine (the client refreshes), so it is not an expiry event.
+            if token.startswith(GRANT_ACCESS_PREFIX) and not (
+                record.access_expires_at and record.access_expires_at > utcnow()
+            ):
+                return None
             if not record.is_usable():
                 refusal = partial(trail_events.credential_expired, record.credential_id)
                 return None
@@ -199,11 +235,17 @@ def authenticate(
                     )
                 return None
 
+            # An unused token past its period, reminded 7 or more days ago, is refused
+            # and revoked, whether or not the sweep has run. Stored state only.
+            if token_unused.refused(record, user, session, utcnow()):
+                refusal = partial(token_unused.refuse, record.credential_id)
+                return None
+
             # Written on the way through so an unused credential can be found
             # later. The Ledger records what was done; this only records that
             # something was.
             record.last_used_at = utcnow()
-            return AuthenticatedCredential(user, record.credential_id)
+            return AuthenticatedCredential(user, record.credential_id, record.resource)
     except Exception:  # noqa: BLE001 - a database that cannot answer is not a yes
         # A store this cannot read has not authenticated anybody. Saying so is
         # a refusal, not an error: the caller is told it is not authenticated,
@@ -284,6 +326,7 @@ def rotate(
     days: Optional[int] = None,
     session: Optional[Session] = None,
     actor: Optional[str] = None,
+    sign_in: Optional[str] = None,
 ) -> Optional[tuple[MintedCredential, McpCredential]]:
     """Mint a successor with the same holder and label; returns it with the old
     record as it now stands, or None if there is no such token.
@@ -291,8 +334,10 @@ def rotate(
     The old token then ends at the earlier of its own expiry and 24 hours from
     now, or now when ``compromised``. NotRotatable once it is rotated, revoked or
     expired. The row is locked, so two rotations of one token cannot both win.
+    The policy is locked first, as a save of it locks it before the tokens.
     """
     with unit_of_work(session) as session:
+        token_policy.current(session)
         old = (
             session.query(McpCredential)
             .filter(McpCredential.credential_id == credential_id)
@@ -304,7 +349,9 @@ def rotate(
         now = utcnow()
         if old.status(now) != "active":
             raise NotRotatable(f"This token is {old.status(now)}")
-        minted = mint(old.user_id, old.label, days, session=session, actor=actor)
+        minted = mint(
+            old.user_id, old.label, days, session=session, actor=actor, sign_in=sign_in
+        )
         if minted is None:
             return None
         end = now if compromised else now + ROTATION_GRACE
@@ -319,5 +366,6 @@ def rotate(
             credential_id=credential_id,
             successor_id=old.successor_id,
             compromised=True if compromised else None,
+            sign_in=sign_in,
         )
         return minted, old

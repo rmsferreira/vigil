@@ -16,8 +16,16 @@ export type Status = "completed" | "waiting_approval" | "failed";
 
 // Everything the loop is given rather than builds. Provider and registry sit
 // beside the four seams because they are injected on the same terms.
+// Reads an operator skill's current text from the backend, for a run that carries
+// only its digest. The refusal's kind and detail go to the model as the call's failure.
+export type SkillBodies = (
+  name: string,
+) => Promise<{ ok: true; body: string } | { ok: false; kind: "invalid_args" | "refused" | "unavailable"; detail: string }>;
+
 export interface Harness<Kinds extends Record<string, unknown> = Record<never, never>> {
   provider: Provider;
+  // Absent where nothing is behind the run to ask: a skill with no carried body then fails to load.
+  skillBodies?: SkillBodies;
   registry: Registry;
   dispatch: ToolDispatch;
   budget: Budget;
@@ -26,6 +34,10 @@ export interface Harness<Kinds extends Record<string, unknown> = Record<never, n
   // Experimental (core/guards.ts): the guarded reader's model, when it is
   // not the run's own. A reader only extracts and labels, so a cheaper one serves.
   guards_provider?: Provider;
+  // The run's operator instructions (Config.instructions). On the harness rather
+  // than each turn, so every model call the run makes -- plugin turns, subturns,
+  // compose phases, children -- carries them from the one place prompts are built.
+  instructions?: string;
 }
 
 export interface TurnConfig {
@@ -67,11 +79,17 @@ export interface TurnConfig {
   // Turns the caller already holds, seeded before the loop. A stateless client
   // posts the whole conversation each time and the run is one turn of it.
   history?: readonly Message[];
+  // On a resume, the approved tool call this role parked on and has not made runs once,
+  // through the invoke door under its checkpoint, before the first model call (#5077).
+  resume_approved?: boolean;
   // The harness's own cap on tool turns, held whatever a workflow asks for.
   max_turns: number;
   // Which tools ask a human first is deployment's answer, not a property of the
   // tool: the same tool needs approval in one deployment and not in another.
   approvals: ReadonlySet<string>;
+  // Tools the deployment marks as emulators (`emulator` on a tool spec). Each call
+  // to one is journaled with its result, gated or not.
+  emulators?: ReadonlySet<string>;
   // Whether a denied call parks the run on its reason. A conversation's turn gets
   // the denial as a result instead: the person is there to read it.
   park_on_denial?: boolean;
@@ -88,6 +106,11 @@ export interface TurnConfig {
   // and means a run that recalls nothing: which keys a run is about is the
   // workflow's answer, and a harness that guessed would query on prose.
   recall_keys?: readonly string[];
+  // Set when the run is an investigation of trigger findings: it opens on the entity
+  // facts for these keys, on its case's rows when it has one (#4742). Absent reads
+  // none -- a chat, a subagent. held: render only the read the run's opening already
+  // journaled, and never read here -- a hunt's (#5212), whose read is declared-only.
+  facts?: { keys: readonly string[]; case_id: string | null; held?: true };
   // Numbers each result so the model can cite it: the nth call is `${prefix}${offset + n}`.
   // Absent leaves results unnumbered, as the workflows written before the kernel expect.
   refs?: { prefix: string; offset: number };

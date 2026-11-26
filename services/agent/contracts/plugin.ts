@@ -9,8 +9,12 @@ export interface SkillSpec {
   name: string;
   description: string;
   // The playbook itself. Loaded only when asked for, so an unused skill costs
-  // its name and description and nothing else.
-  body: string;
+  // its name and description and nothing else. Absent on a skill an operator
+  // added: a run carries its digest and reads the text from the backend when asked.
+  // A run journaled before that still holds the body, and keeps using it.
+  body?: string;
+  // The hash of the body the run was started with (contentHash).
+  digest?: string;
 }
 
 // A structured answer: validated against `schema` by the loop's emission.
@@ -24,15 +28,16 @@ export interface StructuredConclusion {
   // Which field holds what the run could not settle, in its own words: its
   // declared gaps. Required of a plugin whose record is required.
   open_questions_field?: string;
-  // Which field rates what the run found, in SEVERITIES. Carried onto the
-  // terminal, where it raises the priority of the case the run was started from.
-  severity_field?: string;
   // Which field states how sure the run is, in CONFIDENCES. Carried onto the
   // terminal, where the backend scores the verdict against the case's closure.
   confidence_field?: string;
   // Which field holds the run's verdict on the case. Carried onto the terminal as
-  // it stands after the guard, where benign or false_positive closes the case.
+  // it stands after the guard, where benign or false_positive closes the case if
+  // autonomy lets the run act, and otherwise leaves it open for a person.
   disposition_field?: string;
+  // Which field holds a short title for the case the run was started from. Carried
+  // onto the terminal, where a completed run retitles a case no person has titled.
+  title_field?: string;
   // Which field lists the actions the run asks a person to approve, each a
   // ProposedAction. Carried onto the terminal, where the backend files them as
   // pending approvals on the case the run was started from.
@@ -58,6 +63,15 @@ export interface GuardSpec {
   fallback: string;
   // What the reviewer is told it is for. The reviewer never holds tools.
   reviewer_prompt: string;
+  // A guarded answer is refused once at conclude while the record holds fewer
+  // hypotheses than this, so the run puts its alternatives down before it answers.
+  min_hypotheses?: number;
+  // A guarded answer stands only over cited, served, non-empty results from at least
+  // this many distinct capabilities, counted by the code rather than the reviewer.
+  // Capabilities in `uncounted` (the subject's own record, earlier conclusions) never
+  // count: text the subject wrote cannot be its own second source.
+  min_sources?: number;
+  uncounted?: string[];
 }
 
 export interface PluginManifest {
@@ -74,6 +88,9 @@ export interface PluginManifest {
   skills: SkillSpec[];
   conclusion: ConclusionSpec;
   guard?: GuardSpec;
+  // A second look at the other end: an answer that escalates (a malicious verdict
+  // and the containment it proposes) reviewed by its own prompt, held to its own fallback.
+  escalation_guard?: GuardSpec;
   // Experimental (core/guards.ts), honoured only with VIGIL_GUARDS=on: the reader's
   // prompt, and what the deciding agent is told, in this plugin's words. Not `guard`,
   // which is the kernel reviewer's second look at a conclusion.

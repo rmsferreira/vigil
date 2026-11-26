@@ -12,20 +12,27 @@ from core.storage.models.ai import (
     AIModelConfig,
     ChatMessage,
     Conversation,
+    InvestigationReplay,
     LLMInteractionLog,
     LLMProviderConfig,
 )
 from core.storage.models.auth import (
+    AuthLink,
     BreachedPassword,
+    IdentifierReservation,
     McpCredential,
+    OAuthClient,
+    OAuthPending,
     Principal,
     Role,
     SecurityKey,
     SignIn,
+    SsoLink,
     User,
 )
 from core.storage.models.autonomy import ToolEffectClass
 from core.storage.models.base import Base, JSONBList, case_findings
+from core.storage.models.capped_recheck import CappedRecheckBatch, CappedRecheckTicket
 from core.storage.models.case import Case
 from core.storage.models.case_entities import (
     CaseAttachment,
@@ -34,6 +41,7 @@ from core.storage.models.case_entities import (
     CaseComment,
     CaseEscalation,
     CaseEvidence,
+    CaseFindingRemoval,
     CaseIOC,
     CaseMetrics,
     CaseNotification,
@@ -50,6 +58,7 @@ from core.storage.models.config import (
     IntegrationConfig,
     SharedIOC,
     SketchMapping,
+    SourceHealth,
     SystemConfig,
     ThreatIndicator,
     UserPreference,
@@ -68,6 +77,12 @@ from core.storage.models.detection_rule import (
     DetectionRuleVersion,
     SiemSearch,
 )
+from core.storage.models.directory import (
+    DirectoryGroup,
+    DirectoryGroupMember,
+    DirectoryPending,
+)
+from core.storage.models.entity_fact import EntityFact
 from core.storage.models.episodic import (
     EpisodicDistilFailure,
     EpisodicDistilMarker,
@@ -79,8 +94,21 @@ from core.storage.models.episodic import (
 )
 from core.storage.models.exclusion import IpExclusion
 from core.storage.models.finding import Finding, FindingMitrePrediction
-from core.storage.models.medic import MedicLastSeen
-from core.storage.models.skill import SkillRead
+from core.storage.models.history import HistoryAlert, HistoryImport, HistoryTicket
+from core.storage.models.medic import (
+    MedicIncidentNotice,
+    MedicLastSeen,
+    MedicWatchState,
+)
+from core.storage.models.recheck_review import RecheckReview
+from core.storage.models.report import ReportRecord, ReportRun
+from core.storage.models.skill import SkillInstall, SkillRead, SkillScan
+from core.storage.models.supervisory import (
+    SupervisoryHistory,
+    SupervisorySuggestion,
+    SupervisoryWorkerState,
+)
+from core.storage.models.team import Team, TeamMembership
 from core.storage.models.workflow import (
     FINISHED_INVESTIGATION_STATUSES,
     IN_FLIGHT_INVESTIGATION_STATUSES,
@@ -101,8 +129,15 @@ from core.storage.models.workflow import (
 __all__ = [
     "AIDecisionLog",
     "AIModelConfig",
+    "InvestigationReplay",
     "ApprovalAction",
     "Base",
+    "CappedRecheckBatch",
+    "CappedRecheckTicket",
+    "RecheckReview",
+    "SupervisoryHistory",
+    "SupervisorySuggestion",
+    "SupervisoryWorkerState",
     "Case",
     "CaseAttachment",
     "CaseAuditLog",
@@ -110,6 +145,7 @@ __all__ = [
     "CaseComment",
     "CaseEscalation",
     "CaseEvidence",
+    "CaseFindingRemoval",
     "CaseIOC",
     "CaseMetrics",
     "CaseNotification",
@@ -127,10 +163,14 @@ __all__ = [
     "DETECTION_RULE_STATUSES",
     "DetectionProposal",
     "DetectionProposalEvent",
+    "DirectoryGroup",
+    "DirectoryGroupMember",
+    "DirectoryPending",
     "DetectionRule",
     "DetectionRuleCheckChange",
     "DetectionRuleStage",
     "DetectionRuleVersion",
+    "EntityFact",
     "EpisodicDistilFailure",
     "EpisodicDistilMarker",
     "EpisodicGap",
@@ -138,6 +178,9 @@ __all__ = [
     "EpisodicSighting",
     "EpisodicVerdict",
     "EpisodicVerdictSource",
+    "HistoryAlert",
+    "HistoryImport",
+    "HistoryTicket",
     "FederationSource",
     "Finding",
     "FindingMitrePrediction",
@@ -156,19 +199,33 @@ __all__ = [
     "LLMInteractionLog",
     "LLMProviderConfig",
     "BreachedPassword",
+    "IdentifierReservation",
     "McpCredential",
+    "OAuthClient",
+    "OAuthPending",
     "Principal",
     "SiemSearch",
     "DetectionRuleException",
+    "AuthLink",
     "SecurityKey",
     "SignIn",
+    "SsoLink",
+    "MedicIncidentNotice",
     "MedicLastSeen",
+    "MedicWatchState",
+    "ReportRecord",
+    "ReportRun",
     "Role",
     "SLAPolicy",
     "SharedIOC",
     "SketchMapping",
+    "SkillInstall",
     "SkillRead",
+    "SkillScan",
+    "SourceHealth",
     "SystemConfig",
+    "Team",
+    "TeamMembership",
     "ThreatIndicator",
     "ToolEffectClass",
     "User",

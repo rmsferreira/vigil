@@ -17,6 +17,7 @@ from pydantic import BaseModel
 from sqlalchemy import event, or_
 from sqlalchemy.orm import Session
 
+from core.platform.user_agent import browser_of
 from core.storage.models import Principal, SignIn, User
 from core.storage.schemas.base import IsoDateTime, OptDateTime
 from core.storage.unit_of_work import unit_of_work
@@ -32,6 +33,10 @@ TOKEN_REUSE = "token_reuse"
 UPGRADE = "upgrade"
 # Role, password or email changed, or a password reset: sign in again.
 ACCOUNT_CHANGED = "account_changed"
+# A recovery code at sign-in removed the methods and ended the other sign-ins.
+RECOVERY = "recovery"
+# An admin, or the host script, reset two-step sign-in and ended the sign-ins.
+MFA_RESET = "mfa_reset"
 DEACTIVATED = "deactivated"
 ERASED = "erased"
 # Ended from the sign-in list or the person's detail (#4172).
@@ -44,10 +49,49 @@ SIGN_IN_LIMIT = "sign_in_limit"
 # unavailable (a step-down), or a key-only person's recovery code doing so.
 MFA_STEP_DOWN = "mfa_step_down"
 RECOVERY_STEP_DOWN = "recovery_step_down"
-WITH_MFA = ("mfa", MFA_STEP_DOWN, RECOVERY_STEP_DOWN)
+# Through the single sign-on provider (#4284). Whether it met MFA is ``mfa_met``.
+SSO = "sso"
+# A break-glass account's password, code and reason (#4532): "Confirm it's you"
+# passes for the life of the sign-in.
+BREAK_GLASS = "break_glass"
+WITH_MFA = ("mfa", MFA_STEP_DOWN, RECOVERY_STEP_DOWN, BREAK_GLASS)
+# Never held at MFA or key setup: the break-glass code carried the MFA, and a hold
+# would strand the custodian mid-incident.
+NOT_HELD = (BREAK_GLASS,)
+
+# How an SSO sign-in met MFA (epic #4751 decision 5); null on any other sign-in
+# and on SSO sign-ins from before the check. The provider's two count only on its
+# signed claim with a recent auth_time (core/auth/sso.py ``judged``).
+PROVIDER_MFA = "provider_mfa"
+PROVIDER_PHR = "provider_phr"
+VIGIL_FACTOR = "vigil_factor"
+# Security keys required but unavailable: the app, or the provider's mfa, stood in.
+STEP_DOWN = "step_down"
+NONE = "none"
+MET = (PROVIDER_MFA, PROVIDER_PHR, VIGIL_FACTOR, STEP_DOWN)
+
+
+def with_mfa(row: Optional[SignIn]) -> bool:
+    """Whether this sign-in got in with MFA, whichever route it took."""
+    return row is not None and (row.auth_method in WITH_MFA or row.mfa_met in MET)
+
+
+def end_of(row: SignIn, absolute: timedelta) -> datetime:
+    """When the sign-in reaches its absolute end: its start plus the policy's
+    length, or sooner when its MFA came from an older provider sign-in."""
+    end = row.started_at + absolute
+    return min(end, row.ends_at) if row.ends_at else end
+
 
 # Three failed confirmations in a row (core/auth/step_up.py).
 TOO_MANY_CONFIRMATIONS = "too_many_confirmations"
+# A restore ended every open sign-in. Not in STOPS_RUNS: it stops the runs in
+# one pass and sends one notice (core/backup/restore.py), not one per person.
+RESTORE = "restore"
+# Require single sign-on was turned on while this person's sign-in was open and
+# had not come through it. Not in STOPS_RUNS: a settings change, like time, idle
+# and upgrade, so the sign-in's runs keep going.
+SSO_REQUIRED = "sso_required"
 
 # The end reasons that stop the sign-in's agent runs (and their children): a
 # compromise, someone else's act, or a change of who the account is. Time, idle,
@@ -58,6 +102,8 @@ STOPS_RUNS = frozenset(
     {
         TOKEN_REUSE,
         ACCOUNT_CHANGED,
+        RECOVERY,
+        MFA_RESET,
         DEACTIVATED,
         ERASED,
         ENDED_BY_PERSON,
@@ -79,6 +125,8 @@ REASON_WORDS = {
     TOKEN_REUSE: "Token reuse",
     UPGRADE: "Ended by an upgrade",
     ACCOUNT_CHANGED: "Role, password, email or methods changed",
+    RECOVERY: "Signed in with a recovery code",
+    MFA_RESET: "Two-step sign-in was reset",
     DEACTIVATED: "Account deactivated or deleted",
     ERASED: "The person's details were erased",
     ENDED_BY_PERSON: "Ended by the person",
@@ -86,6 +134,8 @@ REASON_WORDS = {
     EVERYONE: "Everyone signed out",
     SIGN_IN_LIMIT: "A newer sign-in took its place",
     TOO_MANY_CONFIRMATIONS: "Too many failed confirmations",
+    RESTORE: "Ended by a restore",
+    SSO_REQUIRED: "Single sign-on is now required",
 }
 UNNAMED_REASON = "Ended by a security event"
 
@@ -130,6 +180,8 @@ class SignInEntry(BaseModel):
     address: Optional[str] = None
     # 'password', 'mfa', or a step-down while security keys are unavailable
     auth_method: str
+    # How an SSO sign-in met MFA; null on other sign-ins and older SSO ones.
+    mfa_met: Optional[str] = None
     ended_at: OptDateTime = None
     end_reason: Optional[str] = None
     end_reason_text: Optional[str] = None
@@ -143,47 +195,6 @@ class EndedSignIns(BaseModel):
     signed_out: bool = False
 
 
-def browser_of(user_agent: Optional[str]) -> str:
-    """A coarse "Browser on OS" from a user agent, for a list. No dependency."""
-    ua = user_agent or ""
-    browser = next(
-        (
-            name
-            for token, name in (
-                ("Edg/", "Edge"),
-                ("OPR/", "Opera"),
-                ("Firefox/", "Firefox"),
-                ("FxiOS", "Firefox"),
-                ("CriOS", "Chrome"),
-                ("Chrome/", "Chrome"),
-                ("Safari/", "Safari"),
-            )
-            if token in ua
-        ),
-        None,
-    )
-    os_ = next(
-        (
-            name
-            for token, name in (
-                ("iPhone", "iOS"),
-                ("iPad", "iOS"),
-                ("Android", "Android"),
-                ("Windows", "Windows"),
-                ("Macintosh", "macOS"),
-                ("CrOS", "ChromeOS"),
-                ("Linux", "Linux"),
-                ("X11", "Linux"),
-            )
-            if token in ua
-        ),
-        None,
-    )
-    if browser and os_:
-        return f"{browser} on {os_}"
-    return browser or os_ or "Unknown browser"
-
-
 def shape(row: SignIn, current: Optional[str] = None) -> dict:
     """One sign-in as a list shows it. Times are naive UTC."""
     return {
@@ -194,6 +205,7 @@ def shape(row: SignIn, current: Optional[str] = None) -> dict:
         "device": row.device,
         "address": row.address,
         "auth_method": row.auth_method,
+        "mfa_met": row.mfa_met,
         "ended_at": row.ended_at,
         "end_reason": row.end_reason,
         "end_reason_text": (
@@ -250,7 +262,12 @@ def start(
     auth_method: str = "password",
     user_agent: Optional[str] = None,
     address: Optional[str] = None,
+    mfa_met: Optional[str] = None,
+    confirmed_at: Optional[datetime] = None,
+    ends_at: Optional[datetime] = None,
 ) -> SignIn:
+    """``confirmed_at``: when the factor that met MFA was given, where that is not
+    now (a provider's auth_time). ``ends_at``: an end sooner than the policy's."""
     now = utcnow()
     row = SignIn(
         sign_in_id=sign_in_id,
@@ -263,8 +280,16 @@ def start(
         device=device_of(user_agent),
         address=address,
         refresh_generation=0,
-        # Completing MFA at sign-in starts the confirmation window.
-        confirmed_at=now if auth_method in WITH_MFA else None,
+        mfa_met=mfa_met,
+        ends_at=ends_at,
+        # Completing MFA at sign-in starts the confirmation window. A password
+        # sign-in starts it only when the caller passes confirmed_at: Require
+        # MFA is off and this person holds no second factor.
+        confirmed_at=(
+            (confirmed_at or now)
+            if auth_method in WITH_MFA or mfa_met in MET
+            else confirmed_at if auth_method == "password" else None
+        ),
     )
     session.add(row)
     return row
@@ -388,6 +413,19 @@ def end_all_for_user(
                 synchronize_session=False,
             )
         )
+
+
+def end_every_open(session: Session, reason: str) -> int:
+    """End every open sign-in of every principal in one UPDATE; no run is queued.
+    Returns how many."""
+    return (
+        session.query(SignIn)
+        .filter(SignIn.ended_at.is_(None))
+        .update(
+            {SignIn.ended_at: utcnow(), SignIn.end_reason: reason},
+            synchronize_session=False,
+        )
+    )
 
 
 def stamp_action(sign_in_id: str, session: Session) -> None:

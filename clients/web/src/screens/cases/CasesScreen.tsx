@@ -1,7 +1,7 @@
-import { useCallback, useEffect, useMemo, useState, type KeyboardEvent, type ReactNode } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState, type KeyboardEvent, type ReactNode } from 'react'
 import { useLocation, useNavigate, useSearchParams } from 'react-router-dom'
 import { Icon } from '../../shared/icons'
-import { caseSearchApi, casesApi, workflowApi } from '../../services/api'
+import { analyticsApi, caseSearchApi, casesApi, workflowApi, type AgreementTally } from '../../services/api'
 import { mapQueueCase } from '../../data/mappers'
 import { CASE_EDIT_FIELDS, type CaseEditField, type CaseEditValues, type CaseRecord, type CaseRow } from '../../data/data'
 import type { Schema } from '../../services/apiTypes'
@@ -14,7 +14,9 @@ import {
   CASE_PAGE_LIMIT,
   INITIAL_CASE_FILTERS,
   isCaseStatus,
+  isClosedBy,
   type CaseFilters,
+  type ClosedByFilter,
   type CaseStatus,
   type Phase,
 } from './useCases'
@@ -27,12 +29,17 @@ import { SeverityMark } from '../../shared/SeverityMark'
 import { LevelBadge, slaLevel } from '../../shared/LevelBadge'
 import { InfoTip } from '../../shared/InfoTip'
 import { useAuth } from '../../contexts/AuthContext'
+import { OwnerFix, PersonPicker, isOwnerNotCurrent, isOwnerOffTeam, onTeam, usePeople, type Person } from '../../shared/people'
 import { useToast } from '../../shell/toast'
 import { inputCls } from './CaseSections'
 import { CasePage } from './CasePage'
-import { caseConflicts, errorDetail } from './caseFormat'
-import { ClosureFields, closurePayload, closureProblem, type ClosureCategory } from './ClosureFields'
+import { MoveCaseDialog, type MoveTeam } from './MoveCaseDialog'
+import { ReaderPicker, RestrictCaseDialog, RestrictHelp, RestrictedMark, useNamedTeams, useReaderNames } from './RestrictCase'
+import { caseConflicts, errorDetail, OWNER_CANNOT_READ_NOTE, STALE_OWNER_NOTE } from './caseFormat'
+import { ClosureFields, closurePayload, closureProblem, type ClosureCategory, type ClosureChoice } from './ClosureFields'
 import { LATER_RELEASE } from '../../shared/later'
+import { NotMeasured } from '../../shared/NotMeasured'
+import { falseCloseText } from '../../shared/autonomy'
 import { holdCase } from '../../shell/heldCase'
 
 const cap = (s: string) => s[0].toUpperCase() + s.slice(1)
@@ -76,22 +83,32 @@ const TIME_LEFT_TIP = {
 const NEEDS_YOU_TIP = {
   source: 'Pending approvals and stopped hunts that wait on a person, matched to their cases.',
   calculation: 'Open cases holding at least one of them.',
-  limit: 'Counts every open case; only the alerts-from filter narrows it.',
+  limit: 'Counts cases on the teams in the team filter. Only the alerts-from filter narrows it further.',
+}
+const WAITING_TIP = {
+  source: 'Open cases and the newest live run on each.',
+  calculation: 'Unowned cases with no assigned or executing run, plus cases whose live run is waiting for approval or paused.',
+  limit: 'Closed cases are not counted. The team filter and the alerts-from filter narrow it.',
 }
 const WORKING_TIP = {
   source: 'Open cases, by their state.',
   calculation: 'Every open case minus the ones that need you.',
-  limit: 'Counts every open case; only the alerts-from filter narrows it.',
+  limit: 'Counts cases on the teams in the team filter. Only the alerts-from filter narrows it further.',
 }
 const NEAR_SLA_TIP = {
   source: 'The latest SLA attached to each open case.',
   calculation: 'Open cases past a due time, or with 75% or more of the response or resolution window used.',
-  limit: 'A paused SLA, or a case with no SLA, is not counted. Only the alerts-from filter narrows it.',
+  limit: 'A paused SLA, or a case with no SLA, is not counted. The team filter and the alerts-from filter narrow it.',
 }
 const CLOSED_TODAY_TIP = {
-  source: 'Case closure records.',
-  calculation: 'Closures since midnight UTC; "by an agent alone" is the share closed by an agent rather than from the console.',
-  limit: 'Today only, so it has no filter: State › Closed lists every closed case.',
+  source: 'Case closure records, and the fleet false-close tally over the last 30 days.',
+  calculation: 'Closures since midnight UTC. "By an agent alone" is the share of those closed by an agent rather than from the console. The 30-day figure is false closes over answered sampled dismissals, across every workflow.',
+  limit: 'The count is today only, and the team filter narrows whose cases count. Opening the card lists sampled dismissals still closed by the agent, not only today’s.',
+}
+const CLOSED_BY_LABEL: Record<ClosedByFilter, string> = {
+  agent: 'Closed by an agent',
+  person: 'Closed by a person',
+  draw: 'Sampled dismissal',
 }
 const STATE_WORDS = STATE_OPTIONS.filter((o) => o.value && o.value !== 'closed')
 const TONE_DOT: Record<PillTone, string> = {
@@ -107,6 +124,78 @@ const WORKING = ':working'
 const MINE = ':mine'
 const NEAR_SLA = ':near-sla'
 const OTHER = ':other'
+const UNASSIGNED = ':unassigned'
+const OWNERS_FAILED = ':owners-failed'
+// an owner's option value, so a username can't collide with the values above
+const OWNER = 'owner:'
+
+type CaseOwner = Schema<'CaseOwner'>
+type OwnerPick = { assignee: string; unassigned: boolean }
+
+/** The owners stored on cases this reader can list, reloaded when a case changes; `failed` if the read failed. */
+function useCaseOwners(): { owners: CaseOwner[]; failed: boolean } {
+  const [state, setState] = useState<{ owners: CaseOwner[]; failed: boolean }>({ owners: [], failed: false })
+  useEffect(() => {
+    let cancelled = false
+    let latest = 0
+    const load = () => {
+      const call = ++latest
+      // only the latest read lands, so a slow earlier one can't overwrite it
+      const keep = () => !cancelled && call === latest
+      casesApi
+        .getOwners()
+        .then((res) => { if (keep()) setState({ owners: res.data.owners, failed: false }) })
+        .catch(() => { if (keep()) setState({ owners: [], failed: true }) })
+    }
+    load()
+    window.addEventListener(CASES_CHANGED, load)
+    return () => {
+      cancelled = true
+      window.removeEventListener(CASES_CHANGED, load)
+    }
+  }, [])
+  return state
+}
+
+/** The option value for an owner filter: '' is everyone's. */
+function ownerValue({ assignee, unassigned }: OwnerPick, me: string): string {
+  if (!assignee.trim()) return unassigned ? UNASSIGNED : ''
+  return assignee === me ? MINE : OWNER + assignee
+}
+
+/** The filter an owner option sets; null for the inert "couldn't load" note. */
+function ownerPick(value: string, me: string): OwnerPick | null {
+  if (value === OWNERS_FAILED) return null
+  if (value === MINE) return { assignee: me, unassigned: false }
+  if (value === UNASSIGNED) return { assignee: '', unassigned: true }
+  return { assignee: value.startsWith(OWNER) ? value.slice(OWNER.length) : '', unassigned: false }
+}
+
+/** Everyone's, Assigned to me, Unassigned, then the readable owners, stale ones labelled. A selected owner
+ *  the list lacks (a ?owner= link, or the list failed) is kept, so the filter never hides. */
+function ownerOptions(
+  { owners, failed }: { owners: CaseOwner[]; failed: boolean },
+  me: string,
+  selected: string,
+  extra: { value: string; label: string; count?: number }[] = [],
+) {
+  const listed = owners.filter((o) => o.owner !== me).map((o) => ({
+    value: OWNER + o.owner,
+    label: o.owner_state === 'not_current' ? `${o.owner} · ${STALE_OWNER_NOTE}` : o.owner,
+  }))
+  if (selected.trim() && selected !== me && !owners.some((o) => o.owner === selected)) listed.unshift({ value: OWNER + selected, label: selected })
+  return [
+    { value: '', label: 'Everyone’s' },
+    ...(me ? [{ value: MINE, label: 'Assigned to me' }] : []),
+    ...extra,
+    { value: UNASSIGNED, label: 'Unassigned' },
+    ...(failed ? [{ value: OWNERS_FAILED, label: 'Couldn’t load owners' }] : []),
+    ...listed,
+  ]
+}
+
+/** An owner filter's name in a combined option. */
+const ownerLabel = (pick: OwnerPick) => (pick.assignee.trim() || (pick.unassigned ? 'Unassigned' : ''))
 
 const KIND_WORDS: Record<string, string> = {
   investigate: 'Investigation',
@@ -154,18 +243,19 @@ export default function CasesScreen({ setViewFull, viewFull, openCase, caseSeed,
   const selected = searchParams.get('case')
   // ?state=closed, ?needs_you=1 and ?working=1 open the list on that chip, and ?closed_by and
   // ?alerts_from narrow it, so an Overview count can link to the cases its alerts are in; ?owner opens
-  // it on one assignee's cases, as a notice about an account's open work links
+  // it on one assignee's cases (?unassigned=1 on cases with none), as a notice about an account's open work links
   const [filters, setFilters] = useState<CaseFilters>(() => {
     const closedBy = searchParams.get('closed_by')
     const alertsFrom = searchParams.get('alerts_from')
     return {
       ...INITIAL_CASE_FILTERS,
-      state: searchParams.get('state') === 'closed' || closedBy === 'agent' || closedBy === 'person' ? 'closed' : '',
+      state: searchParams.get('state') === 'closed' || isClosedBy(closedBy) ? 'closed' : '',
       needsYou: searchParams.get('needs_you') === '1',
       working: searchParams.get('working') === '1',
-      closedBy: closedBy === 'agent' || closedBy === 'person' ? closedBy : '',
+      closedBy: isClosedBy(closedBy) ? closedBy : '',
       alertsFrom: alertsFrom === 'today' || alertsFrom === 'all' ? alertsFrom : '',
       assignee: searchParams.get('owner') ?? '',
+      unassigned: searchParams.get('unassigned') === '1',
     }
   })
   const backToList = useCallback(() => setSearchParams({}), [setSearchParams])
@@ -211,9 +301,54 @@ function CasesTable({
   onFilters: (next: CaseFilters) => void
   onSelect: (id: string) => void
 }) {
-  const { rows, total, strip, phase, error, reload } = useCases(filters)
   const { kinds, names: workflowNames } = useWorkflowCatalog()
+  const owners = useCaseOwners()
   const me = useAuth().user?.username ?? ''
+  const { people, failed: peopleFailed, loaded: peopleLoaded } = usePeople()
+  const { names: readerNames } = useReaderNames()
+  const myTeams = people.find((person) => person.username === me)?.teams ?? []
+  const mineKey = myTeams.map((team) => team.id).join('\n')
+  // 'mine' is My teams (the whole queue for someone on no team), 'all' Everyone's, else one team's id.
+  // A ?owner= link opens on Everyone's, so the list matches the count of that owner's cases that linked to it.
+  const [pickedTeam, setTeamPick] = useState(() => (filters.assignee ? 'all' : 'mine'))
+  // "Assigned to me" spans every team the person owns cases on, so it overrides the My teams default
+  // (an explicitly chosen team still narrows it); the select then says Everyone's, as the list shows.
+  const teamPick = pickedTeam === 'mine' && me && filters.assignee === me ? 'all' : pickedTeam
+  // Teams this person can name: the teams list with users.read, else the teams on the people payload.
+  const listedTeams = useNamedTeams()
+  const teamChoices = useMemo(() => {
+    const byId = new Map<string, string>()
+    if (listedTeams) listedTeams.forEach((team) => byId.set(team.id, team.name))
+    else people.forEach((person) => person.teams.forEach((team) => byId.set(team.id, team.name)))
+    return [...byId].map(([id, name]) => ({ id, name })).sort((a, b) => a.name.localeCompare(b.name))
+  }, [listedTeams, people])
+  // null until the directory answers, so a person on a team does not flash the whole queue.
+  // A failed read cannot name their teams, so the list stays every readable case.
+  const teamIds = useMemo(() => {
+    if (!peopleLoaded) return null
+    if (teamPick === 'all') return []
+    if (teamPick !== 'mine') return [teamPick]
+    if (peopleFailed || !mineKey) return []
+    return mineKey.split('\n')
+  }, [peopleLoaded, teamPick, peopleFailed, mineKey])
+  const { rows, total, hidden, strip, phase, error, reload } = useCases(filters, teamIds)
+  const [overall, setOverall] = useState<AgreementTally | undefined>()
+  const [rateReady, setRateReady] = useState(false)
+  useEffect(() => {
+    let live = true
+    const load = () => {
+      analyticsApi.getAgreement('30d').then(
+        (block) => { if (live) { setOverall(block.overall); setRateReady(true) } },
+        () => { if (live) { setOverall(undefined); setRateReady(true) } },
+      )
+    }
+    load()
+    window.addEventListener(CASES_CHANGED, load)
+    return () => {
+      live = false
+      window.removeEventListener(CASES_CHANGED, load)
+    }
+  }, [])
   const [showAdvanced, setShowAdvanced] = useState(false)
   // Advanced search replaces the page until cleared. Results stay in API order.
   const [results, setResults] = useState<CaseRow[] | null>(null)
@@ -236,7 +371,7 @@ function CasesTable({
   // what the Filters panel holds; the chips own state, needs-you, kind and SLA
   const panelFilters =
     (filters.priority !== 'any' ? 1 : 0) +
-    (filters.assignee.trim() ? 1 : 0) +
+    (filters.assignee.trim() || filters.unassigned ? 1 : 0) +
     (filters.workflow.trim() ? 1 : 0) +
     (filters.dataSource.trim() ? 1 : 0)
   const activeFilters =
@@ -273,6 +408,7 @@ function CasesTable({
       priority: 'any',
       sla: '',
       assignee: '',
+      unassigned: false,
       workflow: '',
       dataSource: '',
     })
@@ -299,20 +435,24 @@ function CasesTable({
     { value: 'closed', label: 'Closed' },
   ]
 
-  // Assigned: an assignee typed in the Filters panel shows as its own option, so it never hides
-  const assignee = filters.assignee.trim()
-  // the panel's assignee can sit alongside Near SLA; then one option names both
-  const other = assignee && assignee !== me ? assignee : ''
-  const assignedValue = other ? OTHER : filters.sla === 'risk' ? NEAR_SLA : assignee ? MINE : ''
+  // Assigned: the panel's owner can sit alongside Near SLA; then one option names both
+  const owner = { assignee: filters.assignee, unassigned: filters.unassigned }
+  const ownerSel = ownerValue(owner, me)
+  const assignedValue = filters.sla === 'risk' ? (ownerSel ? OTHER : NEAR_SLA) : ownerSel
   const assignedOptions = [
-    { value: '', label: 'Everyone’s' },
-    ...(me ? [{ value: MINE, label: 'Assigned to me' }] : []),
-    { value: NEAR_SLA, label: 'Near SLA', count: strip.sla_at_risk },
-    ...(other ? [{ value: OTHER, label: filters.sla === 'risk' ? `${other} · Near SLA` : other }] : []),
+    ...ownerOptions(owners, me, filters.assignee, [{ value: NEAR_SLA, label: 'Near SLA', count: strip.sla_at_risk }]),
+    ...(filters.sla === 'risk' && ownerSel ? [{ value: OTHER, label: `${ownerSel === MINE ? 'Assigned to me' : ownerLabel(owner)} · Near SLA` }] : []),
   ]
+  const noOwner = { assignee: '', unassigned: false }
   const pickAssigned = (v: string) => {
     if (v === OTHER) return
-    setFilters(v === MINE ? { assignee: me, sla: '' } : v === NEAR_SLA ? { sla: 'risk', assignee: '' } : { assignee: '', sla: '' })
+    if (v === NEAR_SLA) return setFilters({ sla: 'risk', ...noOwner })
+    const pick = ownerPick(v, me)
+    if (pick) setFilters({ ...pick, sla: '' })
+  }
+  const pickPanelOwner = (v: string) => {
+    const pick = ownerPick(v, me)
+    if (pick) setFilters(pick)
   }
 
   const kindName = (c: CaseRow) => (c.workflowId && workflowNames[c.workflowId]) || c.workflowId || '—'
@@ -345,10 +485,10 @@ function CasesTable({
                   onSelect={(priority) => setFilters({ priority })}
                   options={[{ value: 'any', label: 'Any' }, ...CASE_PRIO_OPTIONS]}
                 />
-                <label className="filter-grp">
+                <div className="filter-grp">
                   <span className="filter-grp-label">Assignee</span>
-                  <input aria-label="Assignee filter" className={inputCls} value={filters.assignee} onChange={(e) => setFilters({ assignee: e.target.value })} />
-                </label>
+                  <Select searchable value={ownerSel} options={ownerOptions(owners, me, filters.assignee)} onSelect={pickPanelOwner} />
+                </div>
                 <label className="filter-grp">
                   <span className="filter-grp-label">Workflow</span>
                   <input aria-label="Workflow filter" className={inputCls} value={filters.workflow} onChange={(e) => setFilters({ workflow: e.target.value })} />
@@ -366,7 +506,7 @@ function CasesTable({
             </>
           }
         />
-        <StatCards label="Case status">
+        <StatCards label="Case status" className="cases-strip">
           <StatCard
             label="Needs you"
             dot={TONE_DOT.needs}
@@ -375,6 +515,11 @@ function CasesTable({
             value={strip.needs_you.toLocaleString()}
             onClick={() => pickState(filters.needsYou ? '' : NEEDS_YOU)}
             pressed={filters.needsYou}
+          />
+          <StatCard
+            label="Waiting"
+            info={<InfoTip label="How waiting is counted" {...WAITING_TIP} />}
+            value={(strip.waiting ?? 0).toLocaleString()}
           />
           <StatCard
             label="Still working"
@@ -387,19 +532,38 @@ function CasesTable({
             label="Near SLA"
             info={<InfoTip label="How near SLA is counted" {...NEAR_SLA_TIP} />}
             value={strip.sla_at_risk.toLocaleString()}
-            onClick={() => setFilters({ sla: filters.sla === 'risk' ? '' : 'risk', assignee: '' })}
+            onClick={() => setFilters({ sla: filters.sla === 'risk' ? '' : 'risk', ...noOwner })}
             pressed={filters.sla === 'risk'}
           />
-          {/* display-only: the closed filter lists every closed case, not today's */}
           <StatCard
             label="Closed today"
             info={<InfoTip label="How closed today is counted" {...CLOSED_TODAY_TIP} />}
             value={strip.closed_today.toLocaleString()}
-            sub={`${agentShare} by an agent alone`}
+            sub={
+              <>
+                <span>{agentShare} by an agent alone</span>
+                {rateReady && <span>{falseCloseText(overall) ?? <NotMeasured label="30 days" />}</span>}
+              </>
+            }
+            onClick={() => setFilters(filters.closedBy === 'draw' ? { ...allOpen } : { ...allOpen, state: 'closed', closedBy: 'draw' })}
+            pressed={filters.closedBy === 'draw'}
           />
         </StatCards>
         <div className="filter-row" role="group" aria-label="Filters">
           <div className="filter-row-picks">
+            {(myTeams.length > 0 || teamChoices.length > 0) && (
+              <Select
+                name="Team"
+                searchable={teamChoices.length > 8}
+                value={teamPick === 'mine' && myTeams.length === 0 ? 'all' : teamPick}
+                options={[
+                  ...(myTeams.length > 0 ? [{ value: 'mine', label: 'My teams' }] : []),
+                  { value: 'all', label: 'Everyone’s' },
+                  ...teamChoices.map((team) => ({ value: team.id, label: team.name })),
+                ]}
+                onSelect={(value) => { setTeamPick(value); setFilters({}) }}
+              />
+            )}
             <Select name="State" value={stateValue} options={stateOptions} onSelect={pickState} />
             {kinds.length > 0 && (
               <Select
@@ -409,13 +573,13 @@ function CasesTable({
                 onSelect={(kind) => setFilters({ kind })}
               />
             )}
-            <Select name="Assigned" value={assignedValue} options={assignedOptions} onSelect={pickAssigned} />
+            <Select name="Assigned" searchable={owners.owners.length > 8} value={assignedValue} options={assignedOptions} onSelect={pickAssigned} />
             {/* set by an Overview link; shown, and removable, so the list never looks wrong for no reason */}
             {filters.closedBy && (
               <FilterChip
                 list
                 active
-                label={`Closed by ${filters.closedBy === 'agent' ? 'an agent' : 'a person'}`}
+                label={CLOSED_BY_LABEL[filters.closedBy]}
                 count={<Icon name="close" size={11} />}
                 title="Remove this filter"
                 onClick={() => setFilters({ closedBy: '' })}
@@ -437,12 +601,13 @@ function CasesTable({
               {activeFilters || filters.query
                 ? `Showing ${total.toLocaleString()} ${filters.state === 'closed' ? `closed case${total === 1 ? '' : 's'}` : `of ${openCount.toLocaleString()}`}`
                 : `${openCount.toLocaleString()} open case${openCount === 1 ? '' : 's'}`}
+              {hidden > 0 && ` · ${hidden.toLocaleString()} restricted not counted`}
               {activeFilters > 0 && <> · <button type="button" onClick={clearAll}>Clear</button></>}
             </span>
           )}
         </div>
       </div>
-      {showAdvanced && <AdvancedSearchPanel onResults={setResults} rows={rows} />}
+      {showAdvanced && <AdvancedSearchPanel onResults={setResults} rows={rows} owners={owners} me={me} />}
       {results && (
         <div className="adv-results-bar">
           <span>Showing <b>{results.length}</b> search result{results.length === 1 ? '' : 's'}</span>
@@ -458,6 +623,7 @@ function CasesTable({
             <span role="columnheader" className="col-low">Kind</span>
             <span role="columnheader">Severity</span>
             <span role="columnheader">Status</span>
+            <span role="columnheader">Team</span>
             <span role="columnheader" className="col-low">Owner</span>
             <span role="columnheader" className="cg-th-info col-low">Time left (SLA)<InfoTip label="How time left is calculated" {...TIME_LEFT_TIP} /></span>
             <span role="columnheader"><span className="sr-only">Comments</span></span>
@@ -497,16 +663,31 @@ function CasesTable({
                     <span role="cell" className="cg-id" title={c.id}>{c.id}</span>
                     <span role="cell" className="cg-what" title={c.desc || c.title}>
                       <span className="cg-title">{c.title}</span>
-                      <span className="cg-sub">{metaLine(c)}</span>
+                      <span className="cg-sub">
+                        {c.restricted && <><RestrictedMark names={readerNames(c.readers, c.readerTeams)} limit={2} />{' · '}</>}
+                        {metaLine(c)}
+                      </span>
                     </span>
                     <span role="cell" className="cg-kind col-low" title={kindName(c)}>{kindName(c)}</span>
                     <span role="cell"><SeverityMark level={c.prio} /></span>
-                    <span role="cell"><StatePill state={c.status} needs={c.needsYou} /></span>
+                    <span role="cell">
+                      <StatePill
+                        state={c.status}
+                        needs={c.needsYou}
+                        label={!c.needsYou && (c.status === 'assigned' || c.status === 'executing') ? 'Agent working' : undefined}
+                      />
+                    </span>
+                    <span role="cell" className="cg-team" title={c.teamName || undefined}>{c.teamName || '—'}</span>
                     <span role="cell" className="cg-owner col-low">
                       <span className="cg-avatar" aria-hidden="true">{c.owner}</span>
-                      <span className="cg-owner-name">
-                        {c.ownerName === 'unassigned' ? 'Unassigned' : c.ownerName}
-                        {me && c.ownerName === me && ' (you)'}
+                      <span className="cg-owner-text">
+                        <span className="cg-owner-name">
+                          {c.ownerName || 'Unassigned'}
+                          {me && c.ownerName === me && ' (you)'}
+                        </span>
+                        {c.ownerStale && <span className="owner-note">{STALE_OWNER_NOTE}</span>}
+                        {c.ownerOnTeam === false && <span className="owner-note">owner no longer on team</span>}
+                        {c.ownerCannotRead && <span className="owner-note">{OWNER_CANNOT_READ_NOTE}</span>}
                       </span>
                     </span>
                     <span role="cell" className="cg-time col-low">
@@ -612,7 +793,12 @@ function DeleteCaseDialog({
   )
 }
 
-function AdvancedSearchPanel({ onResults, rows }: { onResults: (r: CaseRow[] | null) => void; rows: CaseRow[] }) {
+function AdvancedSearchPanel({ onResults, rows, owners, me }: {
+  onResults: (r: CaseRow[] | null) => void
+  rows: CaseRow[]
+  owners: { owners: CaseOwner[]; failed: boolean }
+  me: string
+}) {
   const [query, setQuery] = useState('')
   const [priority, setPriority] = useState('')
   const [status, setStatus] = useState('')
@@ -646,7 +832,9 @@ function AdvancedSearchPanel({ onResults, rows }: { onResults: (r: CaseRow[] | n
     if (query.trim()) filters.query_text = query.trim()
     if (priority) filters.priority = [priority]
     if (status) filters.status = [status]
-    if (assignee.trim()) filters.assignee = [assignee.trim()]
+    const owner = ownerPick(assignee, me)
+    if (owner?.assignee) filters.assignee = [owner.assignee]
+    if (owner?.unassigned) filters.unassigned = true
     const tagList = tags.split(',').map((t) => t.trim()).filter(Boolean)
     if (tagList.length) filters.tags = tagList
     if (start) filters.created_after = start
@@ -658,7 +846,7 @@ function AdvancedSearchPanel({ onResults, rows }: { onResults: (r: CaseRow[] | n
     setBusy(true)
     setErr('')
     try {
-      const res = await caseSearchApi.search({ ...filters, limit: 50, offset: 0 })
+      const res = await caseSearchApi.search({ ...filters, unassigned: filters.unassigned ?? false, limit: 50, offset: 0 })
       onResults(res.data.results.map((c) => mapQueueCase(c)))
     } catch (e) {
       setErr(errorDetail(e, 'Search failed'))
@@ -733,7 +921,7 @@ function AdvancedSearchPanel({ onResults, rows }: { onResults: (r: CaseRow[] | n
         />
       </label>
       <label className="af"><span>Assignee</span>
-        <input className={inputCls} placeholder="name or email" value={assignee} onChange={(e) => setAssignee(e.target.value)} onKeyDown={onKey} />
+        <Select searchable value={assignee} options={ownerOptions(owners, me, ownerPick(assignee, me)?.assignee ?? '')} onSelect={(v) => v !== OWNERS_FAILED && setAssignee(v)} />
       </label>
       <label className="af"><span>Tags</span>
         <input className={inputCls} placeholder="comma-separated" value={tags} onChange={(e) => setTags(e.target.value)} onKeyDown={onKey} />
@@ -759,8 +947,20 @@ function NewCaseDialog({ open, onClose, onCreated }: { open: boolean; onClose: (
   const [priority, setPriority] = useState('medium')
   const [status, setStatus] = useState<CaseStatus>('open')
   const [description, setDescription] = useState('')
+  // Restricted from the first insert; you are pre-ticked.
+  const [restricted, setRestricted] = useState(false)
+  const [readers, setReaders] = useState<string[]>([])
+  const [readerTeams, setReaderTeams] = useState<string[]>([])
+  const { me } = useReaderNames()
   const [busy, setBusy] = useState(false)
   const [err, setErr] = useState('')
+  // You are ticked once, when the directory has you; unticking yourself stays unticked.
+  const [seeded, setSeeded] = useState(false)
+  useEffect(() => {
+    if (!restricted || seeded || !me) return
+    setSeeded(true)
+    setReaders((held) => (held.includes(me.principal_id) ? held : [...held, me.principal_id]))
+  }, [restricted, seeded, me])
 
   const submit = async () => {
     if (!title.trim()) {
@@ -776,8 +976,10 @@ function NewCaseDialog({ open, onClose, onCreated }: { open: boolean; onClose: (
         finding_ids: [],
         priority,
         status,
+        ...(restricted ? { restricted: true, readers, reader_teams: readerTeams } : {}),
       })
       setTitle(''); setDescription(''); setPriority('medium'); setStatus('open')
+      setRestricted(false); setReaders([]); setReaderTeams([]); setSeeded(false)
       onCreated()
       onClose()
     } catch (e) {
@@ -820,7 +1022,19 @@ function NewCaseDialog({ open, onClose, onCreated }: { open: boolean; onClose: (
           <span>Description</span>
           <textarea className={inputCls} rows={4} placeholder="Optional description" value={description} onChange={(e) => setDescription(e.target.value)} style={{ resize: 'vertical' }} />
         </label>
-        {err && <div className="text-[13px]" style={{ color: 'var(--crit)' }}>{err}</div>}
+        <label className="restrict-toggle">
+          <input type="checkbox" checked={restricted} onChange={(e) => setRestricted(e.target.checked)} />
+          <span>Restricted</span>
+        </label>
+        {restricted ? (
+          <>
+            <RestrictHelp />
+            <ReaderPicker readers={readers} readerTeams={readerTeams} onReaders={setReaders} onTeams={setReaderTeams} />
+          </>
+        ) : (
+          <p className="reader-pick-note">New cases start open; restrict a case to limit who can see it.</p>
+        )}
+        {err && <div role="alert" className="text-[13px]" style={{ color: 'var(--crit)' }}>{err}</div>}
         <div className="flex justify-end gap-2.5">
           <button className="btn ghost" onClick={onClose}>Cancel</button>
           <button className="btn primary" onClick={submit} disabled={busy}>{busy ? 'Creating…' : 'Create case'}</button>
@@ -854,21 +1068,33 @@ const CONFLICT_NAME: Record<CaseEditField, string> = {
 function conflictValue(field: CaseEditField, value: string): string {
   if (field === 'status') return CASE_STATUS_OPTIONS.find((o) => o.value === value)?.label ?? (value || 'blank')
   if (field === 'priority') return CASE_PRIO_OPTIONS.find((o) => o.value === value)?.label ?? (value || 'blank')
-  if (field === 'assignee') return value || 'unassigned'
+  if (field === 'assignee') return value || 'Unassigned'
   return value ? `“${value}”` : 'empty'
 }
 
-function EditCaseDialog({ open, c, onClose, onSaved, onStale }: {
+function EditCaseDialog({ open, c, onClose, onSaved, onStale, onOffTeam, onAssignToMe }: {
   open: boolean
   c: CaseRecord | null
   onClose: () => void
   onSaved: () => void
   /** The case moved under this edit: re-read it behind the dialog. */
   onStale: () => void
+  /** An owner on another team. A closed case has no move, so this stays unset. */
+  onOffTeam?: (person: Person) => void
+  onAssignToMe?: () => void
 }) {
   return (
     <Popup open={open} onClose={onClose} title="Edit case" width={520}>
-      {c && <EditCaseForm c={c} onClose={onClose} onSaved={onSaved} onStale={onStale} />}
+      {c && (
+        <EditCaseForm
+          c={c}
+          onClose={onClose}
+          onSaved={onSaved}
+          onStale={onStale}
+          onOffTeam={c.status === 'closed' ? undefined : onOffTeam}
+          onAssignToMe={onAssignToMe}
+        />
+      )}
     </Popup>
   )
 }
@@ -876,21 +1102,30 @@ function EditCaseDialog({ open, c, onClose, onSaved, onStale }: {
 // Mounted once per opening. Its state starts from the case as read then and does
 // not follow later reads: a run re-reads the case while it works, and following
 // that would wipe what is typed here and hide the change it should be compared with.
-function EditCaseForm({ c, onClose, onSaved, onStale }: {
+function EditCaseForm({ c, onClose, onSaved, onStale, onOffTeam, onAssignToMe }: {
   c: CaseRecord
   onClose: () => void
   onSaved: () => void
   onStale: () => void
+  onOffTeam?: (person: Person) => void
+  onAssignToMe?: () => void
 }) {
   const [values, setValues] = useState<CaseEditValues>(c.stored)
   // What this edit last saw on the server, field by field. A save names these for
   // the fields it changes, so the server can refuse one that has moved since.
   const [seen, setSeen] = useState<CaseEditValues>(c.stored)
   const [conflicts, setConflicts] = useState<CaseConflict[]>([])
-  const [category, setCategory] = useState<ClosureCategory>('resolved')
+  const [category, setCategory] = useState<ClosureChoice>('')
   const [reason, setReason] = useState('')
+  const [cause, setCause] = useState('')
   const [busy, setBusy] = useState(false)
   const [err, setErr] = useState('')
+  // The stored owner a save was refused over (OWNER_NOT_CURRENT); fixed with the picker above.
+  const [staleOwner, setStaleOwner] = useState('')
+  // An owner this dialog already saved stands over a close retried after it (#4983).
+  const namedOwner = useRef(false)
+  const canAssign = useAuth().hasPermission('cases.assign')
+  const { people } = usePeople()
   const set = (field: CaseEditField) => (value: string) => setValues((v) => ({ ...v, [field]: value }))
 
   // Only a Case crossing into closed is being closed. Re-saving one that is
@@ -902,6 +1137,7 @@ function EditCaseForm({ c, onClose, onSaved, onStale }: {
   const save = async (mine: CaseEditValues, stored: CaseEditValues) => {
     if (!mine.title.trim()) { setErr('Title is required.'); return }
     const isClosing = closingFrom(mine, stored)
+    if (isClosing && !category) return
     const problem = isClosing ? closureProblem(category, reason) : null
     if (problem) { setErr(problem); return }
     // Only what this person changed: sending the rest would write back old values
@@ -927,13 +1163,22 @@ function EditCaseForm({ c, onClose, onSaved, onStale }: {
     }
     setBusy(true)
     setErr('')
+    setStaleOwner('')
     try {
-      await casesApi.update(c.id, update)
+      // A close that changes nothing else sends no PATCH: the close endpoint judges it.
+      if (Object.keys(update).length > 1) await casesApi.update(c.id, update)
+      if ('assignee' in update) namedOwner.current = true
       setSeen(landed)
       // Second, so a close that fails leaves the edits saved and the Case open,
       // rather than closed under a title that never landed.
       if (isClosing) {
-        await casesApi.closeCase(c.id, { ...closurePayload(category, reason), expected: { status: stored.status } })
+        // `category` is set: a close with none returned before the save began
+        // An owner this save named stands: the close does not take the case (#4983).
+        await casesApi.closeCase(c.id, {
+          ...closurePayload(category as ClosureCategory, reason, cause),
+          expected: { status: stored.status },
+          ...(namedOwner.current ? { take_ownership: false } : {}),
+        })
       }
       onSaved()
       onClose()
@@ -942,6 +1187,12 @@ function EditCaseForm({ c, onClose, onSaved, onStale }: {
       if (moved) {
         setConflicts(moved)
         onStale()
+      } else if (isOwnerNotCurrent(e)) {
+        setStaleOwner(stored.assignee)
+      } else if (isOwnerOffTeam(e) && onOffTeam) {
+        const person = people.find((one) => one.username === values.assignee.trim())
+        if (person && person.teams.length) onOffTeam(person)
+        else setErr(errorDetail(e, 'Failed to save changes'))
       } else {
         setErr(errorDetail(e, 'Failed to save changes'))
       }
@@ -979,11 +1230,19 @@ function EditCaseForm({ c, onClose, onSaved, onStale }: {
           <Select value={values.status} onSelect={set('status')} options={withStored(CASE_STATUS_OPTIONS, values.status)} />
         </label>
       </div>
-      {closing && <ClosureFields category={category} reason={reason} onCategory={setCategory} onReason={setReason} />}
+      {closing && <ClosureFields category={category} reason={reason} cause={cause} onCategory={setCategory} onReason={setReason} onCause={setCause} />}
       <label className="flex flex-col gap-1.5 text-xs font-semibold uppercase tracking-wide text-tx-3">
         <span>Assignee</span>
-        <input className={inputCls} placeholder="name or email" value={values.assignee} onChange={(e) => set('assignee')(e.target.value)} />
+        <PersonPicker
+          value={values.assignee}
+          state={values.assignee === c.stored.assignee ? c.ownerState : undefined}
+          onSelect={set('assignee')}
+          disabled={!canAssign}
+          teamId={c.teamId}
+          onOffTeam={onOffTeam}
+        />
       </label>
+      {staleOwner && <OwnerFix owner={staleOwner} canChange={canAssign} onAssignToMe={onAssignToMe} />}
       <label className="flex flex-col gap-1.5 text-xs font-semibold uppercase tracking-wide text-tx-3">
         <span>Description</span>
         <textarea className={inputCls} rows={4} value={values.description} onChange={(e) => set('description')(e.target.value)} style={{ resize: 'vertical' }} />
@@ -1008,7 +1267,7 @@ function EditCaseForm({ c, onClose, onSaved, onStale }: {
       {err && <div className="text-[13px]" style={{ color: 'var(--crit)' }}>{err}</div>}
       <div className="flex justify-end gap-2.5">
         <button className="btn ghost" onClick={onClose}>Cancel</button>
-        <button className="btn primary" onClick={() => void save(values, seen)} disabled={busy || conflicts.length > 0}>{busy ? 'Saving…' : 'Save changes'}</button>
+        <button className="btn primary" onClick={() => void save(values, seen)} disabled={busy || conflicts.length > 0 || (closing && !category)}>{busy ? 'Saving…' : 'Save changes'}</button>
       </div>
     </div>
   )
@@ -1123,14 +1382,46 @@ export function CasesDetail({
   seed?: ChatSeed | null
   onSeedConsumed?: () => void
 }) {
-  const { row: c, created, combinedState, investigations, closure, linkedFindings, phase, error, reload: reloadDetail, refresh } =
-    useCaseDetail(id)
-  const { hasPermission } = useAuth()
+  const {
+    row: c, created, combinedState, investigations, closure, linkedFindings, openedFrom,
+    recheck, reviewersDiffer, phase, error, reload: reloadDetail, refresh,
+  } = useCaseDetail(id)
+  const { user, hasPermission } = useAuth()
   const canDelete = hasPermission('cases.delete')
   const canWrite = hasPermission('cases.write')
-  const [action, setAction] = useState<'edit' | 'merge' | 'delete' | null>(null)
+  const [action, setAction] = useState<'edit' | 'merge' | 'delete' | 'restrict' | null>(null)
+  const [move, setMove] = useState<{ owner: string; teams: MoveTeam[] } | null>(null)
+  const { people } = usePeople()
+  const { notify } = useToast()
+  const viewer = people.find((person) => person.username === user?.username)
+  const member = !!(c?.teamId && viewer && onTeam(viewer, c.teamId))
   // a list left mounted behind the drawer reloads on this
   const onChanged = () => { reloadDetail(); notifyCasesChanged() }
+  const claim = async () => {
+    try {
+      await casesApi.claim(id)
+      setAction(null)
+      onChanged()
+    } catch (e) {
+      notify('err', errorDetail(e, 'Couldn’t assign this case to you'))
+    }
+  }
+  const openMove = (owner: string, teams: MoveTeam[]) => {
+    if (!c?.teamId || c.status === 'closed') return
+    setMove({
+      owner,
+      teams: teams.filter((team) => team.id !== c.teamId).sort((a, b) => a.name.localeCompare(b.name)),
+    })
+  }
+  const otherTeams = () => {
+    const seen = new Map<string, MoveTeam>()
+    for (const person of people) {
+      for (const team of person.teams) {
+        if (team.id !== c?.teamId && !seen.has(team.id)) seen.set(team.id, team)
+      }
+    }
+    return [...seen.values()]
+  }
 
   return (
     <>
@@ -1144,6 +1435,9 @@ export function CasesDetail({
         investigations={investigations}
         closure={closure}
         linkedFindings={linkedFindings}
+        openedFrom={openedFrom}
+        recheck={recheck}
+        reviewersDiffer={reviewersDiffer}
         phase={phase}
         error={error}
         pageKey={pageKey}
@@ -1160,7 +1454,13 @@ export function CasesDetail({
         canWrite={canWrite}
         onChanged={onChanged}
         onRefresh={refresh}
+        onClaim={canWrite && member ? claim : undefined}
+        onMove={c?.teamId && c.status !== 'closed' ? () => openMove('', otherTeams()) : undefined}
+        onRestrict={() => setAction('restrict')}
       />
+      {action === 'restrict' && c && (
+        <RestrictCaseDialog key={c.id} c={c} onClose={() => setAction(null)} onChanged={onChanged} />
+      )}
 
       <EditCaseDialog
         open={action === 'edit'}
@@ -1168,7 +1468,20 @@ export function CasesDetail({
         onClose={() => setAction(null)}
         onSaved={onChanged}
         onStale={refresh}
+        onOffTeam={(person) => openMove(person.username, person.teams)}
+        onAssignToMe={member ? claim : undefined}
       />
+      {move && c?.teamId && c.teamName && (
+        <MoveCaseDialog
+          key={`${move.owner}:${move.teams.map((team) => team.id).join()}`}
+          caseId={id}
+          source={{ id: c.teamId, name: c.teamName }}
+          initialOwner={move.owner}
+          teams={move.teams}
+          onClose={() => setMove(null)}
+          onMoved={() => { setMove(null); setAction(null); onChanged() }}
+        />
+      )}
       <MergeCaseDialog
         open={action === 'merge'}
         c={c}

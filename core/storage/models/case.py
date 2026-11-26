@@ -5,23 +5,21 @@ from typing import TYPE_CHECKING, List, Optional
 
 from sqlalchemy import (
     DateTime,
+    ForeignKey,
     Index,
     String,
     Text,
     text,
 )
-from sqlalchemy.dialects.postgresql import ARRAY
-from sqlalchemy.orm import (
-    Mapped,
-    mapped_column,
-    relationship,
-)
+from sqlalchemy.dialects.postgresql import ARRAY, JSONB
+from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from core.storage.models.base import Base, JSONBList, case_findings
 from core.time import utcnow
 
 if TYPE_CHECKING:
     from core.storage.models.finding import Finding
+    from core.storage.models.team import Team
 
 
 class Case(Base):
@@ -44,8 +42,27 @@ class Case(Base):
         String(20), nullable=False, default="medium", server_default="medium"
     )
 
-    # Assignment
+    # Assignment. The team is required; the owner stays a username.
     assignee: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    team_id: Mapped[str] = mapped_column(
+        String(50),
+        ForeignKey("teams.team_id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    team: Mapped["Team"] = relationship(lazy="selectin")
+
+    # Restricted cases (#4354): who may read it. NULL or empty is open; the rule
+    # is core.auth.permissions.may_read_case / case_read_clause.
+    reader_principal_ids: Mapped[Optional[List[str]]] = mapped_column(
+        ARRAY(Text), nullable=True
+    )
+    reader_team_ids: Mapped[Optional[List[str]]] = mapped_column(
+        ARRAY(String(50)), nullable=True
+    )
+
+    # Opened from a re-check (#5095): source, closed_at, run_id. Null otherwise.
+    # Agreement leaves a marked Case out. One column is the whole mark.
+    recheck_mark: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
 
     # Tags (array of strings)
     tags: Mapped[List[str]] = mapped_column(ARRAY(String), nullable=True, default=list)
@@ -73,6 +90,15 @@ class Case(Base):
         ARRAY(String), nullable=True
     )
 
+    # The shared IOC index (#4733): when this Case's rows last matched what it
+    # holds. Stale: a write to the index failed and none has succeeded since.
+    indicators_synced_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, default=utcnow, server_default=text("now()")
+    )
+    indicators_stale_since: Mapped[Optional[datetime]] = mapped_column(
+        DateTime, nullable=True
+    )
+
     # Timestamps
     created_at: Mapped[datetime] = mapped_column(
         DateTime, nullable=False, default=utcnow, server_default=text("now()")
@@ -95,8 +121,20 @@ class Case(Base):
         Index("idx_case_status", "status"),
         Index("idx_case_priority", "priority"),
         Index("idx_case_assignee", "assignee"),
+        Index("idx_case_team_id", "team_id"),
         Index("idx_case_created_at", "created_at"),
         Index("idx_case_updated_at", "updated_at"),
+        # The shared IOC index's catch-up loop and its bell counts (#4734).
+        Index(
+            "idx_case_indicators_stale",
+            "indicators_stale_since",
+            postgresql_where=text("indicators_stale_since IS NOT NULL"),
+        ),
+        Index(
+            "idx_case_indicators_synced",
+            "indicators_synced_at",
+            postgresql_where=text("indicators_synced_at IS NOT NULL"),
+        ),
         Index(
             "idx_case_title_trgm",
             "title",

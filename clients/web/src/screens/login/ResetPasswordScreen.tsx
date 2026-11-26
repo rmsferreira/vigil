@@ -6,7 +6,7 @@ import AuthLayout from './AuthLayout'
 import { requestErrorMessage } from './requestErrorMessage'
 
 // Landing page for the emailed /reset-password?token=… link. Public: the
-// signed token is the credential. AuthProvider's /auth/me GET on mount seeds
+// link's single-use token is the credential. AuthProvider's /auth/me GET on mount seeds
 // the csrf_token cookie the confirm POST needs in a fresh browser.
 export default function ResetPasswordScreen() {
   const navigate = useNavigate()
@@ -27,10 +27,16 @@ export default function ResetPasswordScreen() {
     setError('')
     setLoading(true)
     try {
-      await authApi.confirmPasswordReset({ token, new_password: password })
+      const res = await authApi.confirmPasswordReset({ token, new_password: password })
       navigate('/login', {
         replace: true,
-        state: { notice: 'Password updated. Sign in with your new password.' },
+        state: {
+          notice:
+            'Password updated. Sign in with your new password.' +
+            (res.data?.recovery_codes_removed
+              ? ' Your old recovery codes were removed: make new ones in your security settings after you sign in.'
+              : ''),
+        },
       })
     } catch (err: any) {
       setError(requestErrorMessage(err, 'Could not reset your password. Please try again.'))

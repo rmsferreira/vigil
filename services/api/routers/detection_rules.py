@@ -18,25 +18,32 @@ from fastapi import (
     Response,
     UploadFile,
 )
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, field_validator
 
-from core.auth import trail_events
+from core.auth import signing_key, step_up, tool_principal, trail_events
 from core.auth.current_user import get_current_user
 from core.auth.permissions import permission_gate, require_permission
 from core.deps import provide_detection_rules, provide_mcp_client, provide_mcp_registry
-from core.detections import detection_skill, exceptions, proof_card
+from core.detections import detection_skill, exceptions, proof_card, rule_libraries
 from core.detections.detection_rules_service import (
     DEPLOY_FORMATS,
     DetectionRulesService,
     is_vendor_repo,
 )
-from core.detections.inventory import catalog, health_inbox, stages
+from core.detections.inventory import catalog, health_inbox, import_check, stages
 from core.detections.inventory.sync import sync_repos
 from core.integrations.mcp.registry import MCPRegistry, register_connected
 from core.integrations.mcp.surface import acting_as
 from core.routing import Auth, RouterMeta
-from core.storage.config_service import get_config_service
+from core.skills.skill_library import SkillConflict, SkillError
+from core.storage.config_service import (
+    audited_change,
+    get_config_service,
+    write_config_audit,
+)
 from core.storage.models import User
+from core.storage.unit_of_work import unit_of_work
 from services.api.middleware.auth import get_current_active_user
 
 logger = logging.getLogger(__name__)
@@ -58,7 +65,7 @@ class AddSourceRequest(BaseModel):
     """Request to add a new detection rule source."""
 
     name: str
-    source_type: str  # 'git' or 'local'
+    source_type: str  # 'local'; a git repo is imported (/libraries/import)
     format: str  # 'sigma', 'splunk', 'elastic', 'kql', 'wazuh', 'auto'
     url: Optional[str] = None
     path: Optional[str] = None
@@ -90,6 +97,17 @@ def _audit_deploy_target(user: User, source: dict, old: bool, new: bool) -> None
         logger.warning("Could not write deploy target audit log: %s", e)
 
 
+def _source_record(source: dict) -> dict:
+    """What the trail keeps of a rule source."""
+    keys = ("id", "name", "type", "format", "git_url", "local_path")
+    return {
+        **{k: source.get(k) for k in keys},
+        "subdirectory": source.get("subdirectory") or "",
+        "deploy_target": bool(source.get("deploy_target")),
+        "github_enterprise": bool(source.get("github_enterprise")),
+    }
+
+
 class DeployTargetRequest(BaseModel):
     """Whether this git source receives Vigil's live rules of its format."""
 
@@ -112,6 +130,7 @@ def list_sources(
     # vendor_repo: a shipped vendor repo, which can never be a deploy target.
     # deploy_target is the one rollout honours per format, so a saved file
     # holding two flags of one format never shows both as on.
+    service.refresh()  # a library imported over /mcp or by another worker
     honoured = {
         target["id"]
         for fmt in DEPLOY_FORMATS
@@ -142,6 +161,7 @@ def get_source(
     Returns:
         Source details
     """
+    service.refresh()
     source = service.get_source(source_id)
     if not source:
         raise HTTPException(status_code=404, detail=f"Source not found: {source_id}")
@@ -168,6 +188,7 @@ def add_source(
         before = (
             service.deploy_target(request.format) if request.deploy_target else None
         )
+        prior = {x["id"]: _source_record(x) for x in service.list_sources()}
         source = service.add_source(
             name=request.name,
             source_type=request.source_type,
@@ -179,6 +200,30 @@ def add_source(
             deploy_target=request.deploy_target,
             github_enterprise=request.github_enterprise,
         )
+        # Recorded after the add, which can clone for minutes: the trail's lock
+        # is held to the end of its transaction. A folder already registered is
+        # refreshed, not added; a refused entry takes out only a new source.
+        old = prior.get(source["id"])
+        try:
+            with unit_of_work() as session:
+                write_config_audit(
+                    session,
+                    config_type="detection_rules",
+                    config_key=f"source:{source['id']}",
+                    action="update" if old else "create",
+                    old_value=old,
+                    new_value=_source_record(source),
+                    changed_by=str(current_user.user_id),
+                )
+        except Exception:
+            if old is None:
+                service.remove_source(source["id"])
+            elif request.deploy_target:
+                # Only a deploy-target mark changes what a re-registered source does.
+                service.set_deploy_target(
+                    source["id"], old["deploy_target"], old["github_enterprise"]
+                )
+            raise
         if request.deploy_target:
             was = before is not None and before.get("id") == source["id"]
             _audit_deploy_target(current_user, source, was, True)
@@ -188,12 +233,19 @@ def add_source(
         raise HTTPException(status_code=400, detail=str(e))
 
 
-@router.delete("/sources/{source_id}", dependencies=_SETTINGS_WRITE)
+@router.delete(
+    "/sources/{source_id}",
+    dependencies=[
+        *_SETTINGS_WRITE,
+        step_up.gate("detections.write", "remove a detection source"),
+    ],
+)
 def remove_source(
     source_id: str,
     background: BackgroundTasks,
     delete_files: bool = False,
     service: DetectionRulesService = Depends(provide_detection_rules),
+    current_user: User = Depends(get_current_active_user),
 ):
     """
     Remove a detection rule source.
@@ -205,11 +257,37 @@ def remove_source(
     Returns:
         Success status
     """
-    success = service.remove_source(source_id, delete_files=delete_files)
-    if not success:
+    source = service.get_source(source_id)
+    if not source:
         raise HTTPException(status_code=404, detail=f"Source not found: {source_id}")
+    # Recorded first: a refused entry leaves the source in place.
+    with audited_change(
+        str(current_user.user_id),
+        config_type="detection_rules",
+        config_key=f"source:{source_id}",
+        action="delete",
+        old_value=_source_record(source),
+        new_value={"delete_files": delete_files},
+    ):
+        if not service.remove_source(source_id, delete_files=delete_files):
+            raise HTTPException(
+                status_code=404, detail=f"Source not found: {source_id}"
+            )
     background.add_task(_sync_detection_rules)
     return {"success": True}
+
+
+def _who(user: User) -> rule_libraries.Who:
+    return str(user.user_id), user.username
+
+
+def _library_http(exc: Exception) -> HTTPException:
+    """A library refusal as HTTP: 404 unknown, 409 stale or clashing, else 400."""
+    if isinstance(exc, LookupError):
+        return HTTPException(status_code=404, detail=str(exc))
+    return HTTPException(
+        status_code=409 if isinstance(exc, SkillConflict) else 400, detail=str(exc)
+    )
 
 
 @router.post("/sources/{source_id}/update", dependencies=_SETTINGS_WRITE)
@@ -219,9 +297,11 @@ async def update_source(
     service: DetectionRulesService = Depends(provide_detection_rules),
     mcp_client=Depends(provide_mcp_client),
     registry: MCPRegistry = Depends(provide_mcp_registry),
+    current_user: User = Depends(get_current_active_user),
 ):
     """
-    Update a single detection rule source (git pull or rescan).
+    Update a single detection rule source: a rule library takes its repo whole
+    at the commit read now; a local source is rescanned.
 
     Args:
         source_id: The source ID to update
@@ -230,16 +310,117 @@ async def update_source(
         Updated source details
     """
     try:
-        # git pull runs up to 120s; keep it off the event loop.
-        source = await asyncio.to_thread(service.update_source, source_id)
-
-        # After updating, restart the security-detections MCP server to rebuild index
-        await _restart_security_detections_mcp(mcp_client, service, registry)
-        background.add_task(_sync_detection_rules)
-
-        return {"success": True, "source": source}
+        # A clone runs up to 120s; keep it off the event loop.
+        source = await asyncio.to_thread(
+            service.update_source, source_id, _who(current_user)
+        )
+    except (LookupError, SkillError) as e:
+        raise _library_http(e)
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
+
+    # After updating, restart the security-detections MCP server to rebuild index
+    await _restart_security_detections_mcp(mcp_client, service, registry)
+    background.add_task(_sync_detection_rules)
+    return {"success": True, "source": source}
+
+
+class ReadLibraryRequest(BaseModel):
+    """A repo to read (owner/repo, a GitHub link, an https URL, with @ref), or a
+    library to read with its update diff."""
+
+    repo: Optional[str] = Field(default=None, max_length=500)
+    source_id: Optional[str] = Field(default=None, max_length=64)
+    format: Optional[str] = Field(default=None, max_length=16)
+
+
+class ImportRulesRequest(BaseModel):
+    """Picked rule files at the commit read: a new library from ``repo``, or an
+    update to the library ``source_id``."""
+
+    commit: str = Field(min_length=7, max_length=64)
+    picks: List[str] = Field(default_factory=list, max_length=20000)
+    repo: Optional[str] = Field(default=None, max_length=500)
+    source_id: Optional[str] = Field(default=None, max_length=64)
+    name: Optional[str] = Field(default=None, max_length=200)
+    format: Optional[str] = Field(default=None, max_length=16)
+
+
+@router.post("/libraries/read", dependencies=_SETTINGS_WRITE)
+async def read_library(
+    request: ReadLibraryRequest,
+    service: DetectionRulesService = Depends(provide_detection_rules),
+):
+    """The commit a repo is at and the rule files in it, grouped by folder, each
+    with its language, techniques and why it cannot be picked; for a library,
+    also Changed, Gone from the repo, and In the repo, not imported."""
+    try:
+        return await asyncio.to_thread(
+            rule_libraries.read,
+            service,
+            repo=request.repo,
+            source_id=request.source_id,
+            fmt=request.format,
+        )
+    except (LookupError, SkillError) as e:
+        raise _library_http(e)
+
+
+@router.post("/libraries/import", dependencies=_SETTINGS_WRITE)
+async def import_library_rules(
+    request: ImportRulesRequest,
+    background: BackgroundTasks,
+    service: DetectionRulesService = Depends(provide_detection_rules),
+    mcp_client=Depends(provide_mcp_client),
+    registry: MCPRegistry = Depends(provide_mcp_registry),
+    current_user: User = Depends(get_current_active_user),
+):
+    """Import the picked files at the commit read; refused (409) when the repo
+    has moved since. All or nothing; audited."""
+    try:
+        source = await asyncio.to_thread(
+            rule_libraries.import_rules,
+            service,
+            request.commit,
+            request.picks,
+            _who(current_user),
+            repo=request.repo,
+            source_id=request.source_id,
+            name=request.name,
+            fmt=request.format,
+        )
+    except (LookupError, SkillError) as e:
+        raise _library_http(e)
+    await _restart_security_detections_mcp(mcp_client, service, registry)
+    background.add_task(_sync_detection_rules)
+    return {"success": True, "source": source}
+
+
+@router.delete(
+    "/libraries/{source_id}",
+    dependencies=[
+        *_SETTINGS_WRITE,
+        step_up.gate("detections.write", "remove a rule library"),
+    ],
+)
+async def remove_library(
+    source_id: str,
+    background: BackgroundTasks,
+    service: DetectionRulesService = Depends(provide_detection_rules),
+    mcp_client=Depends(provide_mcp_client),
+    registry: MCPRegistry = Depends(provide_mcp_registry),
+    current_user: User = Depends(get_current_active_user),
+):
+    """Remove a rule library and its files; the next sync marks its rules removed."""
+    try:
+        removed = await asyncio.to_thread(
+            rule_libraries.remove, service, source_id, _who(current_user)
+        )
+    except (LookupError, SkillError) as e:
+        raise _library_http(e)
+    await _restart_security_detections_mcp(mcp_client, service, registry)
+    background.add_task(_sync_detection_rules)
+    return {"success": True, **removed}
 
 
 @router.post("/sources/{source_id}/deploy-target", dependencies=_SETTINGS_WRITE)
@@ -269,20 +450,42 @@ async def update_all_sources(
     service: DetectionRulesService = Depends(provide_detection_rules),
     mcp_client=Depends(provide_mcp_client),
     registry: MCPRegistry = Depends(provide_mcp_registry),
+    current_user: User = Depends(get_current_active_user),
 ):
     """
-    Update all detection rule sources (git pull all repos).
+    Update all detection rule sources: each rule library is taken whole at the
+    commit read now, one after another; local sources are rescanned. A library
+    that cannot be read is a ``success: false`` row saying why.
 
     Returns:
         Results for each source update
     """
-    results = await asyncio.to_thread(service.update_all)
+    results = await asyncio.to_thread(service.update_all, _who(current_user))
 
     # After updating all, restart the security-detections MCP server
     await _restart_security_detections_mcp(mcp_client, service, registry)
     background.add_task(_sync_detection_rules)
 
     return {"success": True, "results": results}
+
+
+# Queueing the gaps run is starting a run, as POST /api/v1/agent-runs is.
+_GAPS_RUN = [permission_gate("detections.write"), permission_gate("ai_chat.use")]
+
+
+@router.post("/gaps-run", dependencies=_GAPS_RUN)
+async def start_gaps_run(
+    request: Request, user: User = Depends(get_current_active_user)
+) -> JSONResponse:
+    """Start the detection gaps run now rather than on the daemon's daily tick, as
+    this user. 200 when it queued, or found nothing to queue; 409 with the reason
+    when refused (another gaps run unfinished, or the workflow turned off)."""
+    from services.api.routers.orchestrator import _person
+    from services.daemon import gaps
+
+    outcome = await gaps.start_gaps_run(_person(user, tool_principal.sid_of(request)))
+    code = {gaps.REFUSED: 409, gaps.NOT_QUEUED: 500}.get(outcome.status, 200)
+    return JSONResponse(outcome.as_dict(), status_code=code)
 
 
 @router.get("/stats")
@@ -382,13 +585,25 @@ def get_metrics():
 
 
 @router.get("/coverage")
-def get_coverage():
+async def get_coverage(
+    by_layer: bool = False,
+    scope: Literal["all", "emulated", "intel"] = "all",
+    techniques: Optional[List[str]] = Query(default=None),
+):
     """ATT&CK coverage by technique and SIEM: each technique an active rule
     declares or an alert shows, proven (an active SIEM copy passes Runs and
-    Sees), unproven or with no rule, split by SIEM. Read-only."""
+    Sees), unproven or with no rule, split by SIEM. ``by_layer`` adds each
+    technique's state per detection layer and for the layers together, with
+    the measures, from the last 30 days' emulation runs: for ``scope`` (all,
+    emulated, intel) or the ``techniques`` given (repeated or comma-separated).
+    Read-only."""
     from core.detections.inventory import coverage
 
-    return coverage.coverage()
+    try:
+        wanted = coverage.technique_ids(techniques or ())
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    return await coverage.read(by_layer, scope, wanted)
 
 
 @router.get("/overlay-only")
@@ -447,11 +662,24 @@ def _edited(result: Dict[str, Any]) -> Dict[str, Any]:
     raise HTTPException(status_code=status, detail=error)
 
 
+@router.get("/rules/{rule_id}")
+def get_rule(rule_id: int):
+    """One listed rule copy: its latest version's query, parsed content and
+    description, and that version's stored checks (lint, replay, runs, shadow
+    and the rest); an overlay copy also carries its stage rows with their proof.
+    Read-only."""
+    rule = catalog.rule_detail(rule_id)
+    if rule is None:
+        raise HTTPException(status_code=404, detail=f"No detection rule {rule_id}")
+    return rule
+
+
 @router.get("/rules/{rule_id}/stages")
 def get_rule_stages(rule_id: int):
     """A rule's stage rows, newest first: version, from and to stage, actor,
-    reason and time; and ``held``, whether a person's Revert holds it in shadow.
-    Read-only."""
+    reason, the earlier copies that version was saved to replace, and time;
+    ``held``, whether a person's Revert holds it in shadow; and ``replaced_by``,
+    the rules saved to replace it. Read-only."""
     try:
         return {"rule_id": rule_id, **stages.history(rule_id)}
     except LookupError as e:
@@ -459,7 +687,8 @@ def get_rule_stages(rule_id: int):
 
 
 class StageChangeRequest(BaseModel):
-    """Why a person reverts a rule, or releases it."""
+    """Why a person reverts a rule, switches it off, releases its hold, or
+    approves it as coverage."""
 
     reason: str = Field(min_length=1, max_length=2000)
 
@@ -483,7 +712,13 @@ def _stage_change(change, rule_id: int, body: StageChangeRequest, user: User):
         raise HTTPException(status_code=409, detail=str(e))
 
 
-@router.post("/rules/{rule_id}/revert", dependencies=_SETTINGS_WRITE)
+@router.post(
+    "/rules/{rule_id}/revert",
+    dependencies=[
+        *_SETTINGS_WRITE,
+        step_up.gate("detections.write", "revert a detection"),
+    ],
+)
 def revert_rule(
     rule_id: int,
     body: StageChangeRequest,
@@ -492,6 +727,19 @@ def revert_rule(
     """Moves a live rule back to shadow and holds it there: the rollout does
     not promote it again until a person releases it."""
     return _stage_change(stages.revert, rule_id, body, current_user)
+
+
+@router.post("/rules/{rule_id}/switch-off", dependencies=_SETTINGS_WRITE)
+def switch_off_rule(
+    rule_id: int,
+    body: StageChangeRequest,
+    current_user: User = Depends(get_current_active_user),
+):
+    """Switches a shadow rule off and holds it there. It only narrows, so an API
+    token or a service account with detections.write may do it too; a later
+    version still waits in shadow until a person releases the hold. A rule that
+    is not in shadow is refused with 409."""
+    return _stage_change(stages.switch_off, rule_id, body, current_user)
 
 
 @router.post("/rules/{rule_id}/release", dependencies=_SETTINGS_WRITE)
@@ -503,6 +751,19 @@ def release_rule(
     """Lifts a person's hold, leaving the rule in its current stage; the normal
     rollout applies again."""
     return _stage_change(stages.release, rule_id, body, current_user)
+
+
+@router.post("/rules/{rule_id}/approve", dependencies=_SETTINGS_WRITE)
+def approve_rule(
+    rule_id: int,
+    body: StageChangeRequest,
+    current_user: User = Depends(get_current_active_user),
+):
+    """Makes a repo or local rule's latest version count as coverage although the
+    import check holds it (a KQL rule, absent fields, no check can judge it). A
+    version failing lint, or one not held, is refused with 409; the next version
+    is held again."""
+    return _stage_change(import_check.approve, rule_id, body, current_user)
 
 
 @router.get("/rules/{rule_id}/findings")
@@ -530,7 +791,7 @@ def export_proof_card(
     each export, and the key's making, as this user."""
     try:
         card, data = proof_card.export(body.rule_ids, actor=user.user_id)
-    except proof_card.ProofKeyUnavailable as e:
+    except signing_key.SigningKeyUnavailable as e:
         raise HTTPException(status_code=503, detail=str(e))
     stamp = card["exported_at"][:19].replace(":", "").replace("-", "")
     return Response(
@@ -547,8 +808,8 @@ def get_proof_card_key(user: User = Depends(get_current_active_user)):
     """The public key proof cards are signed with, and its id; made on first
     use, which the trail records as this user."""
     try:
-        return proof_card.public_key(actor=user.user_id)
-    except proof_card.ProofKeyUnavailable as e:
+        return signing_key.public_key(actor=user.user_id)
+    except signing_key.SigningKeyUnavailable as e:
         raise HTTPException(status_code=503, detail=str(e))
 
 
@@ -587,7 +848,7 @@ def export_detection_skill(rule_id: int, user: User = Depends(get_current_active
         raise HTTPException(status_code=404, detail=str(e))
     except detection_skill.Refused as e:
         raise HTTPException(status_code=400, detail=str(e))
-    except proof_card.ProofKeyUnavailable as e:
+    except signing_key.SigningKeyUnavailable as e:
         raise HTTPException(status_code=503, detail=str(e))
     stamp = manifest["exported_at"][:19].replace(":", "").replace("-", "")
     return Response(

@@ -1,4 +1,5 @@
 import { costOf, roundCost } from "../../contracts/budget.js";
+import { overBy } from "./opening.js";
 import { resolutionOf, type Checkpoint, type Resolution } from "./checkpoints.js";
 import { suppressedEntities } from "./frontier.js";
 import type { Projection } from "./ledger.js";
@@ -34,6 +35,14 @@ export interface VisibilityGap {
   // hunt could not put, rather than as a tool that misbehaved.
   query_intent: string;
   hypothesis_id: string | null;
+  // A call-level gap's server and what the call said ("<server>: <detail>"), where
+  // the ledger kept it. Absent on a dispatch gap and on a ledger written before.
+  detail?: string;
+}
+
+// What a gap says in the report: its call's own words where they were kept.
+export function gapText(gap: VisibilityGap): string {
+  return gap.detail ?? gap.summary;
 }
 
 export interface BacklogQuestion {
@@ -96,20 +105,21 @@ export interface AskedGap {
 export function groupedGaps(gaps: readonly VisibilityGap[]): AskedGap[] {
   const byQuestion = new Map<string, AskedGap>();
   for (const gap of gaps) {
-    const key = `${gap.iteration}|${gap.hypothesis_id ?? ""}|${gap.query_intent}`;
+    // A call-level gap has no question to group under, so its own text is the key.
+    const key = `${gap.iteration}|${gap.hypothesis_id ?? ""}|${gap.query_intent || gapText(gap)}`;
     const held = byQuestion.get(key);
     if (held === undefined) {
       byQuestion.set(key, {
         iteration: gap.iteration,
         hypothesis_id: gap.hypothesis_id,
         query_intent: gap.query_intent,
-        reasons: [gap.summary],
+        reasons: [gapText(gap)],
         workers: 1,
       });
       continue;
     }
     held.workers += 1;
-    if (!held.reasons.includes(gap.summary)) held.reasons.push(gap.summary);
+    if (!held.reasons.includes(gapText(gap))) held.reasons.push(gapText(gap));
   }
   return [...byQuestion.values()];
 }
@@ -138,12 +148,19 @@ export function buildReport(projection: Projection): HuntReport {
     .filter(isGap)
     .map((record) => {
       const dispatch = projection.dispatches.get(record.dispatch_id ?? "");
+      // A call-level gap names its server and what the call said, where the ledger kept it.
+      const said = record.payload["failure_reason"];
+      const server = record.payload["server"];
+      const detail = dispatch === undefined && typeof said === "string" && said !== ""
+        ? (typeof server === "string" && server !== "" ? `${server}: ${said}` : said)
+        : null;
       return {
         evidence_id: record.evidence_id,
         iteration: record.iteration,
         summary: record.summary,
         query_intent: dispatch?.query_intent ?? "",
         hypothesis_id: dispatch?.target_hypothesis_id ?? null,
+        ...(detail === null ? {} : { detail }),
       };
     })
     .sort((a, b) => (a.iteration === b.iteration ? a.evidence_id.localeCompare(b.evidence_id) : a.iteration - b.iteration));
@@ -313,21 +330,25 @@ function openedOn(recall: RecallPayload | null): string[] {
   ];
 }
 
-const COST_LINE = /^(- \*\*Cost:\*\* )\$[\d.]+/m;
+// Cost, then " of $ceiling", then the overshoot a rewrite has to replace rather than keep.
+const COST_LINE = /^(- \*\*Cost:\*\* )\$[\d.]+( of \$[\d.]+)?(?: · (?:under )?\$[\d.]+ over)?$/m;
 const ENDED_LINE = /^(- \*\*Ended:\*\* ).+$/m;
 
 function isHuntReport(markdown: string): boolean {
   return COST_LINE.test(markdown) && ENDED_LINE.test(markdown);
 }
 
+// The ceiling a Cost line printed, for a caller that was not handed the exact one.
+const ceilingIn = (of: string | undefined): number | undefined => (of === undefined ? undefined : Number(of.slice(5)));
+
 // The header is written when the hunt stops reasoning. The account and the review
 // are charged after that, and the run record is their cost and the time the
 // terminal was sealed. Bring the two lines forward; leave every other line alone.
-export function alignReport(markdown: string, costUsd: number, endedAt: string): string {
+export function alignReport(markdown: string, costUsd: number, endedAt: string, ceilingUsd?: number): string {
   // A function, not a replacement string: `$1` in the dollars would be read as a backreference.
   const cost = `$${costUsd.toFixed(4)}`;
   return markdown
-    .replace(COST_LINE, (_match, prefix: string) => `${prefix}${cost}`)
+    .replace(COST_LINE, (_match, prefix: string, of: string | undefined) => `${prefix}${cost}${of ?? ""}${overBy(costUsd, ceilingUsd ?? ceilingIn(of))}`)
     .replace(ENDED_LINE, (_match, prefix: string) => `${prefix}${endedAt}`);
 }
 
@@ -337,9 +358,10 @@ export function sealReport(
   markdown: string,
   events: readonly { kind: string; payload: unknown }[],
   endedAt: string,
+  ceilingUsd?: number,
 ): { summary: string; finished_at: string } | null {
   if (!isHuntReport(markdown)) return null;
-  return { summary: alignReport(markdown, roundCost(costOf(events)), endedAt), finished_at: endedAt };
+  return { summary: alignReport(markdown, roundCost(costOf(events)), endedAt, ceilingUsd), finished_at: endedAt };
 }
 
 // What the rendered header should say once the run has a terminal. Spend after
@@ -376,7 +398,7 @@ export function renderReport(
     `- **Outcome:** ${report.outcome ?? "not terminated"}`,
     `- **Hunt:** ${report.hunt_id}`,
     `- **Iterations:** ${report.iterations} of ${report.budgets.max_iterations}`,
-    `- **Cost:** $${report.cost_usd.toFixed(4)} of $${report.budgets.max_cost_usd.toFixed(2)}`,
+    `- **Cost:** $${report.cost_usd.toFixed(4)} of $${report.budgets.max_cost_usd.toFixed(2)}${overBy(report.cost_usd, report.budgets.max_cost_usd)}`,
     `- **Started:** ${report.created_at}`,
     `- **Ended:** ${report.terminated_at ?? "still running"}`,
   ];
@@ -564,7 +586,7 @@ export function renderCaseFile(projection: Projection, handoff: Handoff): string
     lines.push("Every query the hunt wanted to run came back.", "");
   }
   for (const gap of report.gaps) {
-    lines.push(`- iteration ${gap.iteration}: ${gap.query_intent || gap.summary} — ${gap.summary}`);
+    lines.push(`- iteration ${gap.iteration}: ${gap.query_intent === "" ? gapText(gap) : `${gap.query_intent} — ${gapText(gap)}`}`);
   }
 
   return `${lines.filter((line, index) => line !== "" || lines[index - 1] !== "").join("\n").trimEnd()}\n`;

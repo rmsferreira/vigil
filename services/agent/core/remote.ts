@@ -1,7 +1,12 @@
 import { SpanStatusCode } from "@opentelemetry/api";
 import type { RegisteredTool, ToolPrincipal, ToolResult } from "../contracts/tool.js";
+import type { SkillBodies } from "./loop.js";
 import type { CallApproval, ToolDispatch } from "./seams.js";
 import { capture, traceHeaders, traced } from "./tracing.js";
+import { SKILL_TOOL } from "./record.js";
+import { errorFields, logger } from "./log.js";
+
+const log = logger("agent.remote");
 
 export interface RemoteOptions {
   url: string;
@@ -64,6 +69,45 @@ export function deadline(timeoutMs: number, signal?: AbortSignal): Deadline {
   };
 }
 
+// An operator skill's current text, read from the backend beside skill-reads. A
+// refusal there is an error status with a detail; it comes back as the failure the
+// model reads, never a throw.
+export function skillBodies(options: RemoteOptions): SkillBodies {
+  const call = options.fetch ?? globalThis.fetch;
+  const bodies = new URL("skill-bodies", options.url).toString();
+  return async (name) => {
+    let response: Response;
+    try {
+      response = await call(bodies, {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: `Bearer ${options.token}`, ...traceHeaders() },
+        body: JSON.stringify({ name }),
+        signal: AbortSignal.timeout(8_000),
+      });
+    } catch (error) {
+      return { ok: false, kind: "unavailable", detail: `reading ${name} failed: ${error instanceof Error ? error.message : String(error)}` };
+    }
+    if (response.ok) {
+      try {
+        const answer = (await response.json()) as { body?: unknown };
+        if (typeof answer.body === "string") return { ok: true, body: answer.body };
+      } catch {
+        // Falls through to the unreadable answer below.
+      }
+      return { ok: false, kind: "unavailable", detail: `the answer for ${name} could not be read` };
+    }
+    const detail = await response
+      .json()
+      .then((answer: unknown) => {
+        const detail = (answer as { detail?: unknown } | null)?.detail;
+        return typeof detail === "string" ? detail : "";
+      })
+      .catch(() => "");
+    const kind = response.status === 404 ? "invalid_args" : response.status === 403 || response.status === 409 || response.status === 423 ? "refused" : "unavailable";
+    return { ok: false, kind, detail: detail === "" ? `the endpoint answered ${response.status} for ${name}` : detail };
+  };
+}
+
 // Satisfies the same port as localDispatch, so neither the loop nor a workflow
 // knows whether a tool runs in this process. Bounds travel and are applied there.
 export function remoteDispatch(options: RemoteOptions): ToolDispatch {
@@ -77,7 +121,11 @@ export function remoteDispatch(options: RemoteOptions): ToolDispatch {
   ): Promise<ToolResult> => {
     // A tool the registry answers itself never leaves the process: every call routes
     // through this dispatch, so a local implementation was otherwise unreachable.
-    if (tool.local) return tool.invoke(args);
+    if (tool.local) {
+      const result = await tool.invoke(args);
+      if (tool.id === SKILL_TOOL && result.ok) noteSkillRead(args["name"], agentId);
+      return result;
+    }
 
     // The tool's timeout and the run's abort both end this call, so whichever
     // fires first does: a lost lease must not wait out a 30s tool.
@@ -126,6 +174,24 @@ export function remoteDispatch(options: RemoteOptions): ToolDispatch {
     } finally {
       held.release();
     }
+  };
+
+  // A skill a run loaded counts as a use of it, like a read_skill call the backend
+  // answers (core/skills/skill_usage.py). The backend owns that count, so it is told;
+  // not awaited, since a usage count must never slow or fail the call it counts.
+  const reads = new URL("skill-reads", options.url).toString();
+  const noteSkillRead = (name: unknown, agentId?: string): void => {
+    if (typeof name !== "string" || name === "") return;
+    call(reads, {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${options.token}` },
+      body: JSON.stringify({ name, ...(agentId === undefined ? {} : { agent_id: agentId }) }),
+      signal: AbortSignal.timeout(5_000),
+    })
+      .then((response) => {
+        if (!response.ok) log.warn("recording a skill read was refused", { skill: name, status: response.status });
+      })
+      .catch((error: unknown) => log.warn("recording a skill read failed", { skill: name, ...errorFields(error) }));
   };
 
   return {

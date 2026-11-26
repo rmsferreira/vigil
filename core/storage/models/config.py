@@ -262,6 +262,73 @@ class FederationSource(Base):
     )
 
 
+class SourceHealth(Base):
+    """Integration Health: one record per source, from scheduled collection,
+    Test, detection-source syncs and the push sources (Kafka, the daemon
+    webhook, the Darktrace and Cloudflare receivers).
+
+    Keyed by integration id, or a prefixed id for Vigil's own inputs (``kafka``,
+    ``webhook:<name>``, ``detection_source:<id>``). No secret, no vendor payload.
+    """
+
+    __tablename__ = "source_health"
+
+    source_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    # Last attempt of any kind (poll, Test, sync); null is "no attempt yet".
+    last_attempt_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+    last_attempt_ok: Mapped[Optional[bool]] = mapped_column(Boolean)
+    last_error: Mapped[Optional[str]] = mapped_column(Text)
+    last_error_kind: Mapped[Optional[str]] = mapped_column(Text)
+    last_success_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+    consecutive_failures: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    # Dropped or unreadable records: cumulative, plus the current hour's window.
+    dropped_total: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    # Findings the severity floor skipped. Cumulative, kept across a reset.
+    # Not a drop: the judge does not read it.
+    filtered_total: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    dropped_window_start: Mapped[Optional[datetime]] = mapped_column(DateTime)
+    dropped_window: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    last_dropped_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+    # Federation poll counts under the same window; null until the first
+    # successful poll after upgrade restarts it (duplicates are derived on read).
+    returned_window: Mapped[Optional[int]] = mapped_column(Integer)
+    stored_window: Mapped[Optional[int]] = mapped_column(Integer)
+    filtered_window: Mapped[Optional[int]] = mapped_column(Integer)
+    last_data_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+    # Sender labels (a webhook data_source, a receiver's alert type) and when
+    # each was last seen. Information only: the judge does not read this.
+    labels: Mapped[dict] = mapped_column(
+        JSONB, nullable=False, default=dict, server_default=text("'{}'::jsonb")
+    )
+    # What a collector read from the source itself (OpenCTI's version, newest
+    # intelligence, backlog). Null until its first read; the judge does not read it.
+    facts: Mapped[Optional[dict]] = mapped_column(JSONB)
+    # Last real check (credential_check), apart from attempts that only probe.
+    last_check_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+    last_check_ok: Mapped[Optional[bool]] = mapped_column(Boolean)
+    last_check_error: Mapped[Optional[str]] = mapped_column(Text)
+    # Switched on, or credential or endpoint changed: back to "no attempt yet".
+    reset_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, default=utcnow, server_default=text("now()")
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "last_error_kind IN ('auth','network','config','quota','upstream','unknown')",
+            name="source_health_last_error_kind_check",
+        ),
+    )
+
+
 class ConfigAuditLog(Base):
     """
     Configuration Audit Log - Tracks all configuration changes for compliance.
@@ -304,14 +371,14 @@ class ConfigAuditLog(Base):
 
 
 class SharedIOC(Base):
-    """Cross-investigation IOC index for deduplication and correlation."""
+    """The shared IOC index: the indicators a Case holds, which intake joins alerts by."""
 
     __tablename__ = "shared_iocs"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    investigation_id: Mapped[str] = mapped_column(
-        String(60),
-        ForeignKey("investigations.investigation_id", ondelete="CASCADE"),
+    case_id: Mapped[str] = mapped_column(
+        String(50),
+        ForeignKey("cases.case_id", ondelete="CASCADE"),
         nullable=False,
     )
     ioc_type: Mapped[str] = mapped_column(String(30), nullable=False)
@@ -323,7 +390,8 @@ class SharedIOC(Base):
     __table_args__ = (
         Index("idx_shared_ioc_value", "value"),
         Index("idx_shared_ioc_type", "ioc_type"),
-        Index("idx_shared_ioc_investigation", "investigation_id"),
+        # Also serves reads by Case alone.
+        Index("uq_shared_ioc_case_key", "case_id", "ioc_type", "value", unique=True),
     )
 
 

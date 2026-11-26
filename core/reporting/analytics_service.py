@@ -5,12 +5,14 @@ request-scoped ``Session``; nothing here commits — the unit of work owns that.
 """
 
 import logging
+import math
 from datetime import datetime
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional, Tuple
 
-from sqlalchemy import and_, func, text
+from sqlalchemy import and_, func, literal, select, text
 from sqlalchemy.orm import Session, noload
 
+from core.auth.permissions import CaseReader, case_read_clause
 from core.cases.closure import closed_by_person, closure_says_real
 from core.llm.providers.registry import get_registry, infer_provider_type
 from core.storage.models import (
@@ -19,6 +21,7 @@ from core.storage.models import (
     Finding,
     FindingMitrePrediction,
     LLMInteractionLog,
+    WorkflowRun,
 )
 from core.threat_intel.mitre_lookup import get_time_range, resolve_technique
 
@@ -38,8 +41,15 @@ async def collect_insights_inputs(
     start_time, end_time = get_time_range(time_range)
     period_duration = end_time - start_time
     prev_start = start_time - period_duration
-    metrics = await calculate_metrics(db, start_time, end_time, prev_start, start_time)
-    time_series = await get_time_series_data(db, start_time, end_time, time_range)
+    # The insights are cached for every caller, so they count open cases only:
+    # the read rule for a reader named on no restricted case (#4356).
+    readable = case_read_clause(CaseReader())
+    metrics = await calculate_metrics(
+        db, start_time, end_time, prev_start, start_time, readable
+    )
+    time_series = await get_time_series_data(
+        db, start_time, end_time, time_range, readable
+    )
     return metrics, time_series
 
 
@@ -49,8 +59,14 @@ async def calculate_metrics(
     end_time: datetime,
     prev_start: datetime,
     prev_end: datetime,
+    readable=None,
 ) -> Dict[str, Any]:
-    """Calculate key SOC metrics and their period-over-period changes."""
+    """Calculate key SOC metrics and their period-over-period changes.
+
+    Cases are those ``readable`` (the caller's read rule by default) admits;
+    ``restrictedNotCounted`` is how many it left out, over every case (#4356).
+    """
+    readable = case_read_clause() if readable is None else readable
 
     # Current period metrics
     total_findings = (
@@ -62,7 +78,7 @@ async def calculate_metrics(
 
     total_cases = (
         db.query(func.count(Case.case_id))
-        .filter(Case.created_at.between(start_time, end_time))
+        .filter(Case.created_at.between(start_time, end_time), readable)
         .scalar()
         or 0
     )
@@ -73,7 +89,11 @@ async def calculate_metrics(
             func.avg(func.extract("epoch", Case.updated_at - Case.created_at) / 60)
         )
         .filter(
-            and_(Case.created_at.between(start_time, end_time), Case.status != "new")
+            and_(
+                Case.created_at.between(start_time, end_time),
+                Case.status != "new",
+                readable,
+            )
         )
         .scalar()
     )
@@ -84,7 +104,11 @@ async def calculate_metrics(
     total_closed = (
         db.query(func.count(Case.case_id))
         .filter(
-            and_(Case.created_at.between(start_time, end_time), Case.status == "closed")
+            and_(
+                Case.created_at.between(start_time, end_time),
+                Case.status == "closed",
+                readable,
+            )
         )
         .scalar()
         or 0
@@ -97,6 +121,7 @@ async def calculate_metrics(
             and_(
                 Case.created_at.between(start_time, end_time),
                 CaseClosureInfo.closure_category == "false_positive",
+                readable,
             )
         )
         .scalar()
@@ -117,7 +142,7 @@ async def calculate_metrics(
 
     prev_total_cases = (
         db.query(func.count(Case.case_id))
-        .filter(Case.created_at.between(prev_start, prev_end))
+        .filter(Case.created_at.between(prev_start, prev_end), readable)
         .scalar()
         or 0
     )
@@ -127,7 +152,11 @@ async def calculate_metrics(
             func.avg(func.extract("epoch", Case.updated_at - Case.created_at) / 60)
         )
         .filter(
-            and_(Case.created_at.between(prev_start, prev_end), Case.status != "new")
+            and_(
+                Case.created_at.between(prev_start, prev_end),
+                Case.status != "new",
+                readable,
+            )
         )
         .scalar()
     )
@@ -141,7 +170,11 @@ async def calculate_metrics(
     prev_total_closed = (
         db.query(func.count(Case.case_id))
         .filter(
-            and_(Case.created_at.between(prev_start, prev_end), Case.status == "closed")
+            and_(
+                Case.created_at.between(prev_start, prev_end),
+                Case.status == "closed",
+                readable,
+            )
         )
         .scalar()
         or 0
@@ -154,6 +187,7 @@ async def calculate_metrics(
             and_(
                 Case.created_at.between(prev_start, prev_end),
                 CaseClosureInfo.closure_category == "false_positive",
+                readable,
             )
         )
         .scalar()
@@ -212,6 +246,10 @@ async def calculate_metrics(
         "casesChange": cases_change,
         "responseTimeChange": response_time_change,
         "falsePositiveChange": false_positive_change,
+        "restrictedNotCounted": db.query(func.count(Case.case_id))
+        .filter(~readable)
+        .scalar()
+        or 0,
     }
 
 
@@ -219,9 +257,15 @@ _BUCKET_COUNTS = {"24h": 24, "7d": 28}
 
 
 async def get_time_series_data(
-    db: Session, start_time: datetime, end_time: datetime, time_range: str
+    db: Session,
+    start_time: datetime,
+    end_time: datetime,
+    time_range: str,
+    readable=None,
 ) -> List[Dict[str, Any]]:
-    """Get time series data for findings, cases, and alerts."""
+    """Get time series data for findings, cases (those ``readable`` admits, the
+    caller's read rule by default), and alerts."""
+    readable = case_read_clause() if readable is None else readable
     bucket_count = _BUCKET_COUNTS.get(time_range, 30)
     window = end_time - start_time
 
@@ -240,7 +284,7 @@ async def get_time_series_data(
 
         cases_count = (
             db.query(func.count(Case.case_id))
-            .filter(Case.created_at.between(current_time, bucket_end))
+            .filter(Case.created_at.between(current_time, bucket_end), readable)
             .scalar()
             or 0
         )
@@ -653,13 +697,15 @@ async def get_cost_breakdown(db: Session, time_range: str) -> Dict[str, Any]:
 # sealed at or before the close. ``closed_at`` is naive UTC and ``ts`` timestamptz,
 # so the close is cast rather than read in the server's zone. A run id that is not
 # a uuid has no ledger rows, and is cast to NULL rather than failing the query.
+# A Case opened from a re-check carries cases.recheck_mark and is left out.
 _CLOSURE_VERDICTS = text("""
     SELECT ci.case_id, ci.closure_category, ci.close_channel,
-           t.workflow_id, t.disposition, t.confidence
+           ci.closed_at, ci.sampled_at, ci.evidence_opened,
+           t.run_id, t.workflow_id, t.disposition, t.confidence
     FROM case_closure_info ci
     JOIN cases c ON c.case_id = ci.case_id AND c.status = 'closed'
     JOIN LATERAL (
-        SELECT r.workflow_id,
+        SELECT r.run_id, r.workflow_id,
                e.payload->>'disposition' AS disposition,
                e.payload->>'confidence' AS confidence
         FROM workflow_runs r
@@ -676,8 +722,15 @@ _CLOSURE_VERDICTS = text("""
         ORDER BY e.ts DESC, e.seq DESC
         LIMIT 1
     ) t ON true
-    WHERE ci.closed_at >= :start AND ci.closed_at <= :end
+    WHERE c.recheck_mark IS NULL
+      AND (
+        (ci.closed_at >= :start AND ci.closed_at <= :end)
+        OR (ci.sampled_at >= :start AND ci.sampled_at <= :end)
+      )
     """)
+
+# 95% two-sided Wilson interval. z is the standard normal 0.975 quantile.
+_WILSON_Z = 1.959963984540054
 
 _REAL = {"malicious", "suspicious"}
 _NOT_REAL = {"benign", "false_positive"}
@@ -692,6 +745,13 @@ def _agreement_tally() -> Dict[str, Any]:
         "abstained": 0,
         "closed_without_determination": 0,
         "closed_by_agent_alone": 0,
+        "agreed_unchecked": 0,
+        "draws": 0,
+        "answered": 0,
+        "false_closes": 0,
+        "false_close_rate": None,
+        "wilson_low": None,
+        "wilson_high": None,
         "by_confidence": {
             level: {"agreed": 0, "disagreed": 0}
             for level in (*_CONFIDENCES, "unstated")
@@ -699,14 +759,61 @@ def _agreement_tally() -> Dict[str, Any]:
     }
 
 
+def _wilson(successes: int, n: int) -> Optional[Tuple[float, float]]:
+    """95% Wilson low and high for ``successes`` out of ``n``, or None when ``n`` is 0."""
+    if n <= 0:
+        return None
+    z2 = _WILSON_Z * _WILSON_Z
+    p = successes / n
+    denom = 1 + z2 / n
+    center = (p + z2 / (2 * n)) / denom
+    margin = _WILSON_Z * math.sqrt(p * (1 - p) / n + z2 / (4 * n * n)) / denom
+    low = min(1.0, max(0.0, center - margin))
+    high = min(1.0, max(0.0, center + margin))
+    return round(low, 4), round(high, 4)
+
+
+def _in_window(moment: Optional[datetime], start: datetime, end: datetime) -> bool:
+    return moment is not None and start <= moment <= end
+
+
+def _finish(tally: Dict[str, Any]) -> None:
+    """Fill the rates and the Wilson bounds from the counts."""
+    scored = tally["agreed"] + tally["disagreed"]
+    tally["agreement_rate"] = round(tally["agreed"] / scored, 4) if scored else None
+    answered = tally["answered"]
+    if answered:
+        tally["false_close_rate"] = round(tally["false_closes"] / answered, 4)
+        bounds = _wilson(tally["false_closes"], answered)
+        if bounds is not None:
+            tally["wilson_low"], tally["wilson_high"] = bounds
+
+
+def _run_models(db: Session, run_ids: set) -> Dict[str, str]:
+    """Each investigate run's model, by the rule the run judge reads; a run under
+    no model is left out."""
+    if not run_ids:
+        return {}
+    from core.supervisory.run_model import attributed, ledger_of, run_model
+
+    model, models = run_model(literal("investigate"), ledger_of(WorkflowRun.run_id))
+    rows = db.execute(
+        select(WorkflowRun.run_id, model, models).where(WorkflowRun.run_id.in_(run_ids))
+    )
+    return {
+        run_id: name for run_id, m, n in rows if (name := attributed(m, n)) is not None
+    }
+
+
 async def get_agent_agreement(
     db: Session, start_time: datetime, end_time: datetime
 ) -> Dict[str, Any]:
-    return agent_agreement(db, start_time, end_time)
+    # Shown to a person: closures of cases they may not read are not scored.
+    return agent_agreement(db, start_time, end_time, readable=case_read_clause())
 
 
 def agent_agreement(
-    db: Session, start_time: datetime, end_time: datetime
+    db: Session, start_time: datetime, end_time: datetime, readable=None
 ) -> Dict[str, Any]:
     """How often the investigation's verdict matched the closure, overall and per workflow.
 
@@ -714,36 +821,97 @@ def agent_agreement(
     closure is scored: agreed or disagreed when both sides took a side, abstained
     when the agent said inconclusive or needs_review, closed without a
     determination when the closure was neither resolved nor false_positive.
-    A closure by the agent's own channel is counted apart and never scored.
+    An agreement with ``evidence_opened`` false is ``agreed_unchecked`` and stays
+    out of ``agreed`` and out of the rate. A closure by the agent's own channel
+    is counted apart and never scored.
+
+    The sample is the same rows whose ``sampled_at`` falls in the window: draws,
+    how many a person answered, and false closes (an answered draw whose
+    disposition is not-real and whose closure says real). The rate and the Wilson
+    bounds are null when none are answered.
+
+    Each workflow's tally is also split ``by_model``, the model that ran the
+    investigation whose verdict is scored (:mod:`core.supervisory.run_model`);
+    ``unattributed`` counts its rows whose run used more than one model or none.
+    ``readable``, a read clause on cases, leaves out the closures it does not admit.
     """
-    rows = db.execute(_CLOSURE_VERDICTS, {"start": start_time, "end": end_time})
+    rows = list(db.execute(_CLOSURE_VERDICTS, {"start": start_time, "end": end_time}))
+    if readable is not None and rows:
+        kept = set(
+            db.scalars(
+                select(Case.case_id).where(
+                    Case.case_id.in_({row.case_id for row in rows}), readable
+                )
+            )
+        )
+        rows = [row for row in rows if row.case_id in kept]
+    run_models = _run_models(db, {row.run_id for row in rows})
     overall = _agreement_tally()
     by_workflow: Dict[str, Dict[str, Any]] = {}
+    # Per workflow: model id -> tally, and the rows under no model.
+    by_model: Dict[str, Dict[str, Dict[str, Any]]] = {}
+    unattributed: Dict[str, int] = {}
     for row in rows:
         tallies = (overall, by_workflow.setdefault(row.workflow_id, _agreement_tally()))
-        if not closed_by_person(row.close_channel):
-            key = "closed_by_agent_alone"
+        models = by_model.setdefault(row.workflow_id, {})
+        model = run_models.get(row.run_id)
+        if model is None:
+            unattributed[row.workflow_id] = unattributed.get(row.workflow_id, 0) + 1
         else:
-            disposition = (row.disposition or "").strip().lower()
-            closure = closure_says_real(row.closure_category)
-            if closure is None:
-                key = "closed_without_determination"
-            elif disposition in _REAL or disposition in _NOT_REAL:
-                key = "agreed" if (disposition in _REAL) == closure else "disagreed"
+            tallies += (models.setdefault(model, _agreement_tally()),)
+        if _in_window(row.closed_at, start_time, end_time):
+            if not closed_by_person(row.close_channel):
+                key = "closed_by_agent_alone"
             else:
-                key = "abstained"
-        level = row.confidence if row.confidence in _CONFIDENCES else "unstated"
+                disposition = (row.disposition or "").strip().lower()
+                closure = closure_says_real(row.closure_category)
+                if closure is None:
+                    key = "closed_without_determination"
+                elif disposition in _REAL or disposition in _NOT_REAL:
+                    agreed = (disposition in _REAL) == closure
+                    # An agreement the person did not open stays out of the rate.
+                    if agreed and row.evidence_opened is False:
+                        key = "agreed_unchecked"
+                    else:
+                        key = "agreed" if agreed else "disagreed"
+                else:
+                    key = "abstained"
+            level = row.confidence if row.confidence in _CONFIDENCES else "unstated"
+            for tally in tallies:
+                tally[key] += 1
+                if key in ("agreed", "disagreed"):
+                    tally["by_confidence"][level][key] += 1
+        if not _in_window(row.sampled_at, start_time, end_time):
+            continue
+        disposition = (row.disposition or "").strip().lower()
+        false_close = (
+            closed_by_person(row.close_channel)
+            and disposition in _NOT_REAL
+            and closure_says_real(row.closure_category) is True
+        )
         for tally in tallies:
-            tally[key] += 1
-            if key in ("agreed", "disagreed"):
-                tally["by_confidence"][level][key] += 1
+            tally["draws"] += 1
+            if closed_by_person(row.close_channel):
+                tally["answered"] += 1
+                if false_close:
+                    tally["false_closes"] += 1
     for tally in (overall, *by_workflow.values()):
-        scored = tally["agreed"] + tally["disagreed"]
-        tally["agreement_rate"] = round(tally["agreed"] / scored, 4) if scored else None
+        _finish(tally)
+    for models in by_model.values():
+        for tally in models.values():
+            _finish(tally)
     return {
         "overall": overall,
         "by_workflow": [
-            {"workflow_id": workflow_id, **tally}
+            {
+                "workflow_id": workflow_id,
+                **tally,
+                "by_model": [
+                    {"model": model, **m}
+                    for model, m in sorted(by_model[workflow_id].items())
+                ],
+                "unattributed": unattributed.get(workflow_id, 0),
+            }
             for workflow_id, tally in sorted(by_workflow.items())
         ],
     }

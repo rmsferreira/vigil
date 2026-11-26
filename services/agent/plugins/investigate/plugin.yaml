@@ -18,7 +18,13 @@ min_results: 4
 finish_with: tool
 
 # Bound to this deployment's tools by their `provides` field, as an arch role's are.
-needs: [shell, entity_recall, get_finding, telemetry_search, findings_search, indicator_lookup]
+# The intel_* needs are OpenCTI's graph: observables, indicators, named entities and
+# their relationships. Mirrors INVESTIGATE_CAPABILITIES in core/workflows/playbook_resolver.py.
+needs: [shell, entity_recall, get_finding, telemetry_search, findings_search, indicator_lookup,
+        intel_observable, intel_indicator, intel_entities, intel_relationships]
+# Held when OpenCTI is connected; when not, the run goes without and records no gap.
+# Mirrors OPTIONAL_CAPABILITIES.
+optional: [intel_observable, intel_indicator, intel_entities, intel_relationships]
 
 system: |
   You are the analyst on a single open case. You work it yourself, end to end:
@@ -46,9 +52,10 @@ system: |
   included, link each result that bears on one, and open a question for anything
   you cannot settle. Open questions are reported as gaps whatever your answer says.
 
-  Give the severity the evidence supports, judged on what you found and not on
-  the priority the case was opened at. Leave it out when nothing found gives a
-  basis for one.
+  The detector's verdict, score or severity is why the case exists, not evidence.
+  Nor is a finding's triage: an earlier single model call that saw that finding
+  alone. Use it as a lead, check what it says against the evidence, then cite
+  that.
 
   When you confirm malicious activity, propose the containment a person should
   approve next in proposed_actions: one for each host, IP, domain, file or
@@ -56,7 +63,22 @@ system: |
   of them yourself; each waits for an analyst. Send an empty list when the
   activity is benign or you are not sure it is malicious.
 
-skills: [investigate-case]
+  A malicious answer is held to the same standard from the other side. Before
+  you give one, put the most likely benign explanation that fits this activity
+  on the record and test it: for scanning, probing or repeated logins that is an
+  authorised scanner, vulnerability-management or asset-discovery tool, or a
+  sanctioned test. A scanner's own probes do not rule it out: banner grabs,
+  default-credential tries, exploit checks, and requests naming well-known public
+  sites sent to test for an open proxy are what scanners send, so they name a
+  tool, not an intent or an evasion. What rules it out is activity that succeeds
+  or carries on (a login that works, an exploit check the target answers as a
+  compromised host would, data moved, the source reaching on into other hosts
+  afterwards) or a record that the source is not a scanner. When the case holds
+  more than one finding, read across them, not only the one that opened it.
+  When nothing rules the benign explanation out, answer suspicious and say what
+  would settle it.
+
+skills: [investigate-case, ai-agent-activity]
 
 # The hypothesis record is required: what the agent believes goes on it with
 # propose_hypothesis, what bears on each belief with link_evidence, and what it
@@ -68,12 +90,13 @@ conclusion:
   summary_field: summary
   citations_field: citations
   open_questions_field: gaps
-  # Raises the case's priority to it, never lowers it (run_bridge_router.py).
-  severity_field: severity
   # Read off the terminal when the verdict is scored against the case's closure (analytics_service.py).
   confidence_field: confidence
-  # Sent as the guard leaves it; benign or false_positive closes the case (run_bridge_router.py).
+  # Sent as the guard leaves it; benign or false_positive closes the case where autonomy lets the run act (run_bridge_router.py).
   disposition_field: disposition
+  # Sent on the terminal, where a completed run retitles the case it was started from
+  # unless a person has edited the title (run_bridge_router.py).
+  title_field: title
   # A completed run's list goes to the backend on the terminal, which files each as a
   # pending approval on the case (run_bridge_router.py). The run takes none of them.
   proposals_field: proposed_actions
@@ -86,17 +109,20 @@ conclusion:
     properties:
       summary:
         type: string
-        description: What happened, in a paragraph a reader can act on.
+        description: >-
+          What happened, for a reader who must act on it. Open with one plain sentence, under 180 characters,
+          no heading and no bold, naming the disposition and the core event. Then a blank line and short Markdown
+          sections: ### headings, - bullets, and backticks around hosts, users, paths, commands, hashes and domains.
+      title:
+        type: string
+        description: A short case title, under 80 characters, naming what the activity is, not the alert that raised it. Omit when nothing found supports one.
+        maxLength: 80
       disposition:
         type: string
         enum: [malicious, suspicious, benign, false_positive, inconclusive, needs_review]
       confidence:
         type: string
         enum: [low, medium, high]
-      severity:
-        type: string
-        description: How bad what was found is. Omit when nothing found supports a rating.
-        enum: [low, medium, high, critical]
       citations:
         type: array
         description: Refs of the tool results the answer rests on, such as r3.
@@ -115,24 +141,35 @@ conclusion:
         items:
           type: object
           additionalProperties: false
-          required: [action_type, target, reason]
+          required: [action_type, target, reason, confidence]
           properties:
             action_type:
               type: string
-              enum: [isolate_host, block_ip, block_domain, quarantine_file, disable_user, custom]
-            target: { type: string, description: The host, IP, domain, file or account the action acts on. }
+              enum: [isolate_host, block_ip, block_domain, quarantine_file, disable_user, revoke_session, custom]
+            target: { type: string, description: "The host, IP, domain, file or account the action acts on: a bare value, no URL scheme or placeholder." }
             reason: { type: string, description: Why the evidence calls for it. }
-            confidence: { type: number, minimum: 0, maximum: 1 }
+            # Above zero: the backend refuses 0 as no claim (#4963). No exclusiveMinimum,
+            # because this schema also reaches every provider behind Bifrost.
+            confidence: { type: number, minimum: 0, maximum: 1, description: "Your confidence that the action is warranted, above 0." }
 
 # Dismissing a case is cheap to say and expensive to say wrongly: a run that
 # found nothing, or was talked out of what it found, reads as benign. So a
 # benign or false_positive answer stands only when a reviewer that holds no
-# tools upholds it over at least one real cited result. Otherwise the case is
-# held as needs_review for a person.
+# tools upholds it over at least one real cited result, and the cited results
+# that found something come from at least two capabilities other than the
+# case's own record (its finding and files, which whoever triggered the alert
+# can write into) and memory of earlier conclusions. The kernel counts that
+# itself, so text in a record cannot talk it down. Otherwise the case is held
+# as needs_review for a person.
 guard:
   field: disposition
   guarded: [benign, false_positive]
   fallback: needs_review
+  min_sources: 2
+  # OpenCTI is uncounted too: its four capabilities could otherwise supply both
+  # sources alone, and anyone who can publish to a feed can shape what it says.
+  uncounted: [shell, get_finding, entity_recall, intel_observable, intel_indicator,
+              intel_entities, intel_relationships]
   reviewer_prompt: |
     The agent wants to close this case as benign or a false positive. Closing a
     real attack this way is the costly mistake. Holding a well-grounded benign
@@ -150,12 +187,71 @@ guard:
     answer to name, not on its own grounds to hold.
 
     Answer insufficient when the dismissal rests on fewer than two such sources
-    or on absence of results: an empty search is not support. Overturn when a
+    or on absence of results: an empty search is not support. The case's own
+    finding and files are what is being judged, not a source for it: a ticket,
+    owner or explanation named inside them counts only where another cited
+    result confirms it. A finding's triage
+    verdict is an earlier model's reading, not a source. Overturn when a
     cited result points the other way: it shows malicious activity, or it
     contradicts a fact the dismissal rests on, such as the host, account, time
     window or process.
 
+# An alarm is reviewed too: a malicious answer, and the containment it
+# proposes, stands only when the record names a fitting benign explanation and a
+# cited result rules it out; a suspicious answer stands only over a cited result
+# that leaves a concern the record does not explain. Otherwise it is held as
+# needs_review for a person and files no proposals; the conclusion and review
+# events keep what was asked and why. A fallback may not be an alarm word: it
+# would be written with no review of its own.
+escalation_guard:
+  field: disposition
+  guarded: [malicious, suspicious]
+  fallback: needs_review
+  min_hypotheses: 2
+  reviewer_prompt: |
+    The agent wants to call this case malicious or suspicious; the answer under
+    review says which. Either one holds the case open as an alarm, and a held
+    answer is handed to a person as needs_review.
+
+    For malicious: the agent may propose containment, such as isolating a host.
+    Acting on a wrong malicious call takes a legitimate system offline: an
+    authorised scanner, a monitoring job, a security team's own test. Holding a
+    well-grounded malicious call is a cost too: it still reaches an analyst,
+    without the verdict.
+
+    Uphold malicious when the cited results show the malicious activity itself,
+    and the record names the most likely benign explanation that fits that
+    activity and a cited result rules it out. For scanning, probing or repeated
+    logins, the benign explanation to rule out is an authorised scanner,
+    vulnerability management or asset discovery, or a sanctioned test. A
+    scanner's own probes do not rule it out: banner grabs, default-credential
+    tries, exploit checks, and requests naming well-known public sites sent to
+    test for an open proxy are what scanners send. They identify a tool, not an
+    intent; reading them as disguise or evasion is not supported. What rules it
+    out is activity that succeeds or carries on: a login that works, data moved,
+    the source reaching on into other hosts afterwards. So does a record that
+    the source is not a scanner. An explanation that does not fit the activity,
+    put down only to be dismissed, does not count.
+
+    Answer insufficient for malicious when no fitting benign explanation is on
+    the record, when none is ruled out by a cited result, or when the verdict
+    rests on the detector's score, severity, a finding's triage verdict, the
+    shape of the traffic alone, an empty search, or a threat named from general
+    knowledge rather than a cited record. Overturn when a cited result shows the
+    activity is expected: an inventory, owner or change record naming the source
+    as a scanner, or the activity matching a known job.
+
+    For suspicious: do not demand proof of malice. Uphold when a cited result
+    shows a concrete concern the record does not explain: activity on a named
+    host, account or process that no cited result accounts for. Answer
+    insufficient when the suspicion rests on no cited result, on an empty
+    search, on the detector's score, severity or a finding's triage verdict
+    alone, or on a concern named from general knowledge rather than a cited
+    record. Overturn when a cited result explains the concern away: an owner,
+    inventory, ticket or change record, or a known job, accounting for it.
+
 # The lead's grants, as the spec builder and the Python preflight read them.
 roles:
   lead:
-    needs: [shell, entity_recall, get_finding, telemetry_search, findings_search, indicator_lookup]
+    needs: [shell, entity_recall, get_finding, telemetry_search, findings_search, indicator_lookup,
+            intel_observable, intel_indicator, intel_entities, intel_relationships]

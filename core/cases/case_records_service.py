@@ -7,12 +7,24 @@ router owns the status code.
 
 import logging
 from datetime import datetime
-from typing import Any, Dict, Iterable, List, NamedTuple, Optional, Sequence, Tuple
+from typing import (
+    Any,
+    Dict,
+    Iterable,
+    List,
+    NamedTuple,
+    Optional,
+    Sequence,
+    Set,
+    Tuple,
+)
 
-from sqlalchemy import distinct, func
+from sqlalchemy import distinct, func, select
 from sqlalchemy.orm import Session
 
+from core.auth.permissions import case_read_clause, may_read_case
 from core.cases import case_trail
+from core.exceptions import NotFoundError
 from core.storage.models import (
     LIVE_INVESTIGATION_STATUSES,
     RUN_LIVE_STATE,
@@ -48,6 +60,8 @@ RESET_KILL_REASON = "killed: case reset"
 class PurgeResult(NamedTuple):
     cases: int
     killed_investigation_ids: List[str]
+    # Restricted cases the caller may not read: left in place with their records.
+    kept: int = 0
 
 
 # Purged wholesale by :func:`purge_all_cases`; order matters only in that
@@ -66,6 +80,15 @@ _CASE_OWNED_MODELS = (
     CaseWatcher,
     CaseComment,
 )
+
+
+def readable_case(session: Session, case_id: str, what: str = "Case") -> Case:
+    """The case row if the caller may read it. A restricted case they may not
+    read answers as one that isn't there: the same 404, on reads and writes."""
+    case = session.get(Case, case_id)
+    if case is None or not may_read_case(case):
+        raise NotFoundError(f"{what} not found")
+    return case
 
 
 def list_case_investigations(session: Session, case_id: str) -> List[Investigation]:
@@ -100,14 +123,41 @@ def run_liveness(session: Session, case_ids: Iterable[str]) -> Dict[str, bool]:
     return live
 
 
-def alerts_since_last_run(session: Session, case_id: str) -> int:
-    """Alerts merged after a case's newest run started, so that run did not read them.
+def _merged_in_finding_ids(session: Session, case_id: str, since: datetime) -> Set[str]:
+    """Finding ids a case merge moved onto this case after ``since``.
 
-    Read from the intake ledger rather than kept as a count, so a restart or a merge
-    during a live run needs no bookkeeping. A case with no run has no last run and
-    reads 0. Noise-marked alerts do not count. An alert merged twice counts once. A
-    person-started run has a ``WorkflowRun`` and no ``Investigation``, and it counts
-    as the case's last run all the same.
+    Read from the ``case_merged`` activities the merge writes on the target. A
+    merge made before the activity carried ``finding_ids`` has none to read.
+    """
+    activities = session.query(Case.activities).filter(Case.case_id == case_id).scalar()
+    ids: Set[str] = set()
+    for activity in activities or []:
+        details = activity.get("details") or {}
+        if (
+            activity.get("activity_type") != "case_merged"
+            or details.get("target_case_id") != case_id
+        ):
+            continue
+        try:
+            at = datetime.fromisoformat(str(activity["timestamp"]).rstrip("Z"))
+        except (KeyError, ValueError):
+            continue
+        if at > since:
+            ids.update(details.get("finding_ids") or [])
+    return ids
+
+
+def alerts_since_last_run(session: Session, case_id: str) -> int:
+    """Alerts that joined a case after its newest run started, so that run did not read them.
+
+    Two ways in: the intake ledger (an alert the matcher merged in) and a case
+    merge (the findings it moved onto this case, recorded on the merge's
+    ``case_merged`` activity). Read from those records rather than kept as a
+    count, so a restart or a merge during a live run needs no bookkeeping. A case
+    with no run has no last run and reads 0. Noise-marked alerts do not count. An
+    alert that arrived both ways, or twice, counts once. A person-started run has
+    a ``WorkflowRun`` and no ``Investigation``, and it counts as the case's last
+    run all the same.
     """
     starts = [
         session.query(func.max(Investigation.created_at))
@@ -123,15 +173,24 @@ def alerts_since_last_run(session: Session, case_id: str) -> int:
     starts = [at for at in starts if at is not None]
     if not starts:
         return 0
-    return (
-        session.query(func.count(distinct(IntakeTrigger.finding_id)))
-        .join(Finding, Finding.finding_id == IntakeTrigger.finding_id)
-        .join(case_findings, case_findings.c.finding_id == IntakeTrigger.finding_id)
-        .filter(
-            case_findings.c.case_id == case_id,
+    since = max(starts)
+    arrived = _merged_in_finding_ids(session, case_id, since)
+    arrived.update(
+        row[0]
+        for row in session.query(IntakeTrigger.finding_id).filter(
             IntakeTrigger.merged_into == case_id,
             IntakeTrigger.state == "merged",
-            IntakeTrigger.decided_at > max(starts),
+            IntakeTrigger.decided_at > since,
+        )
+    )
+    if not arrived:
+        return 0
+    return (
+        session.query(func.count(distinct(Finding.finding_id)))
+        .join(case_findings, case_findings.c.finding_id == Finding.finding_id)
+        .filter(
+            case_findings.c.case_id == case_id,
+            Finding.finding_id.in_(arrived),
             Finding.noise_marked_at.is_(None),
         )
         .scalar()
@@ -153,6 +212,27 @@ def list_case_runs(session: Session, case_id: str) -> List[WorkflowRun]:
         .order_by(WorkflowRun.started_at.desc(), WorkflowRun.run_id.desc())
         .all()
     )
+
+
+def list_run_facts(session: Session, run_ids: Sequence[str]) -> Dict[str, dict]:
+    """What each run's report stands on, in one query: ``outcome``, ``capped``,
+    ``citation_count``, ``grounded``. A null column is left out; so is a run with none.
+    """
+    if not run_ids:
+        return {}
+    rows = session.query(
+        WorkflowRun.run_id,
+        WorkflowRun.outcome,
+        WorkflowRun.capped,
+        WorkflowRun.citation_count,
+        WorkflowRun.grounded,
+    ).filter(WorkflowRun.run_id.in_(run_ids))
+    keys = ("outcome", "capped", "citation_count", "grounded")
+    facts = {
+        run_id: {key: value for key, value in zip(keys, values) if value is not None}
+        for run_id, *values in rows
+    }
+    return {run_id: kept for run_id, kept in facts.items() if kept}
 
 
 def run_step_counts(session: Session, run_ids: Sequence[str]) -> Dict[str, int]:
@@ -188,12 +268,39 @@ def list_case_audit(session: Session, case_id: str) -> List[CaseAuditLog]:
 
 
 def list_case_trail(session: Optional[Session], case_id: str) -> List[dict]:
-    """This case's audit trail entries, oldest first; none when it is not in use."""
+    """This case's audit trail entries, oldest first; none when it is not in use.
+
+    A link to a case the caller may not read keeps its entry but not the other
+    case's id, so it reads "Linked the case to another".
+    """
     from core.audit import trail
 
     if session is None or not trail.in_use(session):
         return []
-    return trail.read_all(session, trail.make_query(object_ref=case_id))
+    entries = trail.read_all(session, trail.make_query(object_ref=case_id))
+    linked = {
+        (e.get("payload") or {}).get("related_case_id")
+        for e in entries
+        if (e.get("payload") or {}).get("action") == case_trail.LINK
+    } - {None}
+    if not linked:
+        return entries
+    hidden = set(
+        session.scalars(
+            select(Case.case_id).where(Case.case_id.in_(linked), ~case_read_clause())
+        )
+    )
+    from core.audit.words import sentence
+
+    # Only the sentence: the payload keeps the id, so the record still pairs
+    # the entry with the activity noting the same link and shows neither.
+    def unnamed(e: dict) -> dict:
+        return {**e, "sentence": sentence({**e["payload"], "related_case_id": None})}
+
+    return [
+        unnamed(e) if (e.get("payload") or {}).get("related_case_id") in hidden else e
+        for e in entries
+    ]
 
 
 def add_task(
@@ -209,6 +316,7 @@ def add_task(
     signed_in: Optional[str],
 ) -> CaseTask:
     """Add a task and its trail entry. ``signed_in`` is who added it."""
+    readable_case(session, case_id)
     task = CaseTask(
         case_id=case_id,
         title=title,
@@ -268,7 +376,10 @@ def list_tasks(case_id: str) -> List[CaseTask]:
 
     try:
         with unit_of_work() as session:
+            readable_case(session, case_id)
             return tasks_on_case(session, case_id)
+    except NotFoundError:
+        raise
     except Exception:
         logger.exception("Listing tasks for case %s failed; reporting none", case_id)
         return []
@@ -280,8 +391,11 @@ def update_task(
     updates: Dict[str, Any],
     *,
     signed_in: Optional[str],
+    case_id: Optional[str] = None,
 ) -> Optional[CaseTask]:
-    """Apply non-None ``updates`` to a task. Returns None if it doesn't exist.
+    """Apply non-None ``updates`` to a task, on ``case_id`` when given. Returns
+    None if it isn't there; a case the caller may not read raises
+    ``NotFoundError``, checked before the task so a task id probes nothing.
 
     Driven off the payload rather than a field list held here: TaskUpdate is
     already the definition of what a caller may change, and a second copy of
@@ -289,11 +403,17 @@ def update_task(
     through ``resolve_assignee``; blank unassigns, None leaves it. A refusal
     raises ``AssigneeRefused`` before anything is written.
     """
-    from core.cases.assignee import resolve_assignee
+    from core.cases.assignee import require_owner_reads, resolve_assignee
 
-    task = session.query(CaseTask).filter(CaseTask.task_id == task_id).first()
+    query = session.query(CaseTask).filter(CaseTask.task_id == task_id)
+    if case_id is not None:
+        readable_case(session, case_id)
+        query = query.filter(CaseTask.case_id == case_id)
+    task = query.first()
     if task is None:
         return None
+    if case_id is None:
+        readable_case(session, task.case_id)
     updates = dict(updates)
     owner = None
     raw = updates.pop("assignee", None)
@@ -302,6 +422,8 @@ def update_task(
         task.assignee = resolve_assignee(session, raw, current=previous)
         if task.assignee != previous:
             owner = (previous, task.assignee)
+            # A newly named assignee must read a restricted case; an echo saves.
+            require_owner_reads(session, session.get(Case, task.case_id), task.assignee)
     for field, value in updates.items():
         if value is not None and hasattr(task, field):
             setattr(task, field, value)
@@ -326,7 +448,13 @@ def add_relationship(
     created_by: str,
     notes: Optional[str] = None,
 ) -> CaseRelationship:
-    """One link and its entry on this case's trail; ``created_by`` is the actor."""
+    """One link and its entry on this case's trail; ``created_by`` is the actor.
+
+    Both cases must be ones the caller may read: a target they may not read is
+    not there, as one that doesn't exist.
+    """
+    readable_case(session, case_id)
+    readable_case(session, related_case_id, "Related case")
     rel = CaseRelationship(
         case_id=case_id,
         related_case_id=related_case_id,
@@ -388,22 +516,29 @@ def link_cases(
 
 def list_relationships(
     session: Session, case_id: str
-) -> List[Tuple[CaseRelationship, Optional[str], Optional[str]]]:
-    """Each link with its related Case's title and status, in one query.
+) -> Tuple[List[Tuple[CaseRelationship, Optional[str], Optional[str]]], int]:
+    """Each link the caller may read, with its related Case's title and status,
+    and how many links to cases they may not read were left out.
 
     The inner join drops a row whose related Case is gone; both FKs cascade,
-    so in Postgres there is none to drop.
+    so in Postgres there is none to drop. A hidden link gives only the count:
+    never its id, title or status.
     """
-    return (
-        session.query(CaseRelationship, Case.title, Case.status)
+    readable_case(session, case_id)
+    readable = case_read_clause()
+    rows = (
+        session.query(CaseRelationship, Case.title, Case.status, readable)
         .join(Case, Case.case_id == CaseRelationship.related_case_id)
         .filter(CaseRelationship.case_id == case_id)
         .order_by(CaseRelationship.relationship_id)
         .all()
     )
+    shown = [(rel, title, status) for rel, title, status, ok in rows if ok]
+    return shown, len(rows) - len(shown)
 
 
 def list_escalations(session: Session, case_id: str) -> List[CaseEscalation]:
+    readable_case(session, case_id)
     return session.query(CaseEscalation).filter(CaseEscalation.case_id == case_id).all()
 
 
@@ -429,7 +564,8 @@ def delete_case(session: Session, case_id: str) -> Optional[List[str]]:
     its ``case_id`` SET NULL out from under it.
     """
     case = session.get(Case, case_id)
-    if case is None:
+    # A restricted case the caller may not read is not there (#4354).
+    if case is None or not may_read_case(case):
         return None
 
     live = live_investigation_ids(session, case_id)
@@ -444,7 +580,9 @@ def delete_case(session: Session, case_id: str) -> Optional[List[str]]:
     return []
 
 
-def kill_live_case_investigations(session: Session) -> List[Investigation]:
+def kill_live_case_investigations(
+    session: Session, case_ids: Any = None
+) -> List[Investigation]:
     """Fail every live Case-bearing Investigation. Hunts are not selected.
 
     ``status=failed`` drops the row out of the supervision loop, which
@@ -452,14 +590,13 @@ def kill_live_case_investigations(session: Session) -> List[Investigation]:
     back. The workdir sidecar the kill endpoint also writes is the caller's:
     ``core`` cannot import the daemon that owns it.
     """
-    live = (
-        session.query(Investigation)
-        .filter(
-            Investigation.case_id.isnot(None),
-            Investigation.status.in_(LIVE_INVESTIGATION_STATUSES),
-        )
-        .all()
+    query = session.query(Investigation).filter(
+        Investigation.case_id.isnot(None),
+        Investigation.status.in_(LIVE_INVESTIGATION_STATUSES),
     )
+    if case_ids is not None:
+        query = query.filter(Investigation.case_id.in_(case_ids))
+    live = query.all()
     for inv in live:
         inv.status = "failed"
         inv.master_review_notes = RESET_KILL_REASON
@@ -468,37 +605,50 @@ def kill_live_case_investigations(session: Session) -> List[Investigation]:
 
 
 def purge_all_cases(session: Session) -> PurgeResult:
-    """Delete every case and its derived records, killing live runs first.
+    """Delete every case the caller may read and its derived records, killing
+    live runs first.
 
     Live Case-bearing Investigations are failed before the delete so a
     finding-run is never left running with ``case_id`` SET NULL. Completed rows
     keep their ``case_id`` until the Case delete; the FK SET NULLs them as
-    history. Hunts (``case_id`` already null) are not touched.
+    history. Hunts (``case_id`` already null) are not touched. A restricted case
+    the caller may not read is kept, with every record of its own, and counted.
     """
-    count = session.query(Case).count()
-    killed = [inv.investigation_id for inv in kill_live_case_investigations(session)]
+    readable = case_read_clause()
+    # Every delete is scoped to these ids, so a case written after this read
+    # (restricted or not) is never swept up with them.
+    ids = [row[0] for row in session.execute(select(Case.case_id).where(readable))]
+    kept = session.query(Case).filter(~readable).count()
+    killed = [
+        inv.investigation_id for inv in kill_live_case_investigations(session, ids)
+    ]
 
     for model in _CASE_OWNED_MODELS:
-        session.query(model).delete(synchronize_session=False)
-
-    session.execute(case_findings.delete())
-    session.query(SketchMapping).filter(SketchMapping.case_id.isnot(None)).delete(
-        synchronize_session=False
-    )
-    session.query(AIDecisionLog).filter(AIDecisionLog.case_id.isnot(None)).delete(
-        synchronize_session=False
-    )
+        session.query(model).filter(model.case_id.in_(ids)).delete(
+            synchronize_session=False
+        )
+    session.execute(case_findings.delete().where(case_findings.c.case_id.in_(ids)))
+    for model in (SketchMapping, AIDecisionLog):
+        session.query(model).filter(model.case_id.in_(ids)).delete(
+            synchronize_session=False
+        )
     from core.storage.connection import table_present
 
     if table_present(session, "case_audit_logs"):
-        session.query(CaseAuditLog).delete(synchronize_session=False)
-    session.query(Case).delete(synchronize_session=False)
+        # The legacy store names a case only as an entity id: wholesale, as
+        # before, unless a kept case's rows must stay.
+        legacy = session.query(CaseAuditLog)
+        if kept:
+            legacy = legacy.filter(CaseAuditLog.entity_id.in_(ids))
+        legacy.delete(synchronize_session=False)
+    session.query(Case).filter(Case.case_id.in_(ids)).delete(synchronize_session=False)
     # One entry for the purge, with the count; not one per case.
     case_trail.append_case(
         session,
         case_trail.PURGE,
         None,
-        count=count,
+        count=len(ids),
         killed_investigations=len(killed),
+        kept=kept or None,
     )
-    return PurgeResult(cases=count, killed_investigation_ids=killed)
+    return PurgeResult(cases=len(ids), killed_investigation_ids=killed, kept=kept)

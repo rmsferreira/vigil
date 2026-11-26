@@ -1,16 +1,23 @@
 """Configuration API endpoints."""
 
+import hmac
 import json
 import logging
+import os
+import re
+from contextlib import contextmanager
 from typing import Any, Dict, List, Optional, Union
 
-from fastapi import APIRouter, Depends, HTTPException
-from fastapi.responses import JSONResponse
+from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, Field, create_model
-from sqlalchemy import exists, select
+from sqlalchemy import exists, select, text
 
+from core import site_proposal
 from core.api.v1.findings_router import data_service as findings_data_service
 from core.audit.feed import INTEGRATION_ID as AUDIT_FEED_INTEGRATION_ID
+from core.auth import tool_principal
+from core.auth.current_user import is_machine_request
 from core.auth.permissions import permission_gate
 from core.config import (
     _load_json_config,
@@ -24,10 +31,13 @@ from core.deps import (
     provide_detection_rules,
     provide_integration_bridge,
     provide_mcp_client,
+    provide_mcp_registry,
+    provide_process_health,
 )
 from core.detections.detection_rules_service import DetectionRulesService
+from core.integrations import health as source_health
 from core.integrations._base.descriptor import iter_descriptors
-from core.integrations.credential_check import check_credentials
+from core.integrations.credential_check import NotChecked, check_credentials, has_check
 from core.integrations.darktrace.darktrace_webhook_router import darktrace_enabled
 from core.integrations.extension import session_service as extension_sessions
 from core.integrations.integration_bridge_service import IntegrationBridgeService
@@ -36,10 +46,16 @@ from core.integrations.integration_secrets import (
     redact_secrets,
     secret_fields_for,
     split_secrets,
+    unstorable_secret_fields,
 )
-from core.intent import intent_file
+from core.integrations.readiness import evaluate, sources_settled
+from core.intent_report import intent_body
 from core.llm.defaults import DEFAULT_MODEL
-from core.memory.recall_contract import InvestigationKind
+from core.llm.security import MAX_SYSTEM_PROMPT_BYTES
+from core.llm.system_prompt import OPERATOR_INSTRUCTIONS_KEY, validate_system_prompt
+from core.platform.process_health import ProcessHealth
+from core.response.ceiling import CeilingRefusal, CeilingWriteError, read_ceiling
+from core.response.config import applied_intent, managed_widening, settle_pending
 from core.routing import Auth, RouterMeta, UnitOfWorkSession
 from core.secrets import (
     SECRET_WRITE_REFUSED_DETAIL,
@@ -49,22 +65,26 @@ from core.secrets import (
     set_secret,
 )
 from core.secrets_manager import get_secrets_manager
+from core.site import applied_site, site_view
 from core.skills.skill_library import (
     is_bundled,
     load_skills,
     operator_skills_root,
     skill_roots,
 )
-from core.storage.config_service import get_config_service
+from core.storage.config_service import get_config_service, write_config_audit
 from core.storage.models import (
     AIModelConfig,
-    EpisodicDistilMarker,
+    HistoryImport,
+    SystemConfig,
     User,
 )
+from core.storage.schemas.base import _iso_utc
+from core.storage.unit_of_work import unit_of_work
 from core.time import utcnow
 from services.api.errors import INTERNAL_ERROR_DETAIL
 from services.api.middleware.auth import get_current_active_user
-from services.daemon.intent import intent_report
+from services.daemon.intent_apply import StoreWriteFailed, accept_pending
 
 router = APIRouter()
 
@@ -88,6 +108,31 @@ logger = logging.getLogger(__name__)
 def _for_user(user: User):
     """Config service stamped with the signed-in user for the audit row."""
     return get_config_service(user_id=str(user.user_id))
+
+
+@contextmanager
+def _audited(
+    user: User,
+    config_type: str,
+    config_key: str,
+    old_value: Optional[Dict[str, Any]],
+    new_value: Optional[Dict[str, Any]],
+):
+    """Record a change whose state lives outside the settings service (the
+    secrets store, a State Directory file), then let the caller make it. The
+    entry is written first, so a refused one stops the change; an exception
+    in the block rolls the entry back."""
+    with unit_of_work() as session:
+        write_config_audit(
+            session,
+            config_type=config_type,
+            config_key=config_key,
+            action="update",
+            old_value=old_value,
+            new_value=new_value,
+            changed_by=str(user.user_id),
+        )
+        yield
 
 
 def _mirror_to_file(filename: str, config_data: Dict[str, Any]) -> None:
@@ -171,7 +216,12 @@ class PlatformDatabaseProxyConfig(BaseModel):
     proxy_password: str = ""
     ssh_private_key_path: str = ""
     ssh_key_passphrase: str = ""
+    # Required for ssh_tunnel: the bastion's public host key.
+    ssh_host_key: str = ""
     verify_proxy_tls: bool = True
+    # Not stored: proves the saver already holds the database login that a
+    # moved proxy would receive (see set_platform_database_config).
+    database_password: str = ""
 
 
 @router.get("/demo-mode", dependencies=_PLATFORM_READ)
@@ -197,7 +247,10 @@ def get_demo_mode():
 
 
 @router.post("/demo-mode", dependencies=_PLATFORM_WRITE)
-def set_demo_mode(config: DemoModeConfig):
+def set_demo_mode(
+    config: DemoModeConfig,
+    current_user: User = Depends(get_current_active_user),
+):
     """
     Set demo mode configuration.
 
@@ -219,11 +272,13 @@ def set_demo_mode(config: DemoModeConfig):
         with open(source_file, "r") as f:
             existing = json.load(f)
 
-    # Update demo_mode setting
+    old = {"demo_mode": existing.get("demo_mode")}
     existing["demo_mode"] = config.enabled
-
-    with open(config_file, "w") as f:
-        json.dump(existing, f, indent=2)
+    with _audited(
+        current_user, "general", "demo_mode", old, {"demo_mode": config.enabled}
+    ):
+        with open(config_file, "w") as f:
+            json.dump(existing, f, indent=2)
 
     # Takes effect at once; DEMO_MODE in the environment still wins, so report the
     # effective mode rather than the one asked for.
@@ -285,7 +340,10 @@ def get_claude_config():
 
 
 @router.post("/claude", dependencies=_PLATFORM_WRITE)
-def set_claude_config(config: ClaudeConfig):
+def set_claude_config(
+    config: ClaudeConfig,
+    current_user: User = Depends(get_current_active_user),
+):
     """
     Set Claude API configuration.
 
@@ -295,13 +353,20 @@ def set_claude_config(config: ClaudeConfig):
     Returns:
         Success status
     """
-    # Use standard environment variable name
-    success = set_secret("CLAUDE_API_KEY", config.api_key)
-    if not success:
-        raise HTTPException(
-            status_code=500,
-            detail=secret_write_failure_detail("Failed to save API key"),
-        )
+    # The key's value never reaches the entry, only that it changed.
+    with _audited(
+        current_user,
+        "llm_provider",
+        "CLAUDE_API_KEY",
+        {"configured": bool(get_secret("CLAUDE_API_KEY"))},
+        {"configured": True, "key_change": "set"},
+    ):
+        # Use standard environment variable name
+        if not set_secret("CLAUDE_API_KEY", config.api_key):
+            raise HTTPException(
+                status_code=500,
+                detail=secret_write_failure_detail("Failed to save API key"),
+            )
 
     # GH #88: keep the new llm_provider_configs table in sync so the
     # Settings "AI Config" tab and the legacy endpoint agree on the
@@ -478,6 +543,7 @@ _PLATFORM_DB_PROXY_KEYS = {
     "proxy_password": "PLATFORM_DB_PROXY_PASSWORD",
     "ssh_private_key_path": "PLATFORM_DB_SSH_PRIVATE_KEY_PATH",
     "ssh_key_passphrase": "PLATFORM_DB_SSH_KEY_PASSPHRASE",
+    "ssh_host_key": "PLATFORM_DB_SSH_HOST_KEY",
     "verify_proxy_tls": "PLATFORM_DB_VERIFY_PROXY_TLS",
 }
 _PLATFORM_DB_SECRET_FIELDS = {"proxy_password", "ssh_key_passphrase"}
@@ -520,8 +586,75 @@ def get_platform_database_config():
     return result
 
 
+def _require_proxy_credentials(
+    config: PlatformDatabaseProxyConfig, proxy_type: str
+) -> None:
+    """Refuse a save that sends stored credentials somewhere new, unless re-entered.
+
+    Through a proxy, Vigil logs in to its database with its own login (and, for
+    a password SSH tunnel, the stored SSH password). So a save that changes
+    where the proxy points, or turns its TLS verification off, must carry those
+    values again: a saved credential never goes to a destination its owner did
+    not choose, as on the integrations route.
+    """
+    if proxy_type == "none":
+        return
+    stored = {f: get_secret(k) or "" for f, k in _PLATFORM_DB_PROXY_KEYS.items()}
+    stored_type = (stored["proxy_type"] or "none").strip().lower()
+    stored_verify = stored["verify_proxy_tls"].lower() not in (
+        "false",
+        "0",
+        "no",
+        "off",
+    )
+    moved = (
+        proxy_type != stored_type
+        or (config.proxy_host or "") != stored["proxy_host"]
+        or (str(config.proxy_port) if config.proxy_port else "") != stored["proxy_port"]
+        or (proxy_type == "pgbouncer" and stored_verify and not config.verify_proxy_tls)
+        # The host key is part of the destination: a new key is a new server.
+        or (
+            proxy_type == "ssh_tunnel"
+            and (config.ssh_host_key or "").strip() != stored["ssh_host_key"]
+        )
+    )
+    if not moved:
+        return
+
+    from core.storage.connection import DatabaseConfig
+
+    # A login without a stored password comes from libpq's own sources
+    # (PGPASSWORD, .pgpass); an empty entry never matches, so such a move is refused.
+    expected = DatabaseConfig().password or os.environ.get(
+        "PGPASSWORD", ""
+    )  # noqa: ENV001 - libpq var
+    missing = []
+    if not config.database_password or not hmac.compare_digest(
+        config.database_password.encode(), expected.encode()
+    ):
+        missing.append("database password")
+    if (
+        proxy_type == "ssh_tunnel"
+        and not config.ssh_private_key_path
+        and stored["proxy_password"]
+        and not config.proxy_password
+    ):
+        missing.append("proxy password")
+    if missing:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "The proxy now points somewhere new or no longer verifies TLS; "
+                f"enter its credential again ({', '.join(missing)})"
+            ),
+        )
+
+
 @router.post("/platform-database", dependencies=_PLATFORM_WRITE)
-def set_platform_database_config(config: PlatformDatabaseProxyConfig):
+def set_platform_database_config(
+    config: PlatformDatabaseProxyConfig,
+    current_user: User = Depends(get_current_active_user),
+):
     """Persist the platform-DB proxy config to the encrypted secrets
     store. Takes effect on the next backend restart — the live engine
     can't be hot-swapped safely.
@@ -538,6 +671,21 @@ def set_platform_database_config(config: PlatformDatabaseProxyConfig):
             ),
         )
 
+    if proxy_type == "ssh_tunnel":
+        from core.storage.db_proxy import parse_ssh_host_key
+
+        if not (config.ssh_host_key or "").strip():
+            raise HTTPException(
+                status_code=400,
+                detail="SSH tunnel needs the bastion's SSH host key",
+            )
+        try:
+            parse_ssh_host_key(config.ssh_host_key)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    _require_proxy_credentials(config, proxy_type)
+
     # Non-secret fields — always overwrite so disabling a setting
     # actually clears the stored value.
     values = {
@@ -546,6 +694,9 @@ def set_platform_database_config(config: PlatformDatabaseProxyConfig):
         "proxy_port": str(config.proxy_port) if config.proxy_port else "",
         "proxy_username": config.proxy_username or "",
         "ssh_private_key_path": config.ssh_private_key_path or "",
+        "ssh_host_key": (
+            (config.ssh_host_key or "").strip() if proxy_type == "ssh_tunnel" else ""
+        ),
         "verify_proxy_tls": "true" if config.verify_proxy_tls else "false",
     }
     # Secret fields — only overwrite when caller supplied a non-empty
@@ -554,10 +705,19 @@ def set_platform_database_config(config: PlatformDatabaseProxyConfig):
         values["proxy_password"] = config.proxy_password
     if config.ssh_key_passphrase:
         values["ssh_key_passphrase"] = config.ssh_key_passphrase
-    _set_secrets_or_raise(
-        {_PLATFORM_DB_PROXY_KEYS[k]: v for k, v in values.items()},
-        "platform DB proxy configuration",
-    )
+    # Settings only; a re-entered secret is named, never copied.
+    old = {
+        f: get_secret(k) or ""
+        for f, k in _PLATFORM_DB_PROXY_KEYS.items()
+        if f not in _PLATFORM_DB_SECRET_FIELDS
+    }
+    new = {f: v for f, v in values.items() if f not in _PLATFORM_DB_SECRET_FIELDS}
+    new["rotated"] = sorted(_PLATFORM_DB_SECRET_FIELDS & values.keys())
+    with _audited(current_user, "database", "PLATFORM_DB_PROXY", old, new):
+        _set_secrets_or_raise(
+            {_PLATFORM_DB_PROXY_KEYS[k]: v for k, v in values.items()},
+            "platform DB proxy configuration",
+        )
 
     return {
         "success": True,
@@ -660,6 +820,7 @@ def build_setup_steps(
     skills_root_set: bool = False,
     custom_skills: int = 0,
     history_imported: bool = False,
+    tools_done: Optional[bool] = None,
 ) -> dict:
     """Five or six setup steps from config that already exists. No ranking, no dismissal.
 
@@ -682,12 +843,15 @@ def build_setup_steps(
     else:
         model_line = "Agents use more than one model"
     integrations_href = "/settings?section=integrations"
+    # None keeps the old "a row exists" check: the desktop app does not judge sources.
+    if tools_done is None:
+        tools_done = connected >= 1
     steps = [
         _step(
             "connect_tools",
             "Connect more tools",
             f"{connected} of {descriptor_count} integrations connected",
-            connected >= 1,
+            tools_done,
             integrations_href,
         ),
         _step(
@@ -757,9 +921,10 @@ def build_setup_steps(
     response_model=SetupStepsResponse,
     dependencies=_PLATFORM_READ,
 )
-def get_setup_steps(
+async def get_setup_steps(
     session: UnitOfWorkSession,
     detection_rules: DetectionRulesService = Depends(provide_detection_rules),
+    processes: ProcessHealth = Depends(provide_process_health),
 ):
     """Home's setup list: tools, a notify route, rules on disk, imported history, model variety, a custom skill."""
     loaded = load_integrations_config(get_config_service())
@@ -779,16 +944,11 @@ def get_setup_steps(
         demo_enabled=is_demo_mode(),
         skills_root_set=skills_root_set,
         custom_skills=custom_skills,
+        # Only a finished import counts; a running or failed one does not.
         history_imported=bool(
-            session.scalar(
-                select(
-                    exists().where(
-                        EpisodicDistilMarker.investigation_kind
-                        == InvestigationKind.IMPORTED.value
-                    )
-                )
-            )
+            session.scalar(select(exists().where(HistoryImport.status == "done")))
         ),
+        tools_done=sources_settled(await evaluate(processes)),
     )
 
 
@@ -827,33 +987,72 @@ def get_setup_state():
     return _read_setup_state()
 
 
+# Serialises two wizard saves. A progress write that read the row before
+# "Go to console" must not land afterwards and clear finished.
+SETUP_LOCK = 48751
+
+
 @router.put("/setup-state", response_model=SetupState, dependencies=_PLATFORM_WRITE)
 def put_setup_state(
     update: SetupStateUpdate,
     current_user: User = Depends(get_current_active_user),
 ):
     """Move the wizard on. Progress only grows: a step once passed stays passed,
-    and the furthest step never moves back, so two admins cannot undo each other."""
+    and the furthest step never moves back, so two admins cannot undo each other.
+    A finish, once recorded, stays recorded."""
     if update.passed and any(not 1 <= n <= SETUP_STEP_COUNT for n in update.passed):
         raise HTTPException(status_code=422, detail="passed holds steps 1 to 5")
-    state = _read_setup_state()
-    if update.furthest is not None:
-        state.furthest = max(state.furthest, update.furthest)
-    if update.passed:
-        state.passed = sorted(set(state.passed) | set(update.passed))
-    if update.finished and not state.finished:
-        state.finished = True
-        state.finished_by = current_user.username
-        state.finished_at = utcnow().isoformat()
-    saved = _for_user(current_user).set_system_config(
-        SETUP_STATE_KEY,
-        state.model_dump(),
-        description="Setup wizard progress for this install",
-        config_type="setup",
-        change_reason="setup wizard",
-    )
-    if not saved:
-        raise HTTPException(status_code=500, detail=INTERNAL_ERROR_DETAIL)
+    try:
+        with unit_of_work() as session:
+            session.execute(
+                text("SELECT pg_advisory_xact_lock(:key)"), {"key": SETUP_LOCK}
+            )
+            row = (
+                session.query(SystemConfig).filter_by(key=SETUP_STATE_KEY).one_or_none()
+            )
+            raw = row.value if row is not None else None
+            try:
+                state = SetupState.model_validate(raw) if raw else SetupState()
+            except Exception:  # a hand-edited row must not block the wizard
+                logger.warning("Unreadable %s; reading as not started", SETUP_STATE_KEY)
+                state = SetupState()
+            if update.furthest is not None:
+                state.furthest = max(state.furthest, update.furthest)
+            if update.passed:
+                state.passed = sorted(set(state.passed) | set(update.passed))
+            if update.finished and not state.finished:
+                state.finished = True
+                state.finished_by = current_user.username
+                state.finished_at = utcnow().isoformat()
+            payload = state.model_dump()
+            action = "update" if row is not None else "create"
+            if row is None:
+                session.add(
+                    SystemConfig(
+                        key=SETUP_STATE_KEY,
+                        value=payload,
+                        description="Setup wizard progress for this install",
+                        config_type="setup",
+                        updated_by=str(current_user.user_id),
+                    )
+                )
+            else:
+                row.value = payload
+                row.updated_by = str(current_user.user_id)
+            _for_user(current_user)._create_audit_log(
+                session,
+                config_type="setup",
+                config_key=SETUP_STATE_KEY,
+                action=action,
+                old_value=raw if isinstance(raw, dict) else None,
+                new_value=payload,
+                change_reason="setup wizard",
+            )
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("setup state was not saved")
+        raise HTTPException(status_code=500, detail=INTERNAL_ERROR_DETAIL) from None
     return state
 
 
@@ -868,6 +1067,21 @@ def _secrets_set_map(integrations: dict) -> dict:
                 field: bool(get_secret(env)) for field, env in fields.items()
             }
     return result
+
+
+def _last_tests(integrations: dict) -> dict:
+    """Each configured integration's last Test, from its Integration Health record."""
+    try:
+        records = source_health.read_all()
+    except Exception as e:  # noqa: BLE001 - the settings still load without it
+        logger.warning("Integration health read failed: %s", type(e).__name__)
+        return {}
+    out = {}
+    for iid in integrations:
+        test = source_health.last_test(records.get(iid), has_check(iid))
+        if test:
+            out[iid] = {**test, "at": _iso_utc(test["at"])}
+    return out
 
 
 @router.get("/integrations", dependencies=_INTEGRATIONS_READ)
@@ -908,11 +1122,7 @@ def get_integrations_config():
             "integrations": redacted,
             "secrets_set": _secrets_set_map(redacted),
             # {id: {at, success, error}} from POST .../test; untested ids absent
-            "last_test": {
-                iid: info
-                for iid, info in (loaded.get("last_test") or {}).items()
-                if iid != AUDIT_FEED_INTEGRATION_ID
-            },
+            "last_test": _last_tests(redacted),
         }
     except Exception as e:
         logger.error(f"Error getting integrations config: {e}")
@@ -940,7 +1150,8 @@ def set_integrations_config(
     treated as "keep existing secret" (matches the S3 endpoint convention)
     so editing non-secret fields without re-typing the password doesn't
     clobber stored credentials, unless a destination field (URL, host, ...) also
-    changed: then every stored secret must be re-entered (HTTP 400 otherwise),
+    changed or TLS trust was loosened (verify_ssl off, ca_cert_path or proxy_type
+    changed): then every stored secret must be re-entered (HTTP 400 otherwise),
     so a saved credential is never carried to a destination its owner did not
     choose. A failed secret write or integration-config
     row is HTTP 500; the detail names the integration and field, never the value.
@@ -961,6 +1172,20 @@ def set_integrations_config(
         # must not retarget it, and must not write a second trail entry for it.
         if integration_id == AUDIT_FEED_INTEGRATION_ID:
             continue
+        refused = [
+            field
+            for field in unstorable_secret_fields(integration_id)
+            if (raw_config or {}).get(field)
+        ]
+        if refused:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Integration '{integration_id}' cannot store a secret in "
+                    f"{', '.join(refused)}: a Custom Integration's id must start "
+                    "with 'custom-' and its field names use only a-z, 0-9 and _."
+                ),
+            )
         stored = config_service.get_integration_config(integration_id) or {}
         missing = credentials_to_resupply(
             integration_id, stored.get("config") or {}, raw_config or {}
@@ -997,9 +1222,11 @@ def set_integrations_config(
 
         # Empty string ⇒ user didn't re-type the secret on edit; leave
         # the existing encrypted value untouched. Non-empty ⇒ overwrite.
+        credential_changed = False
         for env_key, value in secrets.items():
             if value == "":
                 continue
+            credential_changed = credential_changed or get_secret(env_key) != value
             if not set_secret(env_key, value):
                 field = field_by_env.get(env_key, env_key)
                 logger.error(
@@ -1018,6 +1245,7 @@ def set_integrations_config(
             config=non_secrets,
             enabled=enabled,
             change_reason="Updated via Settings UI",
+            credential_changed=credential_changed,
         )
         if not success:
             logger.error(f"Failed to save integration '{integration_id}'")
@@ -1105,6 +1333,59 @@ async def _probe_mcp_server(
     return result
 
 
+def _test_result(
+    integration_id: str,
+    *,
+    success: bool,
+    errors: List[Optional[str]],
+    servers: List[Dict[str, Any]],
+    outcome: Any,
+) -> dict:
+    """Record Test and shape its answer.
+
+    A check that did not run is not a failure and is not stored as a pass:
+    the record keeps whatever the last real check said. A real check's line
+    is fixed text; nothing from the vendor is added to it.
+    """
+    credentials = None
+    check = None
+    unchecked = isinstance(outcome, NotChecked)
+    if unchecked:
+        # The read did not run. A probe that failed beside it is not a failed Test.
+        credentials = {"success": None, "message": outcome.reason}
+        success = True
+        errors = []
+    elif outcome is not None:
+        credentials = {"success": outcome[0], "message": outcome[1]}
+        check = outcome
+        if not outcome[0]:
+            success = False
+            errors.append(outcome[1])
+    error_summary = "; ".join(error for error in errors if error) or None
+    # A probe that started and a check that did not run must not read as healthy.
+    if not (unchecked and success):
+        source_health.record_test(
+            integration_id, success=success, error=error_summary, check=check
+        )
+    if unchecked and success:
+        message, reason = outcome.reason, "not_checked"
+    elif success:
+        message, reason = f"Integration '{integration_id}' connected.", None
+    else:
+        message = error_summary or f"Integration '{integration_id}' failed to connect."
+        reason = None
+    result: Dict[str, Any] = {
+        "success": success,
+        "message": message,
+        "servers": servers,
+    }
+    if reason is not None:
+        result["reason"] = reason
+    if credentials is not None:
+        result["credentials"] = credentials
+    return result
+
+
 def _probe_error_summary(servers: List[Dict[str, Any]]) -> Optional[str]:
     parts = []
     for server in servers:
@@ -1123,11 +1404,7 @@ async def _probe_connector_integration(integration_id: str, current_user: User) 
     except extension_sessions.ExtensionSessionError as exc:
         success, message, error = False, str(exc), str(exc)
 
-    recorded = get_config_service(user_id=current_user.user_id).record_integration_test(
-        integration_id, success=success, error=error, tested_at=utcnow()
-    )
-    if not recorded:
-        logger.warning("Integration '%s' test result was not saved", integration_id)
+    source_health.record_test(integration_id, success=success, error=error)
     return {"success": success, "message": message}
 
 
@@ -1141,16 +1418,19 @@ async def test_integration(
     """Probe the MCP servers behind an integration, or its connector URL.
 
     A UI-extension connector (stored ``connectorUrl``, no MCP server) is probed
-    over HTTP instead. Other catalog entries have no descriptor, so they are not
-    testable. A stored
+    over HTTP instead. A catalog entry with no server and no credential check
+    is not testable. One with a check and no server (Cloudforce One) skips the
+    probe and runs the check. A stored
     config of ``{}`` is still configured — secret-only rows keep the secret
     outside this dict. The integration's enabled flag does not block the
     probe: enabled MCP servers are contacted, and if none are enabled every
     declared server is probed with a temporary session. The alert sources
     (Splunk, Elastic, OpenSearch, Sentinel, Security Hub, Defender, CrowdStrike)
-    are also read with their saved URL and credentials, whether or not their
-    servers started (``credentials`` in the answer): a server starts whatever
-    it is pointed at, and the adapter that pulls alerts does not go through it.
+    and the other integrations with a fixed read are also read with their saved
+    credentials (``credentials`` in the answer): a server starts whatever it
+    is pointed at. A read that does not run (no read-only call, no credential
+    saved, or the tool server is off) is ``not_checked``, not a failure, and
+    nothing is stored for it.
     """
     server_names = list(bridge.server_names_for(integration_id))
     integrations = bridge.load_integration_config().get("integrations", {})
@@ -1158,7 +1438,7 @@ async def test_integration(
     stored = integrations.get(integration_id) or {}
     if not server_names and stored.get("connectorUrl"):
         return await _probe_connector_integration(integration_id, current_user)
-    if not server_names:
+    if not server_names and not has_check(integration_id):
         return {
             "success": False,
             "reason": "not_testable",
@@ -1169,6 +1449,16 @@ async def test_integration(
     # as {} after split_secrets and is still configured.
     if integration_id not in integrations:
         raise HTTPException(status_code=400, detail="Integration not configured")
+
+    # Cloudforce One has a check and no MCP server, so there is nothing to probe.
+    if not server_names:
+        return _test_result(
+            integration_id,
+            success=True,
+            errors=[],
+            servers=[],
+            outcome=await check_credentials(integration_id),
+        )
 
     if mcp_client is None:
         return {
@@ -1204,44 +1494,21 @@ async def test_integration(
             )
         )
     success = all(server["success"] for server in servers)
-    errors = [] if success else [_probe_error_summary(servers)]
+    errors: List[Optional[str]] = [] if success else [_probe_error_summary(servers)]
 
     # The servers starting says nothing about the URL or credentials, so read
     # the saved settings against the real service (read-only) before saying Good.
     # It runs whatever the probe said, as its own result: an alert source's
     # adapter reads with these settings directly, not through an MCP server
-    # that may need other config or a browser sign-in.
-    credentials = None
-    outcome = await check_credentials(integration_id)
-    if outcome is not None:
-        credentials = {"success": outcome[0], "message": outcome[1]}
-        if not outcome[0]:
-            success = False
-            errors.append(outcome[1])
-    error_summary = "; ".join(error for error in errors if error) or None
-
-    recorded = get_config_service(user_id=current_user.user_id).record_integration_test(
+    # that may need other config or a browser sign-in. A read that did not
+    # run comes back not checked, which is not a failure.
+    return _test_result(
         integration_id,
         success=success,
-        error=error_summary,
-        tested_at=utcnow(),
+        errors=errors,
+        servers=servers,
+        outcome=await check_credentials(integration_id),
     )
-    if not recorded:
-        logger.warning("Integration '%s' test result was not saved", integration_id)
-
-    if success:
-        message = f"Integration '{integration_id}' connected."
-    else:
-        message = error_summary or f"Integration '{integration_id}' failed to connect."
-
-    result = {
-        "success": success,
-        "message": message,
-        "servers": servers,
-    }
-    if credentials is not None:
-        result["credentials"] = credentials
-    return result
 
 
 @router.get("/general", dependencies=_PLATFORM_READ)
@@ -1309,6 +1576,70 @@ def set_general_config(
     return {"success": True, "message": "General settings saved"}
 
 
+class OperatorInstructions(BaseModel):
+    """Deployment-wide text appended to every agent run's system prompt (#4918)."""
+
+    text: str = ""
+
+
+@router.get("/operator-instructions", dependencies=_PLATFORM_READ)
+def get_operator_instructions():
+    """The saved instructions; empty text when none are set."""
+    try:
+        value = get_config_service().read_system_config(OPERATOR_INSTRUCTIONS_KEY)
+    except Exception as e:
+        logger.error("Error getting operator instructions: %s", e)
+        raise HTTPException(
+            status_code=503, detail="Could not read the operator instructions"
+        ) from e
+    return {
+        "text": (value or {}).get("text") or "",
+        "max_bytes": MAX_SYSTEM_PROMPT_BYTES,
+    }
+
+
+@router.post("/operator-instructions", dependencies=_PLATFORM_WRITE)
+def set_operator_instructions(
+    config: OperatorInstructions,
+    current_user: User = Depends(get_current_active_user),
+):
+    """Save the instructions. Runs started after this carry them; empty clears."""
+    text = config.text.strip()
+    try:
+        validate_system_prompt(text, source="operator_instructions")
+    except ValueError as e:
+        # A string detail, so the console can say why rather than "422".
+        raise HTTPException(
+            status_code=422,
+            detail=str(e)
+            .replace("system_prompt exceeds", "The instructions exceed")
+            .replace("system_prompt contains", "The instructions contain"),
+        ) from None
+    if not _for_user(current_user).set_system_config(
+        key=OPERATOR_INSTRUCTIONS_KEY,
+        value={"text": text},
+        description="Operator instructions appended to every agent run's system prompt",
+        config_type="agents",
+        change_reason="Updated via Settings UI",
+    ):
+        raise HTTPException(
+            status_code=500, detail="Failed to save configuration to database"
+        )
+    return {"text": text, "max_bytes": MAX_SYSTEM_PROMPT_BYTES}
+
+
+def _connection_preview(conn_str: Optional[str]) -> Optional[str]:
+    """The host part of a connection string, with its login and database masked."""
+    if not conn_str:
+        return None
+    if "://" not in conn_str:
+        return "***"
+    # Format: postgresql://user:pass@host:port/db
+    scheme, rest = conn_str.split("://", 1)
+    host = re.split(r"[/?]", rest.split("@")[-1])[0]
+    return f"{scheme}://***@{host}/***"
+
+
 @router.get("/postgresql", dependencies=_PLATFORM_READ)
 def get_postgresql_config():
     """
@@ -1321,27 +1652,20 @@ def get_postgresql_config():
         conn_str = get_secret("POSTGRESQL_CONNECTION_STRING")
         has_config = bool(conn_str)
 
-        # Extract host from connection string for preview (if exists)
-        preview = None
-        if conn_str and "postgresql://" in conn_str:
-            try:
-                # Format: postgresql://user:pass@host:port/db
-                parts = conn_str.split("@")
-                if len(parts) > 1:
-                    host_part = parts[1].split("/")[0]
-                    preview = f"postgresql://***@{host_part}/***"
-            except Exception as e:
-                logger.debug(f"Error parsing connection string preview: {e}")
-                preview = "postgresql://***:***@***/***"
-
-        return {"configured": has_config, "connection_preview": preview}
+        return {
+            "configured": has_config,
+            "connection_preview": _connection_preview(conn_str),
+        }
     except Exception as e:
         logger.error(f"Error getting PostgreSQL config: {e}")
         return {"configured": False, "error": INTERNAL_ERROR_DETAIL}
 
 
 @router.post("/postgresql", dependencies=_PLATFORM_WRITE)
-def set_postgresql_config(config: PostgreSQLConfig):
+def set_postgresql_config(
+    config: PostgreSQLConfig,
+    current_user: User = Depends(get_current_active_user),
+):
     """
     Set PostgreSQL database backend configuration.
 
@@ -1351,19 +1675,24 @@ def set_postgresql_config(config: PostgreSQLConfig):
     Returns:
         Success status
     """
-    success = set_secret("POSTGRESQL_CONNECTION_STRING", config.connection_string)
-    if success:
-        return {
-            "success": True,
-            "message": "PostgreSQL connection string saved securely",
-        }
-    else:
-        raise HTTPException(
-            status_code=500,
-            detail=secret_write_failure_detail(
-                "Failed to save PostgreSQL connection string"
-            ),
-        )
+    with _audited(
+        current_user,
+        "database",
+        "POSTGRESQL_CONNECTION_STRING",
+        {"connection": _connection_preview(get_secret("POSTGRESQL_CONNECTION_STRING"))},
+        {"connection": _connection_preview(config.connection_string)},
+    ):
+        if not set_secret("POSTGRESQL_CONNECTION_STRING", config.connection_string):
+            raise HTTPException(
+                status_code=500,
+                detail=secret_write_failure_detail(
+                    "Failed to save PostgreSQL connection string"
+                ),
+            )
+    return {
+        "success": True,
+        "message": "PostgreSQL connection string saved securely",
+    }
 
 
 class AIOperationsSettingsConfig(BaseModel):
@@ -1601,6 +1930,28 @@ class IntentDiffRow(BaseModel):
     effective: Any
     source: str
     label: str
+    # Set for a key a declared directory manages: the file, line and the
+    # revision that last changed it. ``drift`` is a local or env narrowing;
+    # ``pending`` a loosening waiting for a person; ``env_value`` the env
+    # value the declared one overrides, when they differ.
+    managed: bool = False
+    file: Optional[str] = None
+    line: Optional[int] = None
+    revision: Optional[str] = None
+    drift: bool = False
+    # For a ``workflows.<id>`` row: "lowered by Vigil" or "narrowed locally".
+    drift_reason: Optional[str] = None
+    pending: bool = False
+    env_ignored: bool = False
+    env_value: Any = None
+
+
+class IntentSkipped(BaseModel):
+    """A declared ``workflows.<id>`` this install could not apply, and why."""
+
+    id: str
+    line: Optional[int] = None
+    reason: str
 
 
 class IntentReportResponse(BaseModel):
@@ -1609,33 +1960,312 @@ class IntentReportResponse(BaseModel):
     path: str
     readable: bool
     rows: list[IntentDiffRow] = Field(default_factory=list)
+    # Set when VIGIL_INTENT_DIR is applied by the daemon: the applied
+    # revision, ok | degraded | rejected and why, and loosenings not written.
+    revision: Optional[str] = None
+    state: Optional[str] = None
+    reason: Optional[str] = None
+    pending: list[str] = Field(default_factory=list)
+    # Declared workflow ids missing here or not investigate-kind; the rest applied.
+    skipped: list[IntentSkipped] = Field(default_factory=list)
+    directory: Optional[str] = None
+    # The newest revision the daemon read; "unknown" while degraded.
+    revision_on_disk: Optional[str] = None
+    in_sync: Optional[bool] = None
+    hash: Optional[str] = None
+    applied_at: Optional[str] = None
+    rejected: Optional[Dict[str, Any]] = None
+    verification: Optional[str] = None
 
 
 @router.get("/intent", response_model=IntentReportResponse, dependencies=_AUTONOMY_READ)
-def get_intent_report() -> IntentReportResponse:
-    """Declared intent beside effective config.
+def get_intent_report() -> Dict[str, Any]:
+    """Declared intent beside effective config, and what a declared directory manages.
 
     A missing or unreadable manifest is 200 with ``readable`` false and no
     rows, so the Settings card can say so in one line.
     """
-    rows = intent_report(include_same=True)
-    path = str(intent_file())
-    if rows is None:
-        return IntentReportResponse(path=path, readable=False, rows=[])
-    return IntentReportResponse(
-        path=path,
-        readable=True,
-        rows=[
-            IntentDiffRow(
-                key=row.key,
-                declared=row.declared,
-                effective=row.effective,
-                source=row.source,
-                label=row.label,
+    return intent_body()
+
+
+class SiteOwnerRef(BaseModel):
+    """An owner as resolved now: a team, or why it is unassigned."""
+
+    team: str
+    team_id: Optional[str] = None
+    resolved: Optional[str] = None
+    unassigned: Optional[str] = None
+    file: str
+    line: int
+
+
+class SiteZone(BaseModel):
+    name: str
+    selectors: list[str]
+    description: Optional[str] = None
+    file: str
+    line: int
+    # The owners whose selectors overlap this zone's.
+    owners: list[SiteOwnerRef] = Field(default_factory=list)
+
+
+class SiteCrownJewel(BaseModel):
+    name: str
+    mission: str
+    selectors: list[str]
+    zone: Optional[str] = None
+    why: Optional[str] = None
+    file: str
+    line: int
+    owners: list[SiteOwnerRef] = Field(default_factory=list)
+
+
+class SiteOwner(SiteOwnerRef):
+    selectors: list[str]
+
+
+class SiteBlindSpot(BaseModel):
+    selectors: list[str]
+    what: str
+    file: str
+    line: int
+
+
+class SiteFile(BaseModel):
+    file: str
+    text: str
+
+
+class SiteProposalChange(BaseModel):
+    kind: str
+    item: str
+    # added | changed | removed, against the revision applied now
+    change: str
+
+
+class SiteProposalProvenance(BaseModel):
+    """A cited call on the saving run's ledger, or a person's answer, quoted."""
+
+    # citation | answer
+    source: str
+    change: str
+    run_id: Optional[str] = None
+    at: Optional[str] = None
+    ref: Optional[str] = None
+    tool: Optional[str] = None
+    server: Optional[str] = None
+    arguments: Optional[Any] = None
+    person_id: Optional[str] = None
+    answer: Optional[str] = None
+
+
+class SiteNotEvaluated(BaseModel):
+    """An outside tool the site agent holds that cannot run on this deployment."""
+
+    tool: str
+    reason: str
+    # Where to set its class, for a tool that is not classed read.
+    where: Optional[str] = None
+
+
+class SiteProposalResponse(BaseModel):
+    id: str
+    # open | applied | outdated | discarded
+    status: str
+    saved_at: str
+    saved_by: Dict[str, Optional[str]]
+    base_revision: Optional[str] = None
+    files: list[SiteFile] = Field(default_factory=list)
+    # "<list>/<item>" -> what it rests on
+    provenance: Dict[str, SiteProposalProvenance] = Field(default_factory=dict)
+    questions: list[str] = Field(default_factory=list)
+    refresh: Optional[Dict[str, Any]] = None
+    not_evaluated: list[SiteNotEvaluated] = Field(default_factory=list)
+    discarded: Optional[Dict[str, Any]] = None
+    diff: list[SiteProposalChange] = Field(default_factory=list)
+
+
+class SiteQuestion(BaseModel):
+    """Computed on read: unplaced, unowned or contradicted."""
+
+    question: str
+    # host | ip for an entity; zone | crown_jewel for an unowned item
+    kind: str
+    entity_key: Optional[str] = None
+    investigations: Optional[int] = None
+    latest: Optional[str] = None
+    name: Optional[str] = None
+    file: Optional[str] = None
+    line: Optional[int] = None
+
+
+class SiteContextResponse(BaseModel):
+    """The declared site (site/*.md) the daemon applied. Read-only; not /api/v1."""
+
+    declared: bool
+    directory: Optional[str] = None
+    revision: Optional[str] = None
+    # ok | rejected | degraded | none (no declared directory)
+    state: str
+    reason: str
+    hash: Optional[str] = None
+    applied_at: Optional[str] = None
+    rejected: Optional[Dict[str, Any]] = None
+    zones: list[SiteZone] = Field(default_factory=list)
+    crown_jewels: list[SiteCrownJewel] = Field(default_factory=list)
+    owners: list[SiteOwner] = Field(default_factory=list)
+    blind_spots: list[SiteBlindSpot] = Field(default_factory=list)
+    files: list[SiteFile] = Field(default_factory=list)
+    # The latest Day 1 Report's site checks and evidence; None before one ran.
+    report: Optional[Dict[str, Any]] = None
+    # The open site proposal (#5229), with its status and diff; None when none.
+    proposal: Optional[SiteProposalResponse] = None
+    site_questions: list[SiteQuestion] = Field(default_factory=list)
+
+
+@router.get("/site", response_model=SiteContextResponse, dependencies=_PLATFORM_READ)
+def get_site_context() -> Dict[str, Any]:
+    """The applied site/ revision: state, any refusal with file and line, each
+    item with file, line and resolved owner, and the applied files' text; the
+    open proposal and the site questions."""
+    return site_view()
+
+
+@router.get(
+    "/site/proposal/archive",
+    dependencies=_PLATFORM_READ,
+    responses={200: {"content": {"application/gzip": {}}}},
+)
+def download_site_proposal() -> Response:
+    """The proposed site/ folder as a .tar.gz, to unpack into the declared directory."""
+    value = site_proposal.read_proposal()
+    if not site_proposal._is_proposal(value):
+        raise HTTPException(status_code=404, detail="There is no site proposal")
+    if value.get("discarded"):
+        raise HTTPException(status_code=409, detail="The site proposal was discarded")
+    return Response(
+        content=site_proposal.archive(value),
+        media_type="application/gzip",
+        headers={
+            "Content-Disposition": (
+                f'attachment; filename="{site_proposal.archive_name(value)}"'
             )
-            for row in rows
-        ],
+        },
     )
+
+
+class SiteProposalDiscardBody(BaseModel):
+    reason: str = Field(min_length=1)
+
+
+@router.post(
+    "/site/proposal/discard",
+    response_model=SiteProposalResponse,
+    dependencies=[permission_gate("ai_chat.use")],
+)
+def discard_site_proposal(
+    body: SiteProposalDiscardBody,
+    session: UnitOfWorkSession,
+    current_user: User = Depends(get_current_active_user),
+) -> Dict[str, Any]:
+    """Discard the open proposal; the reason goes on its audit entry."""
+    if not body.reason.strip():
+        raise HTTPException(status_code=422, detail="A discard needs a reason")
+    try:
+        site_proposal.discard(session, body.reason, current_user.username)
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from None
+    except site_proposal.ProposalRefused as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from None
+    session.flush()
+    return site_proposal.proposal_view(applied_site(fresh=True), session=session)
+
+
+@router.post(
+    "/site/proposal/refresh",
+    dependencies=[permission_gate("ai_chat.use")],
+)
+async def refresh_site_proposal(
+    request: Request, current_user: User = Depends(get_current_active_user)
+) -> JSONResponse:
+    """Queue the site agent to draft a refresh now, as this user. 200 when queued;
+    409 with the reason when refused (agent or workflow off, AutoOps off, a
+    refresh unfinished, or another start in progress)."""
+    from services.api.routers.orchestrator import _person
+
+    person = _person(current_user, tool_principal.sid_of(request))
+    outcome = await site_proposal.start_refresh(person, provide_mcp_registry(request))
+    code = {site_proposal.REFUSED: 409, site_proposal.NOT_QUEUED: 500}.get(
+        outcome["status"], 200
+    )
+    return JSONResponse(outcome, status_code=code)
+
+
+class IntentAcceptBody(BaseModel):
+    """The revision (and hash) the person reviewed; a newer one is a 409."""
+
+    revision: str
+    hash: Optional[str] = None
+
+
+@router.post(
+    "/intent/accept", response_model=IntentReportResponse, dependencies=_AUTONOMY_WRITE
+)
+def accept_intent_pending(
+    body: IntentAcceptBody,
+    current_user: User = Depends(get_current_active_user),
+) -> Dict[str, Any]:
+    """Apply the pending loosenings of the applied revision. A person's act.
+
+    Each key's declared value goes into its store under the person's name,
+    with the revision on the audit entry. No timer, and not over /mcp.
+    """
+    if is_machine_request(current_user):
+        raise HTTPException(
+            status_code=403,
+            detail="A service account or API token cannot raise autonomy",
+        )
+    try:
+        stopped = read_ceiling().stopped
+    except Exception as exc:
+        raise HTTPException(
+            status_code=503, detail="Could not read the autonomy ceiling"
+        ) from exc
+    if stopped:
+        raise HTTPException(status_code=409, detail="Stopped: resume first")
+    report = intent_body()
+    if not report["directory"]:
+        raise HTTPException(status_code=409, detail="No declared directory is applied")
+    if report["revision"] != body.revision or (
+        body.hash is not None and body.hash != report["hash"]
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail=f"The applied revision is now {report['revision']}; review it again",
+        )
+    if not report["pending"]:
+        raise HTTPException(status_code=409, detail="Nothing is pending")
+    who = current_user.username or str(current_user.user_id)
+    try:
+        accept_pending(
+            report["pending"], body.revision, body.hash, str(current_user.user_id), who
+        )
+    except CeilingRefusal as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+    except (CeilingWriteError, StoreWriteFailed) as exc:
+        raise HTTPException(
+            status_code=500, detail="The pending keys were not all stored"
+        ) from exc
+    return intent_body()
+
+
+def refuse_managed_widening(values: Dict[str, Any]) -> None:
+    """409 when a local write would widen a key the declared directory manages."""
+    applied = applied_intent(fresh=True)
+    for key, value in values.items():
+        refused = managed_widening(key, value, applied)
+        if refused:
+            raise HTTPException(status_code=409, detail=refused)
 
 
 @router.get(
@@ -1669,6 +2299,16 @@ def set_orchestrator_config(
     flat keys; no profile name is written.
     """
     config_data = config.model_dump()
+    managed = {
+        f"investigate.{name}": config_data[name]
+        for name in (
+            "enabled",
+            "max_cost_per_investigation",
+            "max_total_hourly_cost",
+            "max_runtime_per_investigation",
+        )
+    }
+    refuse_managed_widening(managed)
 
     config_service = _for_user(current_user)
     success = config_service.set_system_config(
@@ -1683,6 +2323,7 @@ def set_orchestrator_config(
         raise HTTPException(
             status_code=500, detail="Failed to save orchestrator config to database"
         )
+    settle_pending(managed, str(current_user.user_id))
 
     return {"success": True, "message": "Orchestrator settings saved"}
 

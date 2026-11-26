@@ -209,10 +209,14 @@ export function FilterButton({
   useEffect(() => {
     if (!open) return
     const onDoc = (e: MouseEvent) => {
-      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false)
+      const t = e.target as Element
+      // a Select inside the panel portals its menu out, so a pick there is not outside
+      if (t.closest?.('.field-menu')) return
+      if (ref.current && !ref.current.contains(t)) setOpen(false)
     }
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') setOpen(false)
+      // Escape closes an open Select menu first
+      if (e.key === 'Escape' && !document.querySelector('.field-menu')) setOpen(false)
     }
     document.addEventListener('mousedown', onDoc)
     document.addEventListener('keydown', onKey)
@@ -286,11 +290,14 @@ export function Select({
   searchable = false,
   disabled,
   name,
+  label,
 }: {
   value: string
   options: DropOption[]
   onSelect: (value: string) => void
   placeholder?: string
+  // an accessible name, for a Select with no wrapping <label>
+  label?: string
   // adds a filter input to the open menu, for long option lists
   searchable?: boolean
   disabled?: boolean
@@ -514,6 +521,7 @@ export function Select({
         className={`field-select${toolbar ? ' toolbar' : ''}${toolbar && value !== options[0]?.value ? ' set' : ''}`}
         aria-haspopup="listbox"
         aria-expanded={open}
+        aria-label={label}
         disabled={disabled}
         aria-controls={open ? listId : undefined}
         aria-activedescendant={open && !searchable && shown[active] ? optionId(active) : undefined}

@@ -74,10 +74,9 @@ def phase_actors(phases: Any) -> dict[str, str]:
 def autonomy_label(run_id: Optional[str] = None) -> str:
     """Act when the run's workflow may take a reversible tool, otherwise Assist."""
     try:
-        stored = read_ceiling()
+        acts = effective_act(read_ceiling(), REVERSIBLE, workflow_of(run_id))
     except Exception:  # noqa: BLE001
         return "Assist"
-    acts = effective_act(stored, REVERSIBLE, workflow_of(run_id))
     return "Act" if acts else "Assist"
 
 
@@ -304,6 +303,28 @@ def note_terminal(run_id: str, outcome: str, summary: str) -> None:
         session.close()
 
 
+def _directive_entry(
+    *,
+    run_id: str,
+    directive_id: str,
+    kind: str,
+    actor: str,
+    actor_principal_id: Optional[str],
+) -> Optional[dict[str, Any]]:
+    principal = actor_principal_id or (
+        SYSTEM_PRINCIPAL_ID if actor == "system" else None
+    )
+    if principal is None:
+        return None
+    return {
+        "action": "agent.directive",
+        "actor": principal,
+        "run_id": run_id,
+        "directive_id": directive_id,
+        "kind": kind,
+    }
+
+
 def note_directive(
     session: Session,
     *,
@@ -313,21 +334,35 @@ def note_directive(
     actor: str,
     actor_principal_id: Optional[str],
 ) -> None:
-    principal = actor_principal_id or (
-        SYSTEM_PRINCIPAL_ID if actor == "system" else None
+    payload = _directive_entry(
+        run_id=run_id,
+        directive_id=directive_id,
+        kind=kind,
+        actor=actor,
+        actor_principal_id=actor_principal_id,
     )
-    if principal is None:
-        return
-    append_here(
-        session,
-        {
-            "action": "agent.directive",
-            "actor": principal,
-            "run_id": run_id,
-            "directive_id": directive_id,
-            "kind": kind,
-        },
+    if payload is not None:
+        append_here(session, payload)
+
+
+def note_directive_later(
+    *,
+    run_id: str,
+    directive_id: str,
+    kind: str,
+    actor: str,
+    actor_principal_id: Optional[str],
+) -> None:
+    """Once the directive row has committed: appended, or held to record late."""
+    payload = _directive_entry(
+        run_id=run_id,
+        directive_id=directive_id,
+        kind=kind,
+        actor=actor,
+        actor_principal_id=actor_principal_id,
     )
+    if payload is not None:
+        trail.append_or_hold(payload)
 
 
 def note_tool(claims: Claims, tool: str, args: Any, *, outcome: Optional[str]) -> None:
@@ -336,7 +371,8 @@ def note_tool(claims: Claims, tool: str, args: Any, *, outcome: Optional[str]) -
     The payload names the tool and, when the call has one, its target.
     Arguments and the result body stay off it.
     """
-    actor = phase_actor(claims.run_id or "") or claims.agent_id
+    # A person running an approved row has no run or agent: they are the actor.
+    actor = phase_actor(claims.run_id or "") or claims.agent_id or claims.person_id
     payload: dict[str, Any] = {
         "action": "agent.tool.intent" if outcome is None else "agent.tool.outcome",
         "actor": actor,

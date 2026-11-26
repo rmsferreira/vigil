@@ -21,11 +21,11 @@ import {
   tabFromQuery,
   type IntegrationsTab,
 } from './integrationsData'
-import { relativeTime, type ServerRow } from './integrationHealth'
+import { factsPhrase, rowPhrase, type ServerRow } from './integrationHealth'
 import { useIntegrationsState } from './IntegrationsState'
 import AddIntegrationTab from './AddIntegrationTab'
 import AuditFeedCard from './AuditFeedCard'
-import { buildCatalog } from './integrationCatalog'
+import { buildCatalog, savedCustomWithoutServer } from './integrationCatalog'
 import CustomIntegrationBuilder from './CustomIntegrationBuilder'
 import IntegrationMark from './IntegrationMark'
 import IntegrationWizard from './IntegrationWizard'
@@ -47,7 +47,7 @@ export default function IntegrationsSection({ notify }: SectionProps) {
   const [searchParams] = useSearchParams()
   const requested = tabFromQuery(searchParams.get('tab'))
   const [tab, setTab] = useState<IntegrationsTab>(requested)
-  const { mcp, int, phase, rows, attention } = useIntegrationsState()
+  const { mcp, int, health, phase, rows, attention } = useIntegrationsState()
   const { reload: reloadExtensions } = useExtensions()
   const [busy, setBusy] = useState<string | null>(null)
   const [reloadingServers, setReloadingServers] = useState(false)
@@ -59,6 +59,7 @@ export default function IntegrationsSection({ notify }: SectionProps) {
   const reload = () => {
     reloadMcp()
     reloadInt()
+    health.reload()
   }
 
   // Refresh only re-reads; this asks the backend to re-read mcp-config.json and
@@ -103,7 +104,8 @@ export default function IntegrationsSection({ notify }: SectionProps) {
     [intCfg.enabled_integrations, connected],
   )
   const entries = useMemo(() => buildCatalog(catalog, rows, connectedIds), [catalog, rows, connectedIds])
-  const available = entries.filter((e) => !e.connected).length
+  // a saved custom integration with no server is not available to add
+  const available = entries.filter((e) => !e.connected && !e.notRunning).length
   const healthy = connected.filter((r) => r.level === 'good').length
 
   // gate M: MCP server on/off (agent tools)
@@ -131,15 +133,17 @@ export default function IntegrationsSection({ notify }: SectionProps) {
     }
   }
 
-  // master: one switch over both gates
-  const onToggleMaster = async (name: string, id: string, want: boolean) => {
+  // master: one switch over both gates. An alert source's integration gate is its
+  // collection; switching on never enables collection for a source with no saved settings.
+  const onToggleMaster = async (name: string, id: string, want: boolean, collects = false, saved = true) => {
     setBusy(name)
     const res = await setServerEnabled(name, want)
     try {
-      await setIntegrationEnabled(id, want)
+      if (!want || saved) await setIntegrationEnabled(id, want)
       reloadExtensions()
+      health.reload()
     } catch {
-      notify('err', `Could not ${want ? 'enable' : 'disable'} the ${id} panel.`)
+      notify('err', `Could not ${want ? 'enable' : 'disable'} ${collects ? `alert collection from ${prettyServerName(name)}` : `the ${id} panel`}.`)
     }
     setBusy(null)
     if (res.ok) notify('ok', `${prettyServerName(name)} ${want ? 'enabled' : 'disabled'}.`)
@@ -261,13 +265,14 @@ export default function IntegrationsSection({ notify }: SectionProps) {
                 <span className="col-low-note">Last verified and what agents may do are hidden while Ask Vigil is open</span>
               </th>
               <th>Health</th>
-              <th className="col-low">
+                <th className="col-low">
                 Last verified
                 <InfoTip
                   label="About Last verified"
                   align="start"
-                  source="The last test of the integration, run through POST /api/config/integrations/{id}/test."
-                  limit="Never-tested integrations show —. A failed test stays until the next test passes."
+                  source="Integration Health for this integration, from GET /api/integration-health."
+                  calculation="Healthy shows when it was last confirmed working. Any other state is the server's own wording."
+                  limit="No record shows —. A failed read shows Could not read, never Good."
                 />
               </th>
               <th className="col-low">What agents may do with it</th>
@@ -277,7 +282,10 @@ export default function IntegrationsSection({ notify }: SectionProps) {
             </tr>
           </thead>
           <tbody>
-            {connected.map((r) => (
+            {connected.map((r) => {
+              const phrase = rowPhrase(r)
+              const facts = r.judgement?.state === 'switched_off' ? '' : factsPhrase(r.judgement?.record?.facts)
+              return (
               <tr key={r.name}>
                 <td>
                   <div className="int-ident">
@@ -289,14 +297,23 @@ export default function IntegrationsSection({ notify }: SectionProps) {
                         {EXPERIMENTAL_SERVERS.has(r.name) && <span className="chip int-exp" title={EXPERIMENTAL_NOTE}>Experimental</span>}
                       </span>
                       <span className="int-sub">{categoryOf(r.name)}</span>
+                      {facts && <span className="int-sub int-facts"><Clamp text={facts} /></span>}
                     </div>
                   </div>
                 </td>
                 <td>
-                  {r.level ? <LevelBadge level={r.level} variant="pill" /> : <span className="int-neutral">{r.word}</span>}
+                  {r.level ? <LevelBadge level={r.level} variant="pill" /> : <span className="int-neutral"><Clamp text={phrase || r.word || '—'} /></span>}
                 </td>
-                <td className="int-time col-low">
-                  {r.lastTest ? <time dateTime={r.lastTest.at} title={r.lastTest.at}>{relativeTime(r.lastTest.at)}</time> : <span title="Never tested">—</span>}
+                <td className="col-low">
+                  {phrase ? (
+                    r.judgement?.since && r.judgement.state === 'healthy' ? (
+                      <time dateTime={r.judgement.since} title={r.judgement.since}><Clamp text={phrase} /></time>
+                    ) : (
+                      <Clamp text={phrase} />
+                    )
+                  ) : (
+                    <span>—</span>
+                  )}
                 </td>
                 <td className="col-low"><Clamp text={SERVER_DESCRIPTIONS.get(r.name) || r.integration?.description || 'Custom MCP integration.'} /></td>
                 <td className={r.level === 'poor' ? 'int-note poor' : 'int-note'}><Clamp text={r.note} /></td>
@@ -313,7 +330,8 @@ export default function IntegrationsSection({ notify }: SectionProps) {
                   )}
                 </td>
               </tr>
-            ))}
+              )
+            })}
           </tbody>
         </table>
         </div>
@@ -348,18 +366,26 @@ export default function IntegrationsSection({ notify }: SectionProps) {
           lastTest={intCfg.last_test[wizardFor.id]}
           health={wizardRow?.level}
           category={categoryOf(wizardRow?.name ?? '')}
-          onTested={reloadInt}
+          onTested={() => {
+            reloadInt()
+            health.reload()
+          }}
           onClose={() => setWizardFor(null)}
           onSave={async (id, cfg) => {
             await saveIntegration(id, cfg)
+            health.reload()
             // refresh the registry so a URL edit re-reads; saving alone doesn't enable
             const isExtension = wizardFor.fields?.some((f) => f.name === 'connectorUrl')
             if (isExtension) reloadExtensions()
+            // no server row, so there is no toggle to point at
+            const notRunning = savedCustomWithoutServer(wizardFor, rows)
             notify(
               'ok',
               isExtension
                 ? `${wizardFor.name} connected. Turn it on with the toggle to enable it.`
-                : `${wizardFor.name} configured. Enable it with the toggle if it isn’t already.`,
+                : notRunning
+                  ? `${wizardFor.name} configured.`
+                  : `${wizardFor.name} configured. Enable it with the toggle if it isn’t already.`,
             )
           }}
         />
@@ -375,14 +401,27 @@ function Clamp({ text }: { text: string }) {
 }
 
 /** On/off. A connector-backed integration is one master switch over two gates:
- * the extension (gate D) and the MCP server / agent tools (gate M). */
+ * the extension (gate D) and the MCP server / agent tools (gate M). A built-in alert
+ * source's switch is the same over its collection and its agent tools. */
 function RowToggle({ row, busy, onMcp, onMaster }: {
   row: ServerRow
   busy: string | null
   onMcp: (name: string, want: boolean) => void
-  onMaster: (name: string, id: string, want: boolean) => void
+  onMaster: (name: string, id: string, want: boolean, collects?: boolean, saved?: boolean) => void
 }) {
-  const { name, integration, isEnabled, masterOn, masterMixed, extConfigured } = row
+  const { name, integration, isEnabled, masterOn, masterMixed, extConfigured, collects, saved } = row
+  if (collects && integration) {
+    return (
+      <Toggle
+        checked={masterOn}
+        mixed={masterMixed}
+        label={`Toggle ${name}`}
+        title={masterMixed ? 'Partly on — switch off to stop alert collection and agent tools' : undefined}
+        disabled={busy === name}
+        onChange={(v) => onMaster(name, integration.id, v, true, saved)}
+      />
+    )
+  }
   if (row.isExtension && integration) {
     return (
       <Toggle

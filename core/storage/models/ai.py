@@ -96,11 +96,10 @@ class AIDecisionLog(Base):
 
 
 class LLMInteractionLog(Base):
-    """Durable audit log of Claude API interactions for chain-of-thought visibility.
+    """Durable log of ``ClaudeService`` completions.
 
-    One row per Anthropic API response (per tool-use iteration). Captures
-    full untruncated thinking blocks, tool call chains, token usage, and
-    cost so analysts can audit AI decision-making post-hoc.
+    One row per completion, with its token usage and cost. Read by the cost
+    and usage reports and the chain-of-custody export.
     """
 
     __tablename__ = "llm_interaction_logs"
@@ -351,4 +350,42 @@ class ChatMessage(Base):
     __table_args__ = (
         UniqueConstraint("conversation_id", "seq", name="uq_chat_messages_conv_seq"),
         Index("idx_chat_messages_conversation", "conversation_id"),
+    )
+
+
+class InvestigationReplay(Base):
+    """The one investigation-model replay. A new start replaces this row."""
+
+    __tablename__ = "investigation_replay"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    status: Mapped[str] = mapped_column(String(16), nullable=False)
+    reason: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    provider_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    model_id: Mapped[str] = mapped_column(String(200), nullable=False)
+    started_by: Mapped[str] = mapped_column(String(64), nullable=False)
+    started_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    total: Mapped[int] = mapped_column(Integer, nullable=False)
+    replayed: Mapped[int] = mapped_column(Integer, nullable=False)
+    skipped: Mapped[int] = mapped_column(Integer, nullable=False)
+    false_closes: Mapped[int] = mapped_column(Integer, nullable=False)
+    false_close_rate: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    false_close_wilson_low: Mapped[Optional[float]] = mapped_column(
+        Float, nullable=True
+    )
+    false_close_wilson_high: Mapped[Optional[float]] = mapped_column(
+        Float, nullable=True
+    )
+    agreed: Mapped[int] = mapped_column(Integer, nullable=False)
+    disagreed: Mapped[int] = mapped_column(Integer, nullable=False)
+    abstained: Mapped[int] = mapped_column(Integer, nullable=False)
+    agreement_rate: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    agreement_wilson_low: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    agreement_wilson_high: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    cost_usd: Mapped[float] = mapped_column(Float, nullable=False)
+    false_close: Mapped[list] = mapped_column(JSONB, nullable=False)
+    # Per-workflow counts and rates keyed by workflow id (#5223).
+    by_workflow: Mapped[dict] = mapped_column(
+        JSONB, nullable=False, default=dict, server_default=text("'{}'::jsonb")
     )

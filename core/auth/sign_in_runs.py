@@ -37,6 +37,15 @@ def inherited_sid(run_id: str) -> Optional[str]:
 def live_runs(sign_in_ids: Iterable[str]) -> dict[str, str]:
     """Run id to a label, for the in-flight runs of these sign-ins and every child
     run below them. A child has a ledger of its own and no row of its own."""
+    return _tree("sign_in_id = ANY(:sids) AND ", {"sids": list(sign_in_ids)})
+
+
+def in_flight_runs() -> dict[str, str]:
+    """As ``live_runs``, for every in-flight run whatever started it."""
+    return _tree("", {})
+
+
+def _tree(seed: str, params: dict) -> dict[str, str]:
     from core.storage.connection import get_db_session
 
     with get_db_session() as session:
@@ -44,7 +53,7 @@ def live_runs(sign_in_ids: Iterable[str]) -> dict[str, str]:
             text(
                 "WITH RECURSIVE tree(run_id) AS ("
                 "  SELECT CAST(run_id AS text) FROM workflow_runs"
-                "  WHERE sign_in_id = ANY(:sids) AND status = ANY(:live)"
+                f"  WHERE {seed}status = ANY(:live)"
                 "  UNION"
                 "  SELECT CAST(e.run_id AS text) FROM agent_events e"
                 "  JOIN tree t ON e.kind = 'run'"
@@ -52,13 +61,14 @@ def live_runs(sign_in_ids: Iterable[str]) -> dict[str, str]:
                 ") SELECT t.run_id, w.workflow_name FROM tree t"
                 " LEFT JOIN workflow_runs w ON w.run_id = t.run_id"
             ),
-            {"sids": list(sign_in_ids), "live": list(IN_FLIGHT_STATUSES)},
+            {**params, "live": list(IN_FLIGHT_STATUSES)},
         ).all()
     return {run_id: name or "child run" for run_id, name in rows}
 
 
 def _reject_pending(run_id: str) -> None:
     """A stopped run's open approvals are rejected, as a cancel does."""
+    from core.auth.permissions import builtin_reader
     from core.response.approval_service import (
         ActionStatus,
         AlreadyDecided,
@@ -66,15 +76,17 @@ def _reject_pending(run_id: str) -> None:
     )
 
     approvals = ApprovalService()
-    for action in approvals.list_actions(
-        status=ActionStatus.PENDING, workflow_run_id=run_id
-    ):
-        try:
-            approvals.reject_action(
-                action.action_id, reason=STOP_REASON, rejected_by=_ACTOR
-            )
-        except AlreadyDecided:
-            pass
+    # The system's own stop, on any case (#4359).
+    with builtin_reader():
+        for action in approvals.list_actions(
+            status=ActionStatus.PENDING, workflow_run_id=run_id
+        ):
+            try:
+                approvals.reject_action(
+                    action.action_id, reason=STOP_REASON, rejected_by=_ACTOR
+                )
+            except AlreadyDecided:
+                pass
 
 
 def _stop(runs: dict[str, str]) -> dict[str, str]:
@@ -132,6 +144,7 @@ def _tell(
                 message,
                 link="/settings",
                 priority="high",
+                about=person,
             )
         except Exception:  # noqa: BLE001 - the runs are already stopped
             logger.exception("could not tell %s that runs were stopped", principal)

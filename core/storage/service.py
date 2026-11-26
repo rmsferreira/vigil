@@ -9,31 +9,36 @@ import logging
 import re
 from contextlib import nullcontext
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, NamedTuple, Optional, Sequence
 
 from sqlalchemy import String, Text, and_
 from sqlalchemy import case as sql_case
 from sqlalchemy import cast, delete, distinct, exists, func, literal, or_, select, true
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.dialects.postgresql import array as pg_array
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import InterfaceError, OperationalError
 from sqlalchemy.exc import TimeoutError as PoolTimeoutError
 from sqlalchemy.orm import lazyload, noload, selectinload
 
-from core.exceptions import default_on_error
-from core.storage import case_trail_hook
+from core.exceptions import TeamRefused, default_on_error
+from core.storage import case_read_hook, case_trail_hook
+from core.storage.case_insert import insert_case
 from core.storage.case_repository import CASE_FINDING_IDS_ONLY, CaseRepository
 from core.storage.connection import get_db_manager
+from core.storage.intake_return import return_removed_findings
 from core.storage.ip_exclusion_repository import exclusion_view_filter
 from core.storage.models import (
     LIVE_INVESTIGATION_STATUSES,
     Case,
+    CaseFindingRemoval,
     Finding,
     FindingMitrePrediction,
     Investigation,
     case_findings,
 )
 from core.storage.schemas import FindingSchema
+from core.storage.shared_ioc_repository import reconcile_case_safely
 from core.storage.technique_confidence import rank_by_confidence
 from core.time import utcnow
 
@@ -45,6 +50,62 @@ _UNSET = object()
 # Retrying a batch row by row against them would only repeat the failure (and
 # any pool timeout) once per row.
 _CONNECTION_ERRORS = (OperationalError, InterfaceError, PoolTimeoutError)
+
+
+class FindingLinkResult(NamedTuple):
+    """What ``add_finding_to_case`` did.
+
+    ``ok`` is true when the case and the finding both exist, so the finding is
+    on the case afterwards. Intake reads that as success. ``attached`` is true
+    only when this call inserted the link. A missing case and a missing finding
+    are separate: linking an unknown id is not a missing case.
+    """
+
+    ok: bool
+    attached: bool = False
+    case_missing: bool = False
+    finding_missing: bool = False
+
+    def __bool__(self) -> bool:
+        return self.ok
+
+
+class FindingUnlinkResult(NamedTuple):
+    """What ``remove_finding_from_case`` did.
+
+    ``ok`` is true when the case and the finding both exist, whether or not
+    they were linked. ``detached`` is true only when this call deleted the link.
+    """
+
+    ok: bool
+    detached: bool = False
+    case_missing: bool = False
+    finding_missing: bool = False
+
+    def __bool__(self) -> bool:
+        return self.ok
+
+
+def _record_removals(session, case_id: str, *, added, removed) -> None:
+    """Remember findings a person took off a Case, and forget ones put back (#4682).
+
+    Intake reads these rows so it does not join a removed finding to the same
+    Case again. Runs in the caller's session, so the row and the unlink commit
+    together.
+    """
+    if removed:
+        session.execute(
+            pg_insert(CaseFindingRemoval)
+            .values([{"case_id": case_id, "finding_id": f} for f in removed])
+            .on_conflict_do_nothing()
+        )
+    if added:
+        session.execute(
+            delete(CaseFindingRemoval).where(
+                CaseFindingRemoval.case_id == case_id,
+                CaseFindingRemoval.finding_id.in_(added),
+            )
+        )
 
 
 def _is_connection_error(e: Exception) -> bool:
@@ -162,6 +223,13 @@ DAEMON_ENRICHMENT_KEYS = (
     "recommended_action",
     "triage_reasoning",
 )
+
+
+def keep_first_verdict(current: Any, stamp: Any) -> Any:
+    """The first recorded verdict time. A later stamp does not move it."""
+    if current is not None or stamp is None:
+        return current
+    return stamp
 
 
 def merge_ai_enrichment(
@@ -975,6 +1043,7 @@ class DatabaseService:
         not the caller's (possibly stale) copy, so a concurrent triage and
         Generate don't lose each other's write. ``updates`` are plain column
         sets applied in the same transaction (the daemon's severity).
+        ``first_verdict_at`` is set only while that column is null.
         """
         with self.db_manager.session_scope() as session:
             finding = session.execute(
@@ -989,6 +1058,10 @@ class DatabaseService:
             finding.ai_enrichment = merge_ai_enrichment(
                 finding.ai_enrichment, ai_enrichment, daemon=daemon
             )
+            if "first_verdict_at" in updates:
+                finding.first_verdict_at = keep_first_verdict(
+                    finding.first_verdict_at, updates.pop("first_verdict_at")
+                )
             for key, value in updates.items():
                 setattr(finding, key, value)
             finding.updated_at = utcnow()
@@ -1027,10 +1100,11 @@ class DatabaseService:
     def delete_findings_from_source(self, data_source: str) -> Dict[str, int]:
         """Delete every finding with this ``data_source``, and the cases that
         held only such findings. A case that also holds another finding keeps
-        it and only loses the link. Returns ``{findings, cases, live}``: when
-        one of those cases has a live Investigation nothing is deleted and
+        it and only loses the link. Returns ``{findings, cases, live, kept}``:
+        when one of those cases has a live Investigation nothing is deleted and
         ``live`` names the blocking runs, as a single case delete refuses
-        (#1001)."""
+        (#1001). A restricted case the caller may not read is kept whole, its
+        findings too, and counted in ``kept``, not in ``cases``."""
         with self.db_manager.session_scope() as session:
             from_source = select(Finding.finding_id).where(
                 Finding.data_source == data_source
@@ -1043,13 +1117,12 @@ class DatabaseService:
                 .join(Finding, Finding.finding_id == case_findings.c.finding_id)
                 .where(Finding.data_source != data_source)
             )
-            case_ids = list(
-                session.scalars(
-                    select(Case.case_id).where(
-                        Case.case_id.in_(touched), Case.case_id.not_in(mixed)
-                    )
-                )
+            only_these = select(Case.case_id).where(
+                Case.case_id.in_(touched), Case.case_id.not_in(mixed)
             )
+            readable = case_read_hook.read_clause()
+            case_ids = list(session.scalars(only_these.where(readable)))
+            kept_ids = list(session.scalars(only_these.where(~readable)))
             if case_ids:
                 live = list(
                     session.scalars(
@@ -1060,14 +1133,21 @@ class DatabaseService:
                     )
                 )
                 if live:
-                    return {"findings": 0, "cases": 0, "live": live}
+                    return {"findings": 0, "cases": 0, "live": live, "kept": 0}
+            # A kept case keeps what it holds.
+            held = select(case_findings.c.finding_id).where(
+                case_findings.c.case_id.in_(kept_ids)
+            )
             cases = 0
             if case_ids:
                 cases = session.execute(
                     delete(Case).where(Case.case_id.in_(case_ids))
                 ).rowcount
             findings = session.execute(
-                delete(Finding).where(Finding.data_source == data_source)
+                delete(Finding).where(
+                    Finding.data_source == data_source,
+                    Finding.finding_id.not_in(held),
+                )
             ).rowcount
             logger.info(
                 "Deleted %d finding(s) and %d case(s) from %s",
@@ -1075,7 +1155,12 @@ class DatabaseService:
                 cases,
                 data_source,
             )
-            return {"findings": findings, "cases": cases, "live": []}
+            return {
+                "findings": findings,
+                "cases": cases,
+                "live": [],
+                "kept": len(kept_ids),
+            }
 
     @default_on_error(list)
     def get_findings_by_technique(
@@ -1137,7 +1222,7 @@ class DatabaseService:
 
     # ========== Case Operations ==========
 
-    @default_on_error(None, passthrough=case_trail_hook.RAISED)
+    @default_on_error(None, passthrough=(*case_trail_hook.RAISED, TeamRefused))
     def create_case(
         self, case_id: str, title: str, finding_ids: List[str], **kwargs
     ) -> Optional[Case]:
@@ -1154,51 +1239,29 @@ class DatabaseService:
             Created Case object or None if failed
         """
         with self.db_manager.session_scope() as session:
-            # Create case
-            now = utcnow()
-            case = Case(
+            case = insert_case(
+                session,
                 case_id=case_id,
                 title=title,
+                finding_ids=finding_ids,
                 description=kwargs.get("description", ""),
                 status=kwargs.get("status", "new"),
                 priority=kwargs.get("priority", "medium"),
                 assignee=kwargs.get("assignee"),
                 tags=kwargs.get("tags", []),
                 notes=kwargs.get("notes", []),
-                timeline=kwargs.get(
-                    "timeline",
-                    [{"timestamp": now.isoformat() + "Z", "event": "Case created"}],
-                ),
+                timeline=kwargs.get("timeline"),
                 activities=kwargs.get("activities", []),
                 resolution_steps=kwargs.get("resolution_steps", []),
                 mitre_techniques=kwargs.get("mitre_techniques"),
+                readers=kwargs.get("readers"),
+                reader_teams=kwargs.get("reader_teams"),
+                recheck_mark=kwargs.get("recheck_mark"),
             )
-            session.add(case)
-            session.flush()
-
-            # Link findings
-            if finding_ids:
-                findings = (
-                    session.execute(
-                        select(Finding).where(Finding.finding_id.in_(finding_ids))
-                    )
-                    .scalars()
-                    .all()
-                )
-                case.findings.extend(findings)
-                session.flush()
-
-            if writer := case_trail_hook.writer(session):
-                writer.append_case(
-                    session,
-                    writer.CREATE,
-                    case_id,
-                    operator_text=title or None,
-                    status=case.status,
-                    priority=case.priority,
-                    assignee=writer.assignee_principal(session, case.assignee),
-                )
             session.refresh(case)
+            # Touch it while the session is open: the dump runs after it closes.
+            if case.team is None:
+                logger.warning("case %s has no team row", case_id)
             logger.info(f"Created case: {case_id} with {len(finding_ids)} findings")
             return case
 
@@ -1217,7 +1280,12 @@ class DatabaseService:
         with self.db_manager.session_scope() as session:
             options = () if include_findings else (CASE_FINDING_IDS_ONLY,)
             case = session.get(Case, case_id, options=options)
+            # A restricted case the caller may not read is not there (#4354).
+            if case and not case_read_hook.may_read(case):
+                return None
             if case:
+                if case.team is None:
+                    logger.warning("case %s has no team row", case_id)
                 if include_findings:
                     for linked in case.findings:
                         _ = linked.mitre_prediction_rows
@@ -1256,25 +1324,39 @@ class DatabaseService:
                 order_by="created_at",
             )
 
-            # Detach from session
+            # Detach from session. Read the team first so the dump can use it.
             for case in cases:
+                if case.team is None:
+                    logger.warning("case %s has no team row", case.case_id)
                 session.expunge(case)
 
             return cases
 
     @default_on_error(None)
     def summarize_cases(self) -> Optional[Dict[str, Any]]:
-        """``{total, by_status, by_priority}`` over every case, counted in SQL.
+        """``{total, by_status, by_priority, restricted_not_counted}`` over every
+        case the caller may read, counted in SQL.
 
         ``None`` means the query failed.
         """
         with self.db_manager.session_scope() as session:
-            total, by_status, by_priority = CaseRepository(session).summary_counts()
+            total, by_status, by_priority, hidden = CaseRepository(
+                session
+            ).summary_counts()
             return {
                 "total": total,
                 "by_status": by_status,
                 "by_priority": by_priority,
+                "restricted_not_counted": hidden,
             }
+
+    def _scope(self, session=None):
+        """The caller's session as is, or a new one that commits on exit."""
+        return (
+            nullcontext(session)
+            if session is not None
+            else self.db_manager.session_scope()
+        )
 
     @default_on_error(False, passthrough=case_trail_hook.RAISED)
     def update_case(self, case_id: str, *, session=None, **updates) -> bool:
@@ -1290,29 +1372,15 @@ class DatabaseService:
         Returns:
             True if successful, False otherwise
         """
-        scope = (
-            nullcontext(session)
-            if session is not None
-            else self.db_manager.session_scope()
-        )
-        with scope as session:
+        with self._scope(session) as session:
             case = session.get(Case, case_id)
-            if not case:
+            if not case or not case_read_hook.may_read(case):
                 logger.warning(f"Case not found: {case_id}")
                 return False
 
-            # ``finding_ids`` maps to the ``findings`` relationship, not a
-            # column, so the generic setattr loop below would drop it.
-            findings: tuple = ((), ())
-            if "finding_ids" in updates:
-                was = {f.finding_id for f in case.findings}
-                CaseRepository(session).set_findings(
-                    case, updates.pop("finding_ids") or []
-                )
-                now = {f.finding_id for f in case.findings}
-                findings = (sorted(now - was), sorted(was - now))
-
-            # Update remaining mapped fields
+            # Finding links are their own rows (add_finding_to_case), not a
+            # column this update can assign.
+            updates.pop("finding_ids", None)
             before, after = {}, {}
             for key, value in updates.items():
                 if hasattr(case, key):
@@ -1322,7 +1390,7 @@ class DatabaseService:
             case.updated_at = utcnow()
             session.flush()
             if writer := case_trail_hook.writer(session):
-                writer.append_update(session, case_id, before, after, findings=findings)
+                writer.append_update(session, case_id, before, after)
             logger.info(f"Updated case: {case_id}")
             return True
 
@@ -1339,7 +1407,7 @@ class DatabaseService:
         """
         with self.db_manager.session_scope() as session:
             case = session.get(Case, case_id)
-            if not case:
+            if not case or not case_read_hook.may_read(case):
                 logger.warning(f"Case not found: {case_id}")
                 return False
 
@@ -1351,66 +1419,203 @@ class DatabaseService:
             logger.info(f"Deleted case: {case_id}")
             return True
 
-    @default_on_error(False, passthrough=case_trail_hook.RAISED)
-    def add_finding_to_case(self, case_id: str, finding_id: str) -> bool:
+    def _readable_case(self, session, case_id: str) -> Optional[Case]:
+        """The case when this caller may read it, locked, without its findings.
+
+        The lock is taken before the ``case_findings`` insert. That insert
+        share-locks this row for the foreign key, and the later ``updated_at``
+        write needs it exclusively: two links of one case deadlock if each
+        holds the share and then asks for the exclusive.
         """
-        Add a finding to a case.
+        case = session.scalars(
+            select(Case)
+            .where(Case.case_id == case_id)
+            .options(noload(Case.findings))
+            .with_for_update()
+        ).first()
+        if not case or not case_read_hook.may_read(case):
+            return None
+        return case
+
+    def _note_finding_links(
+        self,
+        session,
+        case: Case,
+        *,
+        linked: Sequence[str] = (),
+        unlinked: Sequence[str] = (),
+    ) -> None:
+        """Record one link change: the rows, the removal set, and one trail entry.
+
+        The association change and the trail commit together. ``linked`` and
+        ``unlinked`` are the ids this call actually inserted or deleted.
+        """
+        case.updated_at = utcnow()
+        _record_removals(
+            session, case.case_id, added=set(linked), removed=set(unlinked)
+        )
+        reconcile_case_safely(session, case.case_id)
+        # After the removal is recorded. An activities= write cannot follow:
+        # this path does not assign that column, and the note is the send-back.
+        if unlinked:
+            return_removed_findings(session, case, unlinked)
+        session.expire(case, ["findings"])
+        if not (writer := case_trail_hook.writer(session)):
+            return
+        if linked:
+            writer.append_case(
+                session, writer.FINDINGS_LINK, case.case_id, linked=list(linked)
+            )
+        elif unlinked:
+            writer.append_case(
+                session, writer.UNLINK, case.case_id, unlinked=list(unlinked)
+            )
+
+    def _insert_finding_links(
+        self, session, case_id: str, finding_ids: Sequence[str]
+    ) -> List[str]:
+        """Insert links that are not already there. Returns the ids this call inserted."""
+        if not finding_ids:
+            return []
+        now = utcnow()
+        inserted = session.execute(
+            pg_insert(case_findings)
+            .values(
+                [
+                    {"case_id": case_id, "finding_id": fid, "added_at": now}
+                    for fid in finding_ids
+                ]
+            )
+            .on_conflict_do_nothing(index_elements=["case_id", "finding_id"])
+            .returning(case_findings.c.finding_id)
+        ).scalars()
+        return list(inserted.all())
+
+    @default_on_error(False, passthrough=case_trail_hook.RAISED)
+    def add_finding_to_case(
+        self, case_id: str, finding_id: str, *, session=None
+    ) -> FindingLinkResult | bool:
+        """
+        Link one finding to a case.
+
+        One insert, so a link of a different finding that commits at the same
+        moment stays. A second insert of the same pair writes nothing.
 
         Args:
             case_id: Case ID
             finding_id: Finding ID
+            session: The caller's session, so the link and the index write
+                commit together; None owns one here.
 
         Returns:
-            True if successful, False otherwise
+            A ``FindingLinkResult``. False only when the write itself failed.
         """
-        with self.db_manager.session_scope() as session:
-            case = session.get(Case, case_id)
-            finding = session.get(Finding, finding_id)
+        with self._scope(session) as session:
+            case = self._readable_case(session, case_id)
+            if case is None:
+                logger.warning(f"Case not found: {case_id}")
+                return FindingLinkResult(ok=False, case_missing=True)
+            if session.get(Finding, finding_id) is None:
+                logger.warning(f"Finding not found: {finding_id}")
+                return FindingLinkResult(ok=False, finding_missing=True)
 
-            if not case or not finding:
-                logger.warning(f"Case or finding not found: {case_id}, {finding_id}")
-                return False
+            inserted = self._insert_finding_links(session, case_id, [finding_id])
+            if not inserted:
+                return FindingLinkResult(ok=True, attached=False)
 
-            if finding not in case.findings:
-                case.findings.append(finding)
-                case.updated_at = utcnow()
-                session.flush()
-                if writer := case_trail_hook.writer(session):
-                    writer.append_case(
-                        session, writer.FINDINGS_LINK, case_id, linked=[finding_id]
-                    )
-                logger.info(f"Added finding {finding_id} to case {case_id}")
-
-            return True
+            self._note_finding_links(session, case, linked=inserted)
+            logger.info(f"Added finding {finding_id} to case {case_id}")
+            return FindingLinkResult(ok=True, attached=True)
 
     @default_on_error(False, passthrough=case_trail_hook.RAISED)
-    def remove_finding_from_case(self, case_id: str, finding_id: str) -> bool:
+    def add_findings_to_case(
+        self, case_id: str, finding_ids: Sequence[str], *, session=None
+    ) -> Optional[Dict[str, List[str]]] | bool:
+        """Link many findings in one transaction and one trail entry.
+
+        ``added`` is the ids this call newly attached, in request order, plus
+        any id that names no finding (nothing is written for those). ``failed``
+        is the ids already on the case, and later copies of an id in the
+        request. None when the case is missing. False when the write failed.
+        """
+        with self._scope(session) as session:
+            case = self._readable_case(session, case_id)
+            if case is None:
+                logger.warning(f"Case not found: {case_id}")
+                return None
+
+            requested = [fid for fid in finding_ids if isinstance(fid, str)]
+            real: set = set()
+            if requested:
+                real = set(
+                    session.scalars(
+                        select(Finding.finding_id).where(
+                            Finding.finding_id.in_(set(requested))
+                        )
+                    ).all()
+                )
+            first: List[str] = []
+            seen: set = set()
+            for fid in requested:
+                if fid not in seen:
+                    seen.add(fid)
+                    if fid in real:
+                        first.append(fid)
+            inserted = set(self._insert_finding_links(session, case_id, first))
+
+            added: List[str] = []
+            failed: List[str] = []
+            seen.clear()
+            for fid in requested:
+                if fid in seen or (fid in real and fid not in inserted):
+                    failed.append(fid)
+                else:
+                    added.append(fid)
+                seen.add(fid)
+
+            if inserted:
+                self._note_finding_links(session, case, linked=sorted(inserted))
+                logger.info(f"Added findings {sorted(inserted)} to case {case_id}")
+            return {"added": added, "failed": failed}
+
+    @default_on_error(False, passthrough=case_trail_hook.RAISED)
+    def remove_finding_from_case(
+        self, case_id: str, finding_id: str, *, session=None
+    ) -> FindingUnlinkResult | bool:
         """
         Remove a finding from a case.
 
+        One delete, so a link of a different finding that commits at the same
+        moment stays. Deleting a pair that is not linked writes nothing.
+
         Args:
             case_id: Case ID
             finding_id: Finding ID
+            session: The caller's session; None owns one here.
 
         Returns:
-            True if successful, False otherwise
+            A ``FindingUnlinkResult``. False only when the write itself failed.
         """
-        with self.db_manager.session_scope() as session:
-            case = session.get(Case, case_id)
-            finding = session.get(Finding, finding_id)
+        with self._scope(session) as session:
+            case = self._readable_case(session, case_id)
+            if case is None:
+                logger.warning(f"Case not found: {case_id}")
+                return FindingUnlinkResult(ok=False, case_missing=True)
+            if session.get(Finding, finding_id) is None:
+                logger.warning(f"Finding not found: {finding_id}")
+                return FindingUnlinkResult(ok=False, finding_missing=True)
 
-            if not case or not finding:
-                logger.warning(f"Case or finding not found: {case_id}, {finding_id}")
-                return False
+            deleted = session.execute(
+                delete(case_findings)
+                .where(
+                    case_findings.c.case_id == case_id,
+                    case_findings.c.finding_id == finding_id,
+                )
+                .returning(case_findings.c.finding_id)
+            ).scalar_one_or_none()
+            if deleted is None:
+                return FindingUnlinkResult(ok=True, detached=False)
 
-            if finding in case.findings:
-                case.findings.remove(finding)
-                case.updated_at = utcnow()
-                session.flush()
-                if writer := case_trail_hook.writer(session):
-                    writer.append_case(
-                        session, writer.UNLINK, case_id, unlinked=[finding_id]
-                    )
-                logger.info(f"Removed finding {finding_id} from case {case_id}")
-
-            return True
+            self._note_finding_links(session, case, unlinked=[finding_id])
+            logger.info(f"Removed finding {finding_id} from case {case_id}")
+            return FindingUnlinkResult(ok=True, detached=True)

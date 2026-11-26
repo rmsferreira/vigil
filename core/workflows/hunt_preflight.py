@@ -16,10 +16,11 @@ from core.response.ceiling import asks_first, gated_tools
 from core.workflows.playbook_resolver import (
     CAPABILITIES,
     HUNT_CAPABILITIES,
-    OPTIONAL_HUNT_CAPABILITIES,
+    OPTIONAL_CAPABILITIES,
     UnknownPlaybook,
     lead_needs,
     phases_needs,
+    wall_setting_warning,
 )
 from core.workflows.workflows_service import (
     ADJUDICATE_RUN_KIND,
@@ -92,6 +93,8 @@ HUNT_SKILLS = (
     "findings-and-telemetry",
     "network-shape",
     "threat-intel",
+    "ai-agent-activity",
+    "insider-threat",
 )
 PLUGIN_SKILLS = {HUNT_RUN_KIND: HUNT_SKILLS, ADJUDICATE_RUN_KIND: HUNT_SKILLS}
 LEAD_NAMES = {HUNT_RUN_KIND: "Hunt lead", ADJUDICATE_RUN_KIND: "Adjudication lead"}
@@ -115,11 +118,12 @@ def _helper(phase: Dict[str, Any], tools: List[str]) -> Dict[str, Any]:
 
 
 # The needs a hunt-like kind's plugin declares. Adjudicate's does not take the
-# optional intel needs, so its preflight neither lists nor reports them.
+# optional needs (intel and detection coverage), so its preflight neither lists
+# nor reports them.
 def _hunt_needs(kind: str) -> Tuple[str, ...]:
     if kind == HUNT_RUN_KIND:
         return HUNT_CAPABILITIES
-    return tuple(c for c in HUNT_CAPABILITIES if c not in OPTIONAL_HUNT_CAPABILITIES)
+    return tuple(c for c in HUNT_CAPABILITIES if c not in OPTIONAL_CAPABILITIES)
 
 
 def _roles(definition: WorkflowDefinition) -> Tuple[Dict[str, Any], Optional[str]]:
@@ -234,7 +238,7 @@ def _budgets(definition: WorkflowDefinition) -> Dict[str, Any]:
             "max_wall_ms": resolver.HUNT_BUDGETS["max_wall_ms"],
         }
     if kind == INVESTIGATE_RUN_KIND:
-        return dict(resolver.INVESTIGATE_BUDGETS)
+        return resolver._with_deployment_wall(dict(resolver.INVESTIGATE_BUDGETS))
     # Only the count of phases sizes a budget, so a compose whose phases do not
     # resolve is still told its ceiling.
     return resolver._budgets(definition.phases)
@@ -312,6 +316,7 @@ def preflight(
     skills, skills_note = _skills(roles, definition.run_kind)
     permissions = _permissions(roles, definition.run_kind, report)
     checkpoints, checkpoints_note = _checkpoints(definition)
+    wall_note = wall_setting_warning()
     return {
         **({"capabilities": report} if hunt_like or investigate else {}),
         **({"pricing": pricing()} if hunt_like else {}),
@@ -326,4 +331,7 @@ def preflight(
         "budgets": _budgets(definition),
         "checkpoints": checkpoints,
         "checkpoints_note": checkpoints_note,
+        # Set only when WORKFLOW_DEFAULT_WALL_SECONDS is a number outside
+        # 60–86400. The budgets above already use 30 minutes.
+        **({"wall_note": wall_note} if wall_note else {}),
     }

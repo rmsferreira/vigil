@@ -8,6 +8,7 @@ import api, {
   detectionRulesApi,
   federationApi,
   ingestionApi,
+  integrationHealthApi,
   kafkaApi,
   localServicesApi,
   mcpApi,
@@ -17,14 +18,17 @@ import api, {
   type AIConfigResponse,
   type AIModelInfo,
   type BudgetQuotaResponse,
+  type Emulation,
   type BudgetSettings,
   type Ceiling,
   type ComponentAssignment,
   type EffectClass,
   type FederationSourceView,
   type IngestionJob,
+  type IntegrationHealthSource,
   type PlatformDatabaseProxyConfig,
   type ToolClass,
+  type AgentAgreement,
   type WorkflowAgreement,
 } from '../../services/api'
 import type { ApiWorkflow } from '../../data/mappers'
@@ -96,7 +100,9 @@ interface PlatformDbForm {
   proxy_password: string
   ssh_private_key_path: string
   ssh_key_passphrase: string
+  ssh_host_key: string
   verify_proxy_tls: boolean
+  database_password: string
 }
 
 const EMPTY_PLATFORM_DB: PlatformDbForm = {
@@ -107,7 +113,9 @@ const EMPTY_PLATFORM_DB: PlatformDbForm = {
   proxy_password: '',
   ssh_private_key_path: '',
   ssh_key_passphrase: '',
+  ssh_host_key: '',
   verify_proxy_tls: true,
+  database_password: '',
 }
 
 export function usePlatformDatabase() {
@@ -139,7 +147,9 @@ export function usePlatformDatabase() {
           proxy_password: '',
           ssh_private_key_path: d.ssh_private_key_path || '',
           ssh_key_passphrase: '',
+          ssh_host_key: d.ssh_host_key || '',
           verify_proxy_tls: d.verify_proxy_tls ?? true,
+          database_password: '',
         })
         setHasPassword(Boolean(d.has_proxy_password))
         setHasPassphrase(Boolean(d.has_ssh_key_passphrase))
@@ -166,18 +176,64 @@ export function usePlatformDatabase() {
           proxy_password: f.proxy_password,
           ssh_private_key_path: f.ssh_private_key_path,
           ssh_key_passphrase: f.ssh_key_passphrase,
+          ssh_host_key: f.ssh_host_key,
           verify_proxy_tls: f.verify_proxy_tls,
+          database_password: f.database_password,
         })
         .then(() => {
           // clear secret inputs so a later save doesn't overwrite with stale UI state
           if (f.proxy_password) setHasPassword(true)
           if (f.ssh_key_passphrase) setHasPassphrase(true)
-          setForm((prev) => ({ ...prev, proxy_password: '', ssh_key_passphrase: '' }))
+          setForm((prev) => ({
+            ...prev,
+            proxy_password: '',
+            ssh_key_passphrase: '',
+            database_password: '',
+          }))
         }),
     [],
   )
 
   return { form, setForm, hasPassword, hasPassphrase, phase, error, reload, save }
+}
+
+/** GET /api/integration-health. `failed` is a failed read (including 503), never an empty healthy list. */
+export function useIntegrationHealth() {
+  const [sources, setSources] = useState<IntegrationHealthSource[] | null>(null)
+  const [failed, setFailed] = useState(false)
+  const [phase, setPhase] = useState<Phase>('loading')
+  const [reloadKey, setReloadKey] = useState(0)
+  const reload = useCallback(() => setReloadKey((k) => k + 1), [])
+
+  useEffect(() => {
+    let cancelled = false
+    integrationHealthApi
+      .get()
+      .then((res) => {
+        if (cancelled) return
+        const list = res.data?.sources
+        if (!Array.isArray(list)) {
+          setSources(null)
+          setFailed(true)
+          setPhase('error')
+          return
+        }
+        setSources(list)
+        setFailed(false)
+        setPhase('ready')
+      })
+      .catch(() => {
+        if (cancelled) return
+        setSources(null)
+        setFailed(true)
+        setPhase('error')
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [reloadKey])
+
+  return { sources, failed, phase, reload }
 }
 
 export function useFederation() {
@@ -254,6 +310,8 @@ export function useFederation() {
 }
 
 export type AccountStatus = 'active' | 'locked' | 'deactivated' | 'deleted' | 'erased'
+/** A sign-in method type, named once. Details stay on the Sign-in methods dialog. */
+export type MfaMethodType = 'authenticator_app' | 'security_key' | 'recovery_codes'
 /** list_users' status filter: "current" is every account not deleted or erased */
 export type AccountFilter = 'current' | 'all' | AccountStatus
 
@@ -262,6 +320,8 @@ export interface User {
   status: AccountStatus
   /** open cases the account owns, shown before a deactivate or delete */
   open_cases: number
+  /** of those, restricted cases the viewer can't read: counted, not linked */
+  open_cases_hidden?: number
   username: string
   email: string
   full_name: string
@@ -269,10 +329,24 @@ export interface User {
   is_active: boolean
   is_verified: boolean
   mfa_enabled: boolean
+  /** method types this account has, in dialog order; empty when it has none */
+  mfa_method_types: MfaMethodType[]
+  /** signs in with a password, and/or through the SSO provider (a linked subject) */
+  has_password: boolean
+  has_sso: boolean
+  /** a directory-managed account nobody signed in to and no case or task names: Remove frees its names */
+  unused_sync?: boolean
   last_login: string | null
   login_count: number
   principal_kind: 'person' | 'service_account'
   managed_by_medic: boolean
+  /** marked break-glass at the host; shown, never changed here */
+  break_glass?: boolean
+  /** a service account's purpose, and the person answerable for it (never Medic's) */
+  purpose: string | null
+  accountable: { user_id: string; username: string; full_name: string } | null
+  /** that person is deactivated, deleted or erased: reassign */
+  accountable_gone: boolean
   /** sign-in is refused now; locked_until is empty for a lock until an Unlock or a reset link */
   locked: boolean
   locked_until: string | null
@@ -280,6 +354,8 @@ export interface User {
   locked_from: string | null
   /** when an idle account will be deactivated, once inside the warning window */
   deactivating_at: string | null
+  /** sync, person or dormancy; null when the account was deactivated before this was kept */
+  deactivation_route: 'sync' | 'person' | 'dormancy' | null
   /** person-only keys the role holds; stored, no effect for a non-person */
   no_effect: string[]
 }
@@ -296,6 +372,8 @@ export interface Role {
   diff?: Record<string, { catalog: boolean | null; role: boolean | null }>
   unrecognised: string[]
   holders: number
+  /** directory sync's role: not granted, edited or deleted */
+  reserved?: boolean
 }
 
 export interface RolePreset {
@@ -309,6 +387,10 @@ export interface RolesMeta {
   presets: RolePreset[]
   permissions: string[]
   platform_equivalent: string[]
+  /** person-only keys: no effect for a service account */
+  person_only: string[]
+  /** new-capability permissions no custom or legacy role holds */
+  new_permissions_unheld: string[]
   nobody_can_manage_roles: boolean
 }
 
@@ -322,13 +404,14 @@ const EMPTY_ROLES_META: RolesMeta = {
   presets: [],
   permissions: [],
   platform_equivalent: [],
+  person_only: [],
+  new_permissions_unheld: [],
   nobody_can_manage_roles: false,
 }
 
 export interface UserPayload {
   username: string
   email: string
-  password: string
   full_name: string
   role_id: string
 }
@@ -344,6 +427,8 @@ export interface UsersQuery {
 export function useUsers({ search, status, skip, limit }: UsersQuery) {
   const [users, setUsers] = useState<User[]>([])
   const [total, setTotal] = useState(0)
+  // restricted cases with no active reader, install-wide: a count only
+  const [restrictedNoReader, setRestrictedNoReader] = useState(0)
   const [roles, setRoles] = useState<Role[]>([])
   const [rolesMeta, setRolesMeta] = useState<RolesMeta>(EMPTY_ROLES_META)
   const [phase, setPhase] = useState<Phase>('loading')
@@ -365,12 +450,15 @@ export function useUsers({ search, status, skip, limit }: UsersQuery) {
         if (!Array.isArray(u) || !Array.isArray(r)) throw new Error('Invalid users/roles data')
         setUsers(u)
         setTotal(usersRes.data?.total ?? u.length)
+        setRestrictedNoReader(usersRes.data?.restricted_no_reader ?? 0)
         setRoles(r)
         const d = rolesRes.data
         setRolesMeta({
           presets: d.presets ?? [],
           permissions: d.permissions ?? [],
           platform_equivalent: d.platform_equivalent ?? [],
+          person_only: d.person_only ?? [],
+          new_permissions_unheld: d.new_permissions_unheld ?? [],
           nobody_can_manage_roles: !!d.nobody_can_manage_roles,
         })
         setPhase('ready')
@@ -385,10 +473,6 @@ export function useUsers({ search, status, skip, limit }: UsersQuery) {
     }
   }, [reloadKey, search, status, skip, limit])
 
-  const createUser = useCallback(
-    (payload: UserPayload) => api.post('/users/', payload).then(() => reload()),
-    [reload],
-  )
   const updateUser = useCallback(
     (userId: string, patch: Partial<UserPayload>) => api.put(`/users/${userId}`, patch).then(() => reload()),
     [reload],
@@ -424,12 +508,12 @@ export function useUsers({ search, status, skip, limit }: UsersQuery) {
   return {
     users,
     total,
+    restrictedNoReader,
     roles,
     rolesMeta,
     phase,
     error,
     reload,
-    createUser,
     updateUser,
     deleteUser,
     changeStatus,
@@ -629,6 +713,25 @@ export function useCeiling() {
     }
   }, [refresh])
   const resume = useCallback(async () => apply((await autonomyApi.resume()).data), [apply])
+  const releaseHeld = useCallback(
+    async (actionId: string) => {
+      try {
+        return apply((await autonomyApi.releaseHeld(actionId)).data)
+      } catch (err) {
+        refresh()
+        throw err
+      }
+    },
+    [apply, refresh],
+  )
+  const releaseAllHeld = useCallback(async () => {
+    try {
+      return apply((await autonomyApi.releaseAllHeld()).data)
+    } catch (err) {
+      refresh()
+      throw err
+    }
+  }, [apply, refresh])
   const setWorkflow = useCallback(
     async (id: string, body: Schema<'WorkflowAutonomyBody'>) => {
       try {
@@ -641,7 +744,7 @@ export function useCeiling() {
     [apply, refresh],
   )
 
-  return { ceiling, phase, save, stop, resume, refresh, setWorkflow }
+  return { ceiling, phase, save, stop, resume, refresh, setWorkflow, releaseHeld, releaseAllHeld }
 }
 
 export interface InvestigateWorkflow {
@@ -657,15 +760,21 @@ export function useInvestigateWorkflows() {
 
   useEffect(() => {
     let cancelled = false
-    Promise.all([workflowApi.listAll(), analyticsApi.getAgreement('30d').catch(() => [])])
+    Promise.all([
+      workflowApi.listAll(),
+      analyticsApi.getAgreement('30d').catch((): Pick<AgentAgreement, 'by_workflow'> => ({ by_workflow: [] })),
+    ])
       .then(([res, agreement]) => {
         if (cancelled) return
-        const listed = ((res.data?.workflows ?? []) as ApiWorkflow[]).filter((w) => w.run_kind === 'investigate')
+        // re-decision is an investigate workflow the live intake list does not offer.
+        const listed = ((res.data?.workflows ?? []) as ApiWorkflow[]).filter(
+          (w) => w.run_kind === 'investigate' && w.id !== 're-decision',
+        )
         setWorkflows(
           listed.map((w) => ({
             id: w.id,
             name: w.name || w.id,
-            agreement: agreement.find((row) => row.workflow_id === w.id),
+            agreement: agreement.by_workflow.find((row) => row.workflow_id === w.id),
           })),
         )
         setPhase('ready')
@@ -1452,6 +1561,9 @@ export interface DetectionSource {
   vendor_repo?: boolean
   /** The person said this non-github.com host is GitHub Enterprise */
   github_enterprise?: boolean
+  /** A rule library's branch or tag, and the commit its files were taken at */
+  ref?: string
+  commit?: string | null
 }
 
 interface DetectionStats {
@@ -1519,6 +1631,11 @@ export function useDetectionRules() {
       detectionRulesApi.setDeployTarget(id, on, githubEnterprise).then(() => reload()),
     [reload],
   )
+  // A rule library's reads and imports are detectionRulesApi.readLibrary/importLibrary (the dialogs).
+  const removeLibrary = useCallback(
+    (id: string) => detectionRulesApi.removeLibrary(id).then(() => reload()),
+    [reload],
+  )
   const updateAll = useCallback(
     () =>
       detectionRulesApi.updateAll().then((res) => {
@@ -1528,7 +1645,7 @@ export function useDetectionRules() {
     [reload],
   )
 
-  return { sources, stats, phase, error, reload, addSource, removeSource, updateSource, updateAll, setDeployTarget }
+  return { sources, stats, phase, error, reload, addSource, removeSource, removeLibrary, updateSource, updateAll, setDeployTarget }
 }
 
 const JOB_POLL_MS = 1000
@@ -1588,4 +1705,37 @@ export function useIngestionJob(dataType: 'finding' | 'history' = 'finding') {
   )
 
   return { job, attaching, upload, start }
+}
+
+/** The stored emulators and host list (GET/PUT /api/autonomy/emulation), shared with the tool rows' mark. */
+export function useEmulation() {
+  const [data, setData] = useState<Emulation | null>(null)
+  const [failed, setFailed] = useState(false)
+  const load = useCallback(
+    () =>
+      autonomyApi
+        .emulation()
+        .then((r) => {
+          setData(r.data)
+          setFailed(false)
+        })
+        .catch(() => setFailed(true)),
+    [],
+  )
+  useEffect(() => {
+    void load()
+  }, [load])
+  // refetch after a failure too: a 409 may mean someone stopped or edited meanwhile
+  const save = useCallback(
+    async (body: { tools?: string[]; hosts?: string[] }) => {
+      try {
+        setData((await autonomyApi.updateEmulation(body)).data)
+      } catch (err) {
+        await load()
+        throw err
+      }
+    },
+    [load],
+  )
+  return { data, failed, save }
 }

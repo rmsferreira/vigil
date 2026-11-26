@@ -15,6 +15,8 @@ usage() {
 Usage: $0 [--daemon|-d] [--with <profile>] [--all]
        $0 backup --repo PATH --passphrase-file PATH
        $0 restore --repo PATH --passphrase-file PATH [--snapshot ID] [--test]
+                  [--reason TEXT]
+       $0 secrets
 
   -d, --daemon      Run in the background (logs/ + pidfiles)
       --with NAME   Also start a profiled service (splunk, kafka, pgadmin,
@@ -24,8 +26,13 @@ Usage: $0 [--daemon|-d] [--with <profile>] [--all]
                     start the API, frontend, or agent layer.
       restore       Swap a snapshot in from the backup image and exit. Stop the
                     Bifrost container first. --test runs the checks and leaves
-                    live state untouched. Pass JWT_SECRET_KEY in the shell when
-                    Compose, not .env, holds it.
+                    live state untouched. --reason is recorded in the upgrade
+                    history. Pass JWT_SECRET_KEY in the shell when Compose, not
+                    .env, holds it.
+      secrets       Mint this install's secrets and exit: no virtualenv, no
+                    package install, nothing started. Prints the export lines
+                    a bare \`docker compose up\` needs (README, Run released
+                    images).
 
 Core services come from .vigil-autostart (or \$AUTOSTART_SERVICES, else
 postgres redis bifrost ollama). --with/--all are additive to that list.
@@ -88,10 +95,10 @@ prepare_backup_run() {
         --bifrost-data /var/lib/vigil/bifrost)
 }
 
-# Sets repo, passfile, snapshot and test from `backup`/`restore` arguments.
+# Sets repo, passfile, snapshot, test and reason from `backup`/`restore` arguments.
 parse_backup_args() {
     local cmd="$1"; shift
-    repo="" passfile="" snapshot="" test=0
+    repo="" passfile="" snapshot="" test=0 reason=""
     while [ $# -gt 0 ]; do
         case "$1" in
             --repo)
@@ -107,6 +114,10 @@ parse_backup_args() {
             --test)
                 [ "$cmd" = "restore" ] || { echo "Unknown argument: $1" >&2; usage >&2; exit 1; }
                 test=1; shift ;;
+            --reason)
+                [ "$cmd" = "restore" ] || { echo "Unknown argument: $1" >&2; usage >&2; exit 1; }
+                [ -n "${2:-}" ] || { echo "$cmd: --reason requires text" >&2; exit 1; }
+                reason="$2"; shift 2 ;;
             -h|--help) usage; exit 0 ;;
             *) echo "Unknown argument: $1" >&2; usage >&2; exit 1 ;;
         esac
@@ -119,7 +130,7 @@ parse_backup_args() {
 }
 
 run_backup() {
-    local repo passfile snapshot test
+    local repo passfile snapshot test reason
     parse_backup_args backup "$@"
     prepare_backup_run backup "$repo" "$passfile" ro
     dc "${BACKUP_RUN_ARGS[@]}"
@@ -129,7 +140,7 @@ run_backup() {
 # JWT rotation edits it) and Bifrost stopped (its SQLite files are replaced).
 # --test leaves live state alone, so Bifrost may keep running for it.
 run_restore() {
-    local repo passfile snapshot test
+    local repo passfile snapshot test reason
     parse_backup_args restore "$@"
     if [ "$test" -eq 0 ]; then
         ensure_docker || exit 1
@@ -143,12 +154,39 @@ run_restore() {
     prepare_backup_run restore "$repo" "$passfile" rw
     [ -n "$snapshot" ] && BACKUP_RUN_ARGS+=(--snapshot "$snapshot")
     [ "$test" -eq 1 ] && BACKUP_RUN_ARGS+=(--test)
+    [ -n "$reason" ] && BACKUP_RUN_ARGS+=("--reason=$reason")
     dc "${BACKUP_RUN_ARGS[@]}"
+}
+
+# The secrets start.sh mints below, for a Compose install that runs released
+# images. Only openssl, awk and docker. No --replace-published: replacing a
+# published database password needs the database set to match, which only a
+# full ./start.sh does (sync_postgres_passwords).
+run_secrets() {
+    [ $# -eq 0 ] || { usage >&2; exit 1; }
+    load_env
+    ensure_jwt_secret || exit 1
+    ensure_agent_token
+    ensure_bifrost_admin_password
+    ensure_redis_password || exit 1
+    ensure_postgres_passwords
+    # The JWT secret and Redis password live in ~/.vigil, never in .env, so the
+    # shell running `docker compose` has to export them.
+    local dir="${VIGIL_DIR:-$HOME/.vigil}" key file
+    echo ""
+    echo "Before docker compose, in the same shell:"
+    for key in JWT_SECRET_KEY:jwt_secret REDIS_PASSWORD:redis_password; do
+        file="$dir/${key#*:}"
+        [ -z "$(env_file_value "${key%%:*}")" ] && [ -s "$file" ] \
+            && echo "  export ${key%%:*}=\"\$(cat $file)\""
+    done
+    return 0
 }
 
 case "${1:-}" in
     backup) shift; run_backup "$@"; exit $? ;;
     restore) shift; run_restore "$@"; exit $? ;;
+    secrets) shift; run_secrets "$@"; exit $? ;;
 esac
 
 DAEMON=0
@@ -208,6 +246,9 @@ ensure_bifrost_admin_password
 # Redis requires a password; host-run backend, daemon, worker and agents inherit
 # it as REDIS_PASSWORD (REDIS_URL stays password-free).
 ensure_redis_password || exit 1
+# The three database passwords, per install. A published one (env.example's old
+# values) is replaced here, and the database is set to match once it is up.
+ensure_postgres_passwords --replace-published
 
 # `bifrost` only resolves inside the compose network. Rewrite before starting
 # services: bringing Ollama up syncs its catalog into Bifrost, and that runs
@@ -228,6 +269,8 @@ esac
 
 # --- Services (autostart list + any --with/--all extras) ---
 start_autostart_services
+# Before anything logs in: .env may have just got new values.
+sync_postgres_passwords || exit 1
 for svc in $EXTRA_SERVICES; do
     ensure_container "$(service_container "$svc")" "$svc" "$(service_profile "$svc")"
 done
@@ -247,6 +290,10 @@ if [ "$SKIP_FRONTEND" -eq 0 ] && [ -d "clients/web" ] && frontend_deps_stale cli
     fi
 fi
 
+# --- MCP connectors (the runner image's pinned tree; exports VIGIL_MCP_PREFIX) ---
+MCP_CONNECTORS_PROBLEM=""
+install_mcp_connectors "$NODE_PROBLEM"
+
 # --- Launch ---
 export PYTHONPATH="${PWD}:${PYTHONPATH:-}"
 LOGS_DIR="${PWD}/logs"
@@ -264,6 +311,7 @@ print_ready() {
         echo "Frontend: not started ($NODE_PROBLEM), and neither is the agent layer"
     fi
     echo "Docs:     http://localhost:6987/docs"
+    [ -n "$MCP_CONNECTORS_PROBLEM" ] && echo "MCP:      connectors $MCP_CONNECTORS_PROBLEM"
     echo ""
     if [ "$SKIP_FRONTEND" -eq 1 ]; then
         echo "Install Node.js 20 or later (Ubuntu's apt package is older; nvm works:"

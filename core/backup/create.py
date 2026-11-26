@@ -8,7 +8,9 @@ queueing when the session advisory lock is already held.
 from __future__ import annotations
 
 import json
+import logging
 import os
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -25,13 +27,24 @@ from core.audit.retention import list_text
 from core.backup.connection import backup_database_config
 from core.config import REPO_ROOT, get_settings, vigil_path
 from core.intent import intent_file
+from core.secrets import get_secret
 from core.storage.connection import DatabaseConfig
 from core.version import __version__
+
+logger = logging.getLogger(__name__)
 
 # Session lock, distinct from services/api/routers/auth.py _BOOTSTRAP_LOCK.
 LOCK_CLASSID = 1287
 LOCK_OBJID = 1
 SKIPPED_MESSAGE = "skipped: a backup is already running"
+
+# The wrapping key (JWT_SECRET_KEY) is kept out of the snapshot's copy of .env and
+# written as a second snapshot in the same repository (#4181): tagged
+# ``wrapping-key`` and ``main-<id>`` of the snapshot it pairs with.
+WRAPPING_TAG = "wrapping-key"
+PAIR_PREFIX = "main-"
+WRAPPING_FILE = "vigil-wrapping-key"
+_JWT_ENV_LINE = re.compile(r"^(\s*(?:export\s+)?JWT_SECRET_KEY\s*=)(.*)$")
 
 PRE_RESTORE_PREFIX = ".vigil-pre-restore-"
 STAGE_PREFIX = ".vigil-restore-stage-"
@@ -143,6 +156,7 @@ def create_snapshot(
                         f"{exc}; failed to remove snapshot {snap}: {detail}"
                     ) from exc
                 raise
+            _write_wrapping_key(repo, passphrase, snap, priority, extra_env)
             return snap
     finally:
         lock.close()
@@ -354,38 +368,144 @@ def _locations(staging: Path, bifrost_data: str | None) -> list[Location]:
     settings = get_settings()
     locations = [
         Location("database", "included", path=str(staging / "db.dump")),
-        _existing("state_directory", vigil_path(), directory=True),
+        _existing("state_directory", vigil_path(), staging, directory=True),
         _existing(
             "orchestrator_workdir",
             Path(settings.orchestrator_workdir),
+            staging,
             directory=True,
         ),
         # Unset, skills sit in the State Directory and are copied with it.
-        _skills(settings.vigil_skills_path or ""),
-        _file_or_absent("intent", intent_file()),
-        _file_or_absent("env", REPO_ROOT / ".env"),
+        _skills(settings.vigil_skills_path or "", staging),
+        _file_or_absent("intent", intent_file(), staging),
+        _env(staging),
         _bifrost(staging, bifrost_data),
     ]
     return locations
 
 
-def _existing(name: str, path: Path, *, directory: bool) -> Location:
+def _existing(name: str, path: Path, staging: Path, *, directory: bool) -> Location:
     present = path.is_dir() if directory else path.exists()
     if present:
-        return Location(name, "included", path=str(path))
+        return Location(name, "included", path=_stage(name, path, staging))
     return Location(name, "skipped", reason="absent")
 
 
-def _skills(raw: str) -> Location:
+def _skills(raw: str, staging: Path) -> Location:
     if not raw.strip():
         return Location("skills", "skipped", reason="unset")
-    return _existing("skills", Path(raw), directory=False)
+    return _existing("skills", Path(raw), staging, directory=False)
 
 
-def _file_or_absent(name: str, path: Path) -> Location:
+def _file_or_absent(name: str, path: Path, staging: Path) -> Location:
     if path.is_file():
-        return Location(name, "included", path=str(path))
+        return Location(name, "included", path=_stage(name, path, staging))
     return Location(name, "skipped", reason="absent")
+
+
+def _stage(name: str, src: Path, staging: Path) -> str:
+    """Copy a host input into staging; the manifest records the copy.
+
+    restic's reads fail with EIO on host-created files over Docker Desktop's
+    VirtioFS bind mounts while plain read() works (#4919), so restic only ever
+    reads container-local copies. Restore places each location by its name.
+    """
+    dest = staging / name / src.name
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        if src.is_dir():
+            _copy_tree(src, dest)
+        else:
+            _copy_file(src, dest)
+    except OSError as exc:
+        where = exc.filename or src
+        raise BackupError(
+            f"could not copy {name} for backup: {where}: {exc.strerror or exc}"
+        ) from exc
+    return str(dest)
+
+
+def _copy_tree(src: Path, dest: Path) -> None:
+    dest.mkdir(exist_ok=True)
+    with os.scandir(src) as entries:
+        for entry in sorted(entries, key=lambda e: e.name):
+            if entry.name.startswith(_RESTORE_ARTIFACT_PREFIXES):
+                continue
+            target = dest / entry.name
+            try:
+                if entry.is_symlink():
+                    os.symlink(os.readlink(entry.path), target)
+                elif entry.is_dir(follow_symlinks=False):
+                    _copy_tree(Path(entry.path), target)
+                elif entry.is_file(follow_symlinks=False):
+                    _copy_file(Path(entry.path), target)
+                # Sockets and FIFOs are not data; restic would store them empty.
+            except FileNotFoundError as exc:
+                # Gone between listing and copying (a rotated log); a read
+                # error on a file that is there still fails the backup.
+                if os.fspath(exc.filename or "") != entry.path:
+                    raise
+    _keep_meta(src, dest)
+
+
+def _copy_file(src: Path, dest: Path) -> None:
+    # Plain read/write: shutil's copies use sendfile, untested over VirtioFS.
+    with open(src, "rb") as fin, open(dest, "wb") as fout:
+        while chunk := fin.read(1 << 20):
+            fout.write(chunk)
+    _keep_meta(src, dest)
+
+
+def _keep_meta(src: Path, dest: Path) -> None:
+    # Mode and times only: never ownership, which a non-root uid cannot set.
+    st = os.stat(src)
+    os.chmod(dest, st.st_mode & 0o7777)
+    os.utime(dest, ns=(st.st_atime_ns, st.st_mtime_ns))
+
+
+def _env(staging: Path) -> Location:
+    """The repo-root .env without its JWT_SECRET_KEY line, staged as a copy."""
+    src = REPO_ROOT / ".env"
+    if not src.is_file():
+        return Location("env", "skipped", reason="absent")
+    dest = staging / "env" / ".env"
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    kept = [
+        line
+        for line in src.read_text(
+            encoding="utf-8", errors="surrogateescape"
+        ).splitlines(keepends=True)
+        if not _JWT_ENV_LINE.match(line.rstrip("\r\n"))
+    ]
+    dest.write_text("".join(kept), encoding="utf-8", errors="surrogateescape")
+    os.chmod(dest, 0o600)
+    return Location("env", "included", path=str(dest))
+
+
+def _write_wrapping_key(
+    repo: str,
+    passphrase: Path,
+    main_id: str,
+    priority: list[str],
+    extra_env: Mapping[str, str] | None,
+) -> None:
+    """The second snapshot, after the main one passed verification. The main
+    snapshot restores without it, so a failure here is logged, not raised."""
+    secret = get_secret("JWT_SECRET_KEY")
+    if not secret:
+        logger.warning("JWT_SECRET_KEY is not set here; no wrapping-key snapshot")
+        return
+    proc = subprocess.run(
+        priority
+        + ["restic", "-r", repo, "backup", "--stdin", "--stdin-filename", WRAPPING_FILE]
+        + ["--tag", WRAPPING_TAG, "--tag", PAIR_PREFIX + main_id],
+        env=_restic_env(passphrase, extra_env),
+        input=secret,
+        capture_output=True,
+        text=True,
+    )
+    if proc.returncode != 0:
+        logger.warning("wrapping-key snapshot failed: %s", _output(proc))
 
 
 def _bifrost(staging: Path, bifrost_data: str | None) -> Location:

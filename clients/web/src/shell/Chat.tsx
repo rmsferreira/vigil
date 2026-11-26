@@ -16,11 +16,10 @@ import { useThreadHeight } from './useThreadHeight'
 import { Icon } from '../shared/icons'
 import { VigilMark } from '../shared/VigilLogo'
 import { TITLES } from '../data/data'
-import { Cost } from '../shared/cost'
 import api, {
+  agentsApi,
   casesApi,
   conversationsApi,
-  reasoningApi,
   streamFetch,
   workflowApi,
   type ConversationDetail,
@@ -37,11 +36,18 @@ import {
   serverUnreachable,
   setKeymapEntry,
 } from './chatCache'
-import { Popup } from '../shared/ui'
 import { LATER_RELEASE } from '../shared/later'
 import { errorText } from '../shared/errorText'
-import { attachRefusal } from './commandBarModel'
-import type { ChatSeed, SeedDocument } from '../shared/types'
+import {
+  attachRefusal, bindLine, parseLine, proposalFrom, startedText,
+  type HuntAttachment, type HuntProposal, type LiveCommand,
+} from './commandBarModel'
+import { CaseRunBlock } from './ChatRun'
+import { useToast } from './toast'
+import { useNavigate } from 'react-router-dom'
+import type { ChatAgent, ChatSeed, SeedDocument } from '../shared/types'
+import { caseLabel } from '../shared/caseLabel'
+import { prettyHandle } from '../data/appData'
 
 type Role = 'user' | 'vigil' | 'error'
 interface ChatMsg {
@@ -49,45 +55,6 @@ interface ChatMsg {
   text: string
   /** What the model thought before answering, when it says. Kept for this session only. */
   reasoning?: string
-}
-
-interface SessionSummary {
-  total_interactions: number
-  total_cost_usd: number | null
-  unpriced_calls: number
-  total_input_tokens: number
-  total_output_tokens: number
-}
-
-function sessionSummaryFrom(s: Partial<SessionSummary>): SessionSummary {
-  return {
-    total_interactions: s.total_interactions ?? 0,
-    total_cost_usd: s.total_cost_usd ?? null,
-    unpriced_calls: s.unpriced_calls ?? 0,
-    total_input_tokens: s.total_input_tokens ?? 0,
-    total_output_tokens: s.total_output_tokens ?? 0,
-  }
-}
-interface TraceItem {
-  interaction_id: string
-  created_at?: string
-  has_thinking?: boolean
-  has_tools?: boolean
-  agent_id?: string
-  input_tokens?: number
-  output_tokens?: number
-  cost_usd?: number
-}
-interface TraceDetail {
-  interaction_id: string
-  model?: string
-  stop_reason?: string
-  duration_ms?: number
-  cost_usd?: number
-  thinking_content?: string
-  response_content?: string
-  tool_calls?: Array<{ name?: string; input?: unknown }>
-  tool_results?: Array<{ tool_use_id?: string; content?: unknown; is_error?: boolean }>
 }
 
 // randomUUID exists only in secure contexts (HTTPS or localhost); plain HTTP at a LAN address lacks it.
@@ -110,6 +77,8 @@ interface Conversation {
   /** the seed prompt, when opened from an "Investigate with Vigil" affordance;
    *  re-opening the same finding restores the thread instead of duplicating it */
   key?: string
+  /** the agent it runs under, so an offline reopen keeps it */
+  agent?: ChatAgent
 }
 
 interface HistRow {
@@ -127,7 +96,7 @@ function histTime(ts: number | null): string {
   return isNaN(d.getTime()) ? '' : format(d, 'HH:mm')
 }
 function histContext(caseId?: string | null, pageContext?: string | null): string {
-  if (caseId) return `Case ${caseId}`
+  if (caseId) return caseLabel(caseId)
   const titles = TITLES as Record<string, [string, string] | undefined>
   return (pageContext && titles[pageContext]?.[0]) || 'General'
 }
@@ -164,7 +133,25 @@ async function refusalOf(res: Response): Promise<string | null> {
 type ChatFile =
   | { status: 'reading'; name: string }
   | { status: 'refused'; name: string; reason: string }
-  | { status: 'ready'; name: string; text: string; pages: number; condensed: boolean; named: boolean }
+  | {
+      status: 'ready'; name: string; text: string; pages: number; condensed: boolean; named: boolean
+      /** The original, which a run started here keeps on its case; absent for a file handed over already read. */
+      file?: File
+      pasted?: boolean
+      /** The hypothesis the coverage check proposed for /hunt; null until asked. */
+      proposal: HuntProposal | null
+    }
+
+/** The dock's file as the command bar's attachment, so a run started here takes the bar's path. */
+function attachmentOf(file: ChatFile | null): HuntAttachment | null {
+  if (file?.status !== 'ready') return file
+  if (!file.file) return { status: 'refused', name: file.name, reason: `${file.name} came here without its original, which a run keeps on its case. Drop it on the dock to start a run with it.` }
+  return { status: 'ready', name: file.name, file: file.file, pasted: Boolean(file.pasted), pages: file.pages, condensed: file.condensed, text: file.text, proposal: file.proposal }
+}
+
+/** The commands the dock runs itself; anything else typed with a slash is asked as written. */
+const DOCK_COMMANDS = ['hunt', 'investigate']
+const NO_JIRA = { gap: null, projectKey: '' }
 
 interface CaseHit {
   id: string
@@ -199,22 +186,6 @@ function mentionToken(text: string): string | null {
 function dayLabel(ts: number | null): string {
   if (ts == null || Number.isNaN(ts)) return 'Undated'
   return format(new Date(ts), 'MMM d, yyyy')
-}
-
-function traceTime(s?: string): string {
-  if (!s) return '—'
-  const d = new Date(s)
-  return isNaN(d.getTime()) ? '—' : format(d, 'HH:mm:ss')
-}
-/* without throwing on cycles */
-function safeJson(v: unknown): string {
-  if (v == null) return ''
-  if (typeof v === 'string') return v
-  try {
-    return JSON.stringify(v, null, 2)
-  } catch {
-    return String(v)
-  }
 }
 
 /** What a chip reads, without its kind: an alert by its title, an explanation by its statement, a row by its step and source. */
@@ -274,13 +245,13 @@ function VigilMessage({
   reasoning,
   citations,
   onCite,
-  onTrace,
+  pinned,
 }: {
   text: string
   reasoning?: string
   citations?: readonly Citation[]
   onCite?: (cite: Citation) => void
-  onTrace?: () => void
+  pinned?: boolean
 }) {
   const copy = (
     <button title="Copy" onClick={() => navigator.clipboard?.writeText(text)}><Icon name="copy" size={15} /></button>
@@ -291,19 +262,16 @@ function VigilMessage({
       <AnswerText text={text} citations={citations} onCite={onCite} />
       <div className="msg-actions">
         {copy}
-        {onTrace && (
-          <button title="Reasoning trace" aria-label="Reasoning trace" onClick={onTrace}><Icon name="reason" size={15} /></button>
-        )}
       </div>
     </>
   )
-  return onTrace ? (
+  return pinned ? (
+    <div className="msg vigil">{content}</div>
+  ) : (
     <div className="msg vigil">
       <span className="msg-av"><VigilMark /></span>
       <div className="msg-main">{content}</div>
     </div>
-  ) : (
-    <div className="msg vigil">{content}</div>
   )
 }
 
@@ -386,11 +354,11 @@ export default function Chat({
   const [file, setFile] = useState<ChatFile | null>(null)
   const [dragging, setDragging] = useState(false)
   const fileSeq = useRef(0)
-  const [traceOpen, setTraceOpen] = useState(false)
-  const [traceLoading, setTraceLoading] = useState(false)
-  const [traceItems, setTraceItems] = useState<TraceItem[]>([])
-  const [traceSelected, setTraceSelected] = useState<TraceDetail | null>(null)
-  const [sessionSummary, setSessionSummary] = useState<SessionSummary | null>(null)
+  // a run starting from the composer, and a nudge for the run block to re-read the case
+  const [starting, setStarting] = useState(false)
+  const [runSeq, setRunSeq] = useState(0)
+  const { notify } = useToast()
+  const navigate = useNavigate()
 
   const sessionRef = useRef<string>(newSessionId())
   const bodyRef = useRef<HTMLDivElement>(null)
@@ -415,6 +383,22 @@ export default function Chat({
   }
   // true once this session id has a conversation row, so an @ attach can PATCH
   const persistedRef = useRef(false)
+  // The agent this conversation runs under: set only as a conversation starts, sent on every turn.
+  const [agent, setAgent] = useState<ChatAgent | null>(null)
+  const agentRef = useRef<ChatAgent | null>(null)
+  const rememberAgent = (next: ChatAgent | null) => {
+    agentRef.current = next
+    setAgent(next)
+  }
+  // A stored conversation keeps only the id: its name is read back, and the handle stands in until then.
+  const restoreAgent = (id: string | null | undefined) => {
+    if (!id) return rememberAgent(null)
+    rememberAgent({ id, name: prettyHandle(id) })
+    agentsApi.getAgent(id).then((res) => {
+      const name = (res.data as { name?: string } | undefined)?.name
+      if (name && agentRef.current?.id === id) rememberAgent({ id, name })
+    }).catch(() => { /* the handle stays */ })
+  }
 
   // Drop every other user's copy as soon as this dock knows who is signed in.
   // A new id without an unmount (session replaced in place) must not keep the
@@ -430,7 +414,7 @@ export default function Chat({
       sessionRef.current = newSessionId()
       currentKeyRef.current = null
       persistedRef.current = false
-      setSessionSummary(null)
+      rememberAgent(null)
       setHistoryOpen(false)
       dropFile()
     }
@@ -468,18 +452,15 @@ export default function Chat({
     root.querySelector<HTMLElement>(historyOpen ? '.chist-search input' : 'textarea')?.focus()
   }, [historyOpen, open, pinned, renamingId, serverConvos, history])
 
-  // the trace dialog owns its Esc + focus handling
-  const anyPopupOpen = traceOpen
   const full = size?.full ?? false
   const onFull = size?.onFull
 
-  // never while the trace Popup is open: it handles its own Esc, and closing
-  // the dock too would dismiss both at once. Esc steps back one layer: rename
-  // field, mention list, history view, full screen, then the dock.
+  // Esc steps back one layer: rename field, mention list, history view, full
+  // screen, then the dock.
   useEffect(() => {
     if (!open || pinned) return
     const onKey = (e: globalThis.KeyboardEvent) => {
-      if (e.key !== 'Escape' || anyPopupOpen || renamingId) return
+      if (e.key !== 'Escape' || renamingId) return
       if (historyOpen) setHistoryOpen(false)
       else if (mentionHits) setMentionHits(null)
       else if (full) {
@@ -491,11 +472,10 @@ export default function Chat({
     }
     document.addEventListener('keydown', onKey)
     return () => document.removeEventListener('keydown', onKey)
-  }, [open, pinned, mentionHits, onClose, anyPopupOpen, historyOpen, renamingId, full, onFull])
+  }, [open, pinned, mentionHits, onClose, historyOpen, renamingId, full, onFull])
 
-  // unless a Popup is up, which traps focus itself
   const onPanelKeyDown = (e: KeyboardEvent<HTMLElement>) => {
-    if (pinned || e.key !== 'Tab' || !open || anyPopupOpen) return
+    if (pinned || e.key !== 'Tab' || !open) return
     const root = panelRef.current
     if (!root) return
     const f = Array.from(
@@ -584,7 +564,7 @@ export default function Chat({
     setFile({ status: 'reading', name: picked.name })
     try {
       const { data } = await workflowApi.readHuntDocument(picked)
-      if (fileSeq.current === seq) setFile({ status: 'ready', name: picked.name, text: data.text, pages: data.pages, condensed: data.condensed, named: false })
+      if (fileSeq.current === seq) setFile({ status: 'ready', name: picked.name, text: data.text, pages: data.pages, condensed: data.condensed, named: false, file: picked, proposal: null })
     } catch (error) {
       if (fileSeq.current === seq) setFile({ status: 'refused', name: picked.name, reason: errorText(error, `${picked.name} could not be read`) })
     }
@@ -612,8 +592,102 @@ export default function Chat({
     setMentionHits(null)
   }
 
+  // /hunt and /investigate run as the command bar runs them, with the dock's file as the attachment
+  const typed = pinned ? null : parseLine(draft)
+  const command = typed?.kind === 'command' && DOCK_COMMANDS.includes(typed.command.id) ? typed : null
+  const attachment = attachmentOf(file)
+  const binding = command ? bindLine(command, null, { openCaseId: caseId || null, jira: NO_JIRA, attachment }) : null
+
+  // With no hypothesis typed, the coverage check proposes one from the file, as in the command bar.
+  const needsProposal = command?.command.id === 'hunt' && !command.word && file?.status === 'ready' && !!file.file && file.proposal === null
+  useEffect(() => {
+    if (!needsProposal || file?.status !== 'ready') return
+    const seq = fileSeq.current
+    const settle = (proposal: HuntProposal) => {
+      if (fileSeq.current === seq) setFile((now) => (now?.status === 'ready' ? { ...now, proposal } : now))
+    }
+    settle({ status: 'checking' })
+    workflowApi
+      .checkCoverage({ report: file.text })
+      .then((res) => settle(proposalFrom(res.data)))
+      .catch((error: unknown) => {
+        const status = (error as { response?: { status?: number } })?.response?.status
+        settle({
+          status: 'none',
+          reason: status === 400
+            ? 'Nothing in this document to propose a hypothesis from. Type one to hunt with it.'
+            : `A hypothesis could not be proposed: ${errorText(error, 'the coverage check failed')}`,
+        })
+      })
+    // the file is read once, when the proposal is first asked for
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [needsProposal])
+
+  const runCommand = async () => {
+    if (!command || binding?.state !== 'bound' || starting || loading) return
+    setStarting(true)
+    const sentSeq = fileSeq.current
+    const sentDraft = draft
+    // the conversation on screen at Enter; switching away while the run starts leaves the new one alone
+    const session = sessionRef.current
+    let started: string | null = null
+    try {
+      await (command.command as LiveCommand).run(binding.target, {
+        openCaseId: caseId || null,
+        jira: NO_JIRA,
+        attachment,
+        notify,
+        // the conversation follows the run's case once it has started; the drawer stays as it is
+        onOpenCase: (id) => { started = id },
+        onGo: (screen, options) => navigate(`/${screen}${options?.search ?? ''}`),
+        ask: () => false,
+        dropSent: () => { if (fileSeq.current === sentSeq) dropFile() },
+      })
+      setDraft((now) => (now === sentDraft ? '' : now))
+      if (started && sessionRef.current === session) {
+        applyCase(started)
+        setRunSeq((n) => n + 1)
+        // an ordinary turn on the case writes the conversation row, so a reload finds it and its run
+        void send(startedText(command.command as LiveCommand), { bare: true })
+      }
+    } catch (error) {
+      notify('err', errorText(error, 'Command failed'))
+    } finally {
+      setStarting(false)
+    }
+  }
+
+  /** A run started from the command bar: the dock follows its case, on a conversation of its own. */
+  const followCase = (id: string, text: string) => {
+    setRunSeq((n) => n + 1)
+    if (caseIdRef.current === id && messagesRef.current.length > 0) return
+    archiveCurrent()
+    sessionRef.current = newSessionId()
+    currentKeyRef.current = null
+    persistedRef.current = false
+    rememberCase(id)
+    rememberAgent(null)
+    dropFile()
+    void send(text, { fresh: true })
+  }
+
+  /** Opened from an agent: a new conversation under it, with a first question when one came along. */
+  const startUnder = (under: ChatAgent, text: string, document?: SeedDocument) => {
+    if (loading) return
+    setHistoryOpen(false)
+    archiveCurrent()
+    putMessages([])
+    sessionRef.current = newSessionId()
+    currentKeyRef.current = null
+    persistedRef.current = false
+    rememberCase(null)
+    rememberAgent(under)
+    dropFile()
+    if (text) void send(text, { fresh: true, document })
+  }
+
   // `document` is a file the command bar already read: it rides on this turn, whatever the dock holds
-  const send = async (override?: string, opts?: { fresh?: boolean; document?: SeedDocument }) => {
+  const send = async (override?: string, opts?: { fresh?: boolean; bare?: boolean; document?: SeedDocument }) => {
     const text = (override ?? draft).trim()
     if (!text) return
     // Hold the turn until the locked thread is the one on screen.
@@ -623,7 +697,7 @@ export default function Chat({
       return
     }
     // a fresh seed leaves the file behind, so a file still being read does not hold it
-    if (loading || (file?.status === 'reading' && !opts?.fresh && !opts?.document)) return
+    if (loading || (starting && !opts?.bare) || (file?.status === 'reading' && !opts?.fresh && !opts?.document)) return
     setHistoryOpen(false)
     const gen = turnGen.current
     localTurn.current = true
@@ -635,8 +709,9 @@ export default function Chat({
     // `fresh` keeps a new investigation's seed off an unrelated conversation
     const base = opts?.fresh ? [] : messagesRef.current
     // the turn a file first rides on names it, so the question reads right in history
-    const handed = opts?.document ? { status: 'ready' as const, ...opts.document, named: false } : null
-    const sentFile = handed ?? (file?.status === 'ready' && !opts?.fresh ? file : null)
+    const handed = opts?.document ? { status: 'ready' as const, ...opts.document, named: false, proposal: null } : null
+    // `bare`: a turn that follows a run started here, whose file the run already took
+    const sentFile = handed ?? (file?.status === 'ready' && !opts?.fresh && !opts?.bare ? file : null)
     const asked = sentFile && !sentFile.named ? `${text}\n\nAttached: ${sentFile.name}` : text
     if (handed) {
       // the handed file replaces the dock's; the case composer shows no chip, so it keeps none
@@ -666,6 +741,7 @@ export default function Chat({
         page_context?: string
         page_snapshot?: string
         case_id?: string
+        agent_id?: string
         document?: { name: string; text: string }
       } = {
         messages: askedOf(next).map((m) => ({ role: m.role === 'vigil' ? 'assistant' : 'user', content: m.text })),
@@ -675,6 +751,7 @@ export default function Chat({
       const snapshot = getPageSnapshot(pageKey)
       if (snapshot) payload.page_snapshot = snapshot
       if (sentCase !== null) payload.case_id = sentCase
+      if (agentRef.current) payload.agent_id = agentRef.current.id
       if (sentFile) payload.document = { name: sentFile.name, text: sentFile.text }
       const res = await streamFetch('/claude/chat/stream', {
         method: 'POST',
@@ -747,13 +824,6 @@ export default function Chat({
           summary: summary || 'Analysis complete',
         })
       }
-      // refresh the reasoning-trace summary for this session (best-effort)
-      reasoningApi
-        .getSessionSummary(sessionRef.current)
-        .then((s: Partial<SessionSummary> | null) =>
-          setSessionSummary(s ? sessionSummaryFrom(s) : null),
-        )
-        .catch(() => {})
     } catch (e) {
       const err = e as { name?: string; message?: string }
       if (err?.name !== 'AbortError' && gen === turnGen.current) {
@@ -797,6 +867,7 @@ export default function Chat({
       // the cache keeps what the server keeps: no reasoning
       messages: messages.map(({ role, text }) => ({ role, text })),
       key: currentKeyRef.current || undefined,
+      agent: agentRef.current ?? undefined,
     }
     setHistory((h) => {
       const next = [convo, ...h.filter((c) => c.id !== convo.id)].slice(0, CHAT_HISTORY_MAX)
@@ -814,8 +885,8 @@ export default function Chat({
     currentKeyRef.current = null
     persistedRef.current = false
     rememberCase(null)
+    rememberAgent(null)
     dropFile()
-    setSessionSummary(null)
     reloadHistory()
   }
 
@@ -837,8 +908,8 @@ export default function Chat({
       currentKeyRef.current = key ?? null
       persistedRef.current = true
       rememberCase(lockedCaseId ?? detail.case_id ?? null)
+      restoreAgent(detail.agent_id)
       dropFile()
-      setSessionSummary(null)
       return true
     } catch (error) {
       if (gen !== loadGen.current || (lockedCaseId && localTurn.current)) return false
@@ -852,8 +923,8 @@ export default function Chat({
         currentKeyRef.current = cached.key || key || null
         persistedRef.current = false
         rememberCase(lockedCaseId ?? null)
+        rememberAgent(cached.agent ?? null)
         dropFile()
-        setSessionSummary(null)
         return true
       }
       return false
@@ -895,35 +966,10 @@ export default function Chat({
     currentKeyRef.current = prompt
     persistedRef.current = false
     rememberCase(null)
+    rememberAgent(null)
     dropFile()
     setKeymapEntry(userId, prompt, sessionRef.current) // so re-opening this finding restores it
-    setSessionSummary(null)
     send(prompt, { fresh: true, document })
-  }
-
-  const openReasoningTrace = () => {
-    setTraceOpen(true)
-    setTraceLoading(true)
-    setTraceSelected(null)
-    const sid = sessionRef.current
-    reasoningApi
-      .listInteractions(sid, { limit: 200 })
-      .then((r: { interactions?: TraceItem[] }) => setTraceItems(r?.interactions || []))
-      .catch(() => setTraceItems([]))
-      .finally(() => setTraceLoading(false))
-    reasoningApi
-      .getSessionSummary(sid)
-      .then((s: Partial<SessionSummary> | null) =>
-        setSessionSummary(s ? sessionSummaryFrom(s) : null),
-      )
-      .catch(() => {})
-  }
-
-  const loadTraceInteraction = (interactionId: string) => {
-    reasoningApi
-      .getInteraction(sessionRef.current, interactionId)
-      .then((d: TraceDetail) => setTraceSelected(d))
-      .catch(() => {})
   }
 
   const deleteConversation = async (id: string) => {
@@ -949,8 +995,8 @@ export default function Chat({
       sessionRef.current = newSessionId()
       currentKeyRef.current = null
       persistedRef.current = false
-      setSessionSummary(null)
       if (!lockedCaseId) rememberCase(null)
+      rememberAgent(null)
       dropFile()
     }
   }
@@ -1002,6 +1048,7 @@ export default function Chat({
     currentKeyRef.current = null
     persistedRef.current = false
     rememberCase(lockedCaseId)
+    rememberAgent(null)
     let live = true
     const settle = () => {
       if (!live || gen !== loadGen.current) return
@@ -1053,11 +1100,15 @@ export default function Chat({
     if (!open || seed === seedRef.current) return
     if (loading && (!lockedCaseId || caseReady.current)) return
     seedRef.current = seed
-    if (!seed.text) {
+    if (seed.caseId && !pinned) {
+      followCase(seed.caseId, seed.text)
+    } else if (seed.agent && !pinned) {
+      startUnder(seed.agent, seed.text, seed.document)
+    } else if (!seed.text) {
       // a file with no question waits on the dock's chip for one
       if (seed.document && !pinned) {
         fileSeq.current += 1
-        setFile({ status: 'ready', ...seed.document, named: false })
+        setFile({ status: 'ready', ...seed.document, named: false, proposal: null })
       }
     } else if (lockedCaseId) {
       // append on this session; do not open a keymap investigation or clear the case
@@ -1096,7 +1147,8 @@ export default function Chat({
     }
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault()
-      send()
+      if (command) void runCommand()
+      else send()
     }
   }
 
@@ -1137,9 +1189,11 @@ export default function Chat({
             )}
           </div>
         ) : (
-          <VigilMessage key={i} text={m.text} reasoning={m.reasoning} citations={citations} onCite={onCite} onTrace={pinned ? undefined : openReasoningTrace} />
+          <VigilMessage key={i} text={m.text} reasoning={m.reasoning} citations={citations} onCite={onCite} pinned={pinned} />
         )
       )}
+      {/* read only while the dock is open: it polls the case */}
+      {!pinned && !lockedCaseId && open && caseId && <CaseRunBlock caseId={caseId} refresh={runSeq} />}
       {loading && (
         <div className="msg vigil">
           {!pinned && <span className="msg-av"><VigilMark /></span>}
@@ -1258,11 +1312,21 @@ export default function Chat({
               {pinned ? <Icon name="x2" size={15} /> : <span className="ci-stop" />}
             </button>
           ) : (
-            <button className="ci-send" title="Send" onClick={() => send()} disabled={!draft.trim() || file?.status === 'reading'}><Icon name="send" /></button>
+            <button
+              className="ci-send" title={command ? 'Run' : 'Send'}
+              onClick={() => (command ? void runCommand() : send())}
+              disabled={starting || (command ? binding?.state !== 'bound' : !draft.trim() || file?.status === 'reading')}
+            ><Icon name="send" /></button>
           )}
         </div>
       </div>
-      {!pinned && <div className="chat-hint">Saved privately to your history · @ attaches · drop a file · Enter sends</div>}
+      {!pinned && (binding ? (
+        <div className={`chat-hint${binding.state === 'bound' ? ' is-command' : ''}`} role="status">
+          {starting ? 'Starting…' : binding.state === 'bound' ? `${binding.line}${binding.note ? ` · ${binding.note}` : ''} · Enter runs` : binding.reason}
+        </div>
+      ) : (
+        <div className="chat-hint">Saved privately to your history · @ attaches · drop a file · /hunt or /investigate starts a run · Enter sends</div>
+      ))}
     </div>
   )
 
@@ -1449,6 +1513,7 @@ export default function Chat({
       <div className="chat-head">
         <span className="ch-ico"><VigilMark /></span>
         <h3 className="ch-title">Ask Vigil</h3>
+        {agent && <span className="ch-agent" title={`Runs under the ${agent.name} agent`}>{agent.name}</span>}
         <span className="ch-convo" title={convoTitle}>{convoTitle}</span>
         <div className="hbtns">
           <button
@@ -1504,85 +1569,6 @@ export default function Chat({
       )}
     </aside>
     )}
-
-    {/* Reasoning trace — per-interaction chain-of-thought for this session */}
-    <Popup open={traceOpen} onClose={() => setTraceOpen(false)} title="Reasoning trace" width={760}>
-      {sessionSummary && (
-        <div className="trace-sum">
-          {sessionSummary.total_interactions} call{sessionSummary.total_interactions === 1 ? '' : 's'}
-          {' · '}<Cost usd={sessionSummary.total_cost_usd} digits={4} />
-          {sessionSummary.unpriced_calls > 0 && (
-            <>{' · '}{sessionSummary.unpriced_calls.toLocaleString()} unpriced</>
-          )}
-          {' · '}{(sessionSummary.total_input_tokens + sessionSummary.total_output_tokens).toLocaleString()} tokens
-        </div>
-      )}
-      <div className="trace">
-        <div className="trace-list">
-          {traceLoading ? (
-            <div className="muted">Loading…</div>
-          ) : traceItems.length === 0 ? (
-            <div className="muted">No reasoning recorded for this conversation yet.</div>
-          ) : (
-            traceItems.map((it) => (
-              <button
-                key={it.interaction_id}
-                className={`trace-row${traceSelected?.interaction_id === it.interaction_id ? ' sel' : ''}`}
-                onClick={() => loadTraceInteraction(it.interaction_id)}
-              >
-                <span className="trace-row-top">
-                  <span>{traceTime(it.created_at)}</span>
-                  {it.has_thinking && <span className="trace-chip" title="Has thinking">💭</span>}
-                  {it.has_tools && <span className="trace-chip" title="Used tools">🔧</span>}
-                  <span className="trace-row-agent">{it.agent_id || 'chat'}</span>
-                </span>
-                <span className="trace-row-meta">
-                  {(it.input_tokens ?? 0).toLocaleString()} in · {(it.output_tokens ?? 0).toLocaleString()} out · <Cost usd={it.cost_usd} digits={4} />
-                </span>
-              </button>
-            ))
-          )}
-        </div>
-        <div className="trace-detail">
-          {!traceSelected ? (
-            <div className="muted">{traceItems.length ? 'Select an interaction to inspect its reasoning.' : ''}</div>
-          ) : (
-            <>
-              <div className="trace-meta">
-                <span>{traceSelected.model || '—'}</span>
-                {traceSelected.stop_reason && <span>· {traceSelected.stop_reason}</span>}
-                {typeof traceSelected.duration_ms === 'number' && <span>· {(traceSelected.duration_ms / 1000).toFixed(1)}s</span>}
-                <span>· <Cost usd={traceSelected.cost_usd} digits={4} /></span>
-              </div>
-              {traceSelected.thinking_content && (
-                <div className="trace-block thinking">
-                  <div className="trace-block-h">💭 Thinking</div>
-                  <div className="trace-block-b">{traceSelected.thinking_content}</div>
-                </div>
-              )}
-              {traceSelected.response_content && (
-                <div className="trace-block">
-                  <div className="trace-block-h">Response</div>
-                  <div className="trace-block-b"><Markdown>{traceSelected.response_content}</Markdown></div>
-                </div>
-              )}
-              {traceSelected.tool_calls?.map((tc, i) => (
-                <div key={`c${i}`} className="trace-block tool">
-                  <div className="trace-block-h">🔧 {tc.name || 'tool'}</div>
-                  <div className="trace-block-b mono">{safeJson(tc.input)}</div>
-                </div>
-              ))}
-              {traceSelected.tool_results?.map((tr, i) => (
-                <div key={`r${i}`} className={`trace-block ${tr.is_error ? 'err' : 'ok'}`}>
-                  <div className="trace-block-h">{tr.is_error ? 'Tool error' : 'Tool result'}</div>
-                  <div className="trace-block-b mono">{typeof tr.content === 'string' ? tr.content : safeJson(tr.content)}</div>
-                </div>
-              ))}
-            </>
-          )}
-        </div>
-      </div>
-    </Popup>
     </>
   )
 }

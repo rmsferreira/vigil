@@ -9,9 +9,11 @@
 // chmod its way out because it owns none of it. No network, credentials or
 // packages: the container is the boundary for those (network_mode: none).
 //
-// Runs as root with SETUID, SETGID and KILL only, as the MCP runner does.
+// Runs as root with SETUID, SETGID and KILL only, as the MCP runner does. Over TCP
+// (Helm) POST /run takes `Authorization: Bearer $SHELL_TOKEN`; a token that only
+// opens this shell, which no child ever sees.
 import { spawn } from "node:child_process";
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import { chmodSync, existsSync, unlinkSync } from "node:fs";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { constants } from "node:os";
@@ -30,6 +32,8 @@ const num = (name: string, fallback: number): number => {
 };
 
 const SOCKET = env["SHELL_SOCKET"] ?? "";
+// The backend's bearer in TCP mode (#4570). Socket mode leaves it to the socket's volume.
+const TOKEN = SOCKET ? "" : (env["SHELL_TOKEN"] ?? "");
 const PORT = num("SHELL_PORT", 6992);
 const WORK = env["SHELL_WORK_DIR"] ?? "/work";
 const POOL = num("SHELL_POOL", 8);
@@ -54,6 +58,8 @@ interface Ran {
   code: number;
   stdout: Buffer;
   stderr: Buffer;
+  // Every byte the command wrote to stdout, kept or not.
+  stdoutBytes: number;
   truncated: boolean;
   timedOut: boolean;
 }
@@ -125,7 +131,7 @@ function run(script: string, as: As): Promise<Ran> {
       clearTimeout(timer);
       child.stdout.destroy();
       child.stderr.destroy();
-      resolve({ code, stdout: Buffer.concat(out), stderr: Buffer.concat(err), truncated, timedOut });
+      resolve({ code, stdout: Buffer.concat(out), stderr: Buffer.concat(err), stdoutBytes: outBytes, truncated, timedOut });
     };
     // Not a served answer: the command never ran.
     child.on("error", (error) => {
@@ -144,6 +150,20 @@ function run(script: string, as: As): Promise<Ran> {
       });
     });
   });
+}
+
+// A cap can land inside a multi-byte character: drop its lead and continuation
+// bytes so decoding does not invent a U+FFFD the command never wrote. A buffer
+// short of its cap was not cut and is decoded as written.
+function whole(buf: Buffer, cap: number): Buffer {
+  if (buf.length < cap) return buf;
+  for (let back = 1; back <= Math.min(4, buf.length); back++) {
+    const byte = buf[buf.length - back]!;
+    if ((byte & 0xc0) === 0x80) continue; // continuation byte: keep walking back
+    const need = byte >= 0xf0 ? 4 : byte >= 0xe0 ? 3 : byte >= 0xc0 ? 2 : 1;
+    return need > back ? buf.subarray(0, buf.length - back) : buf;
+  }
+  return buf;
 }
 
 const OWNER = (slot: number) => ({ uid: UID_BASE + 2 * slot, gid: UID_BASE + 2 * slot, groups: [WORK_GID] });
@@ -171,8 +191,9 @@ async function execute(view: Buffer, command: string): Promise<Record<string, un
     });
     return {
       exit_code: ran.code,
-      stdout: ran.stdout.toString("utf8"),
-      stderr: ran.stderr.toString("utf8"),
+      stdout: whole(ran.stdout, STDOUT_CAP).toString("utf8"),
+      stderr: whole(ran.stderr, STDERR_CAP).toString("utf8"),
+      stdout_bytes: ran.stdoutBytes,
       truncated: ran.truncated,
       timed_out: ran.timedOut,
       timeout_ms: TIMEOUT_MS,
@@ -231,9 +252,25 @@ async function body(req: IncomingMessage): Promise<Buffer | null> {
   return Buffer.concat(chunks);
 }
 
+const digest = (value: string): Buffer => createHash("sha256").update(value).digest();
+const EXPECTED = digest(`Bearer ${TOKEN}`);
+
+// Digests, so the comparison takes the same time whatever length was presented.
+function authorised(req: IncomingMessage): boolean {
+  if (!TOKEN) return true;
+  if (timingSafeEqual(digest(req.headers.authorization ?? ""), EXPECTED)) return true;
+  log.warn("shell call refused", { reason: req.headers.authorization ? "wrong token" : "missing token" });
+  return false;
+}
+
 const server = createServer((req, res) => {
   if (req.method === "GET" && (req.url === "/healthz" || req.url === "/readyz")) return reply(res, 200, { ok: true, free: free.length });
   if (req.method !== "POST" || req.url !== "/run") return reply(res, 404, { error: "not found" });
+  // Before the body is read: an unauthenticated caller never gets a slot or a buffer.
+  if (!authorised(req)) {
+    res.setHeader("connection", "close"); // the unread body is not drained
+    return reply(res, 401, { error: "missing or wrong SHELL_TOKEN bearer" });
+  }
   void (async () => {
     // A client gone mid-upload must not take the process, and every call, with it.
     try {
@@ -261,6 +298,11 @@ const server = createServer((req, res) => {
 
 if (process.getuid?.() !== 0) {
   log.error("the shell runs as root to drop each call to its own uid; refusing to start");
+  process.exit(1);
+}
+
+if (!SOCKET && !TOKEN) {
+  log.error("SHELL_TOKEN is empty: TCP mode takes calls only with a bearer; refusing to start");
   process.exit(1);
 }
 

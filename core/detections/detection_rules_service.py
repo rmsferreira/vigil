@@ -1,8 +1,10 @@
 """
-Detection Rules Service - Manages detection rule sources (git repos, local directories).
+Detection Rules Service - Manages detection rule sources (rule libraries, local directories).
 
 Persists source metadata to ~/.vigil/detection_sources.json.
-Provides CRUD operations, git pull updates, and builds env vars for Security-Detections-MCP.
+Provides CRUD operations and builds env vars for Security-Detections-MCP. A git
+source is a rule library: its files are read and taken through
+``core.detections.rule_libraries``, which uses the skill reader's clone.
 """
 
 import json
@@ -17,7 +19,11 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from core.config import _safe_home, get_settings, vigil_path
-from core.detections.inventory.readers import OVERLAY_ID
+from core.detections.inventory.readers import (
+    FORMAT_SUFFIXES,
+    OVERLAY_ID,
+    rule_files,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -58,28 +64,21 @@ DEFAULT_SOURCES = [
     },
 ]
 
-# Names a git clone may take under base_dir (derived from the repo URL).
-_CLONE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
-# Remote git URLs only: network schemes or scp-style user@host:path. This keeps
-# git's command-running transports (ext::, fd::), local paths and option-like
-# strings out of `git clone`. The host never starts with '-'.
-_GIT_URL_RE = re.compile(
-    r"^(?:(?:https?|ssh|git)://(?:[^\s/@]+@)?[A-Za-z0-9\[][^\s/]*/\S+"
-    r"|[A-Za-z0-9_][\w.-]*@[A-Za-z0-9][\w.-]*:\S+)$"
+# A github.com ssh or scp URL, rewritten to https when a git source becomes a library.
+# A github.com URL in another form (ssh, scp, git, http), rewritten to https when a
+# git source becomes a library.
+_GITHUB_URL_RE = re.compile(
+    r"^(?:(?:ssh|git|http)://(?:[^@/\s]+@)?github\.com(?::\d+)?/"
+    r"|(?:[^@/\s]+@)?github\.com:)(?P<path>[^\s:]+?)/?$",
+    re.IGNORECASE,
 )
-_GIT_ALLOWED_PROTOCOLS = "http:https:ssh:git"
 
 LOCAL_ROOTS_ENV = "VIGIL_DETECTION_LOCAL_ROOTS"
 
 # File extensions per format
-FORMAT_EXTENSIONS = {
-    "sigma": [".yml"],
-    "splunk": [".yml"],
-    "elastic": [".toml"],
-    "kql": [".yaml", ".kql", ".md"],
-    "wazuh": [".xml"],
-    "auto": [".yml", ".yaml", ".toml", ".kql", ".md", ".xml"],
-}
+# One map of the files each format reads, owned by the readers, so a source's
+# rule count and the rules the inventory reads cannot disagree.
+FORMAT_EXTENSIONS = {fmt: list(suffixes) for fmt, suffixes in FORMAT_SUFFIXES.items()}
 
 # MCP env var name per format
 FORMAT_ENV_VARS = {
@@ -218,6 +217,107 @@ def read_deploy_target(fmt: str) -> Optional[Dict[str, Any]]:
         return _deploy_target_of(json.load(f).get("sources", []), fmt)
 
 
+def read_saved_sources() -> List[Dict[str, Any]]:
+    """The repository sources as last saved, without a rescan (not the overlay,
+    which is Vigil's own directory); raises when the file is unreadable."""
+    path = vigil_path(_CONFIG_FILENAME)
+    if not path.exists():
+        return []
+    with open(path, "r") as f:
+        sources = json.load(f).get("sources", [])
+    return [s for s in sources if s.get("id") != OVERLAY_ID]
+
+
+_MISSING_DIR = "Rules directory missing or outside the source"
+
+
+def _https_github(url: str) -> str:
+    """A github.com ssh, scp, git or http URL in https form; any other URL as it is."""
+    m = _GITHUB_URL_RE.match((url or "").strip())
+    if not m:
+        return url
+    path = m.group("path").removesuffix(".git")
+    return f"https://github.com/{path}.git"
+
+
+def _local_head(path: str) -> Optional[str]:
+    """The commit a clone on disk has checked out, read locally; None without one.
+
+    No network, and a minimal environment rather than the process's: only what
+    git needs to run, with no system or user config.
+    """
+    if not Path(path, ".git").exists():
+        return None
+    env = {
+        "PATH": os.environ.get("PATH", "/usr/bin:/bin"),  # noqa: ENV001
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_TERMINAL_PROMPT": "0",
+    }
+    try:
+        result = subprocess.run(
+            ["git", "-c", f"safe.directory={path}", "-C", path, "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            env=env,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    sha = result.stdout.strip()
+    return (
+        sha
+        if result.returncode == 0 and re.fullmatch(r"[0-9a-f]{40,64}", sha)
+        else None
+    )
+
+
+def _seed_health(sources: List[Dict[str, Any]]) -> None:
+    """A record for each ready or failed source that has none yet (a source
+    settled before Integration Health existed); existing records stay."""
+    from core.integrations import health
+
+    health.seed(
+        {
+            f"{health.DETECTION_PREFIX}{s['id']}": (
+                s["status"] == "ready",
+                _MISSING_DIR,
+                "config",
+            )
+            for s in sources
+            if s.get("id") != OVERLAY_ID and s.get("status") in ("ready", "error")
+        }
+    )
+
+
+def _record_health(
+    source: Dict[str, Any], error: Optional[BaseException] = None
+) -> None:
+    """Write a source's status to its Integration Health record: ready is a
+    success, error a failure, not_cloned no attempt yet."""
+    if source.get("id") == OVERLAY_ID:
+        return
+    from core.federation.error_kind import classify_failure
+    from core.integrations import health
+
+    source_id = f"{health.DETECTION_PREFIX}{source['id']}"
+    status = source.get("status")
+    if status == "ready":
+        health.record_collected(source_id)
+    elif status == "error":
+        if error is None:
+            health.record_failed(source_id, _MISSING_DIR, "config")
+        else:
+            # The class name only: a git error can quote the URL.
+            health.record_failed(
+                source_id,
+                f"Sync failed ({type(error).__name__})",
+                classify_failure(error),
+            )
+    elif status == "not_cloned":
+        health.reset(source_id)
+
+
 class DetectionRulesService:
     """Service for managing detection rule sources."""
 
@@ -241,7 +341,9 @@ class DetectionRulesService:
             except Exception as e:
                 logger.error(f"Error loading detection sources config: {e}")
             else:
-                if self._clear_stray_targets():
+                # Both run on every construction, in the API workers and the
+                # daemon alike: each writes only when something moved.
+                if self._as_libraries() | self._clear_stray_targets():
                     self._save_config()
                 # Outside the try: a rescan failure must not fall through to
                 # _seed_defaults, which would overwrite the user's sources.
@@ -254,9 +356,49 @@ class DetectionRulesService:
         logger.info("No detection sources config found, seeding defaults")
         self._seed_defaults()
 
+    def _as_libraries(self) -> bool:
+        """Make each git source saved before rule libraries existed a library.
+
+        A git entry with no ``commit`` key gets the commit its clone has checked
+        out (None when never cloned), an empty ``ref``, and a github.com ssh URL
+        in https form. Its id and local_path stay, so its rules keep their keys.
+        True when an entry changed; a second run changes nothing.
+        """
+        changed = False
+        for source in self.sources:
+            if source.get("type") != "git" or "commit" in source:
+                continue
+            source["git_url"] = _https_github(source.get("git_url") or "")
+            source["ref"] = ""
+            source["commit"] = _local_head(source.get("local_path") or "")
+            source.setdefault("imported_by", None)
+            source.setdefault("imported_at", None)
+            changed = True
+            logger.info(
+                "Detection source %r is a rule library at %s",
+                source.get("name"),
+                source["commit"],
+            )
+        return changed
+
     def reload(self):
         """Re-read the config file and rescan every source against disk."""
         self._load_config()
+
+    def refresh(self) -> None:
+        """Re-read the sources as saved, before a change is made and saved.
+
+        This instance may be long-lived (the API's) while another process, a
+        worker or an /mcp call, saved a library since; writing the older list
+        would drop it. An unreadable file keeps what this instance holds.
+        """
+        try:
+            with open(self.config_path, "r") as f:
+                sources = json.load(f).get("sources")
+        except (OSError, ValueError, AttributeError):
+            return
+        if isinstance(sources, list):
+            self.sources = sources
 
     def rescan_sources(self):
         """Re-derive status and rule_count for every source from what is on disk."""
@@ -289,12 +431,16 @@ class DetectionRulesService:
             )
             if status == "ready" and source.get("status") != "ready":
                 source["last_updated"] = datetime.now().isoformat()
+            moved = status != source.get("status")
             source["status"], source["rule_count"] = status, count
+            if moved:
+                _record_health(source)
             changed = True
         # Only write when something moved: this runs on every construction, and
         # the service is built in more than one process.
         if changed:
             self._save_config()
+        _seed_health(self.sources)
 
     def _seed_defaults(self):
         """Seed default sources based on existing repos on disk."""
@@ -332,9 +478,11 @@ class DetectionRulesService:
 
             self.sources.append(source)
 
+        self._as_libraries()
         self._save_config()
 
-    def _save_config(self):
+    def _save_config(self, strict: bool = False):
+        """Write the sources; ``strict`` raises a failed write instead of logging it."""
         # Resolved here, not in __init__: write=True creates the directory, and
         # this service is constructed on the API startup path (#695).
         self._keep_overlay()
@@ -343,6 +491,8 @@ class DetectionRulesService:
             with open(vigil_path(_CONFIG_FILENAME, write=True), "w") as f:
                 json.dump({"sources": self.sources, "version": 1}, f, indent=2)
         except Exception as e:
+            if strict:
+                raise
             logger.error(f"Error saving detection sources config: {e}")
 
     def _clear_stray_targets(self) -> bool:
@@ -424,11 +574,14 @@ class DetectionRulesService:
         if not target.exists():
             return 0
 
-        extensions = FORMAT_EXTENSIONS.get(fmt, FORMAT_EXTENSIONS["auto"])
-        count = 0
-        for ext in extensions:
-            count += len(list(target.rglob(f"*{ext}")))
-        return count
+        # The readers' own walk: .git skipped, each file once, the same
+        # suffixes the inventory reads. A count is a status read: an
+        # unreadable directory counts nothing rather than raising.
+        try:
+            return len(rule_files(target, fmt))
+        except OSError as exc:
+            logger.warning("Could not count rules under %s: %s", target, exc)
+            return 0
 
     def _contained(self, source: Dict, rel: str) -> Optional[str]:
         """``rel`` under the source's clone path, or None (logged) when a stored
@@ -528,39 +681,34 @@ class DetectionRulesService:
         """
         Add a new detection rule source.
 
+        A git repo is not added here: it is imported as a rule library
+        (``core.detections.rule_libraries``), at a commit someone read.
+
         Args:
             name: Display name for the source
-            source_type: 'git' or 'local'
-            format: 'sigma', 'splunk', 'elastic', 'kql', or 'auto'
-            url: Git repository URL (required for type='git')
-            path: Local directory path (required for type='local')
-            subdirectory: Subdirectory within the repo/path containing rules
+            source_type: 'local'
+            format: 'sigma', 'splunk', 'elastic', 'kql', 'wazuh' or 'auto'
+            url: Unused; kept for the request shape
+            path: Local directory path
+            subdirectory: Subdirectory within the path containing rules
             story_subdirectory: Subdirectory for Splunk stories (optional)
-            deploy_target: Where Vigil's live rules of this format go (git, splunk/elastic)
-            github_enterprise: The person says this non-github.com host is GitHub
-                Enterprise, so a deploy may send it the GitHub token
+            deploy_target: Refused: only a git library can be a deploy target
+            github_enterprise: Recorded with deploy_target
         """
         source_id = str(uuid.uuid4())[:8]
+        self.refresh()
 
         if source_type == "git":
-            if not url:
-                raise ValueError("Git URL is required for type 'git'")
-            # Derive clone name from URL
-            if not _GIT_URL_RE.match(url):
-                raise ValueError(
-                    "Git URL must be an http(s)://, ssh://, git:// or user@host:path URL"
-                )
-            clone_name = url.rstrip("/").split("/")[-1].replace(".git", "")
-            if not _CLONE_NAME_RE.match(clone_name):
-                raise ValueError(f"Cannot derive a clone directory from URL: {url}")
-            local_path = self._under(str(self.base_dir), clone_name)
-        elif source_type == "local":
-            if not path:
-                raise ValueError("Path is required for type 'local'")
-            local_path = self._local_root(path)
-            clone_name = Path(local_path).name
-        else:
+            raise ValueError(
+                "A git repo is imported, not added: use Import rules to read it "
+                "and pick its rules (POST /api/detection-rules/libraries/read)"
+            )
+        if source_type != "local":
             raise ValueError(f"Invalid source type: {source_type}")
+        if not path:
+            raise ValueError("Path is required for type 'local'")
+        local_path = self._local_root(path)
+        clone_name = Path(local_path).name
 
         # Reject subdirectories that climb out of the source before they are stored.
         self._under(local_path, subdirectory)
@@ -582,9 +730,7 @@ class DetectionRulesService:
             )
         if existing is not None:
             if not Path(local_path).exists():
-                if source_type != "git":
-                    raise ValueError(f"Local path does not exist: {local_path}")
-                self._git_clone(url, local_path)
+                raise ValueError(f"Local path does not exist: {local_path}")
             existing["rule_count"] = self._count_rules(
                 Path(local_path), format, subdirectory
             )
@@ -612,52 +758,27 @@ class DetectionRulesService:
             "local_path": local_path,
             "rule_count": 0,
             "last_updated": None,
-            "status": "not_cloned" if source_type == "git" else "unknown",
+            "status": "unknown",
             "deploy_target": bool(deploy_target),
             "github_enterprise": bool(github_enterprise),
         }
 
-        # If git, clone the repo
-        if source_type == "git":
-            clone_dir = Path(local_path)
-            if clone_dir.exists():
-                # Already cloned, just scan
-                source["status"] = "ready"
-                source["rule_count"] = self._count_rules(
-                    clone_dir, format, subdirectory
-                )
-                source["last_updated"] = datetime.now().isoformat()
-            else:
-                try:
-                    self._git_clone(url, local_path)
-                    source["status"] = "ready"
-                    source["rule_count"] = self._count_rules(
-                        clone_dir, format, subdirectory
-                    )
-                    source["last_updated"] = datetime.now().isoformat()
-                except Exception as e:
-                    source["status"] = "error"
-                    logger.error(f"Failed to clone {url}: {e}")
-                    raise
-        elif source_type == "local":
-            local_dir = Path(local_path)
-            if local_dir.exists():
-                source["status"] = "ready"
-                source["rule_count"] = self._count_rules(
-                    local_dir, format, subdirectory
-                )
-                source["last_updated"] = datetime.now().isoformat()
-            else:
-                source["status"] = "error"
-                raise ValueError(f"Local path does not exist: {local_path}")
+        local_dir = Path(local_path)
+        if not local_dir.exists():
+            raise ValueError(f"Local path does not exist: {local_path}")
+        source["status"] = "ready"
+        source["rule_count"] = self._count_rules(local_dir, format, subdirectory)
+        source["last_updated"] = datetime.now().isoformat()
 
         self.sources.append(source)
         self._save_config()
+        _record_health(source)
         logger.info(f"Added source: {name} ({source['rule_count']} rules)")
         return source
 
     def remove_source(self, source_id: str, delete_files: bool = False) -> bool:
         """Remove a rule source by ID."""
+        self.refresh()
         source = self.get_source(source_id)
         if not source:
             return False
@@ -716,6 +837,7 @@ class DetectionRulesService:
         ``github_enterprise``, when given with ``on``, records whether the person
         says the repo's non-github.com host is GitHub Enterprise.
         """
+        self.refresh()
         source = self.get_source(source_id)
         if not source:
             raise LookupError(f"Source not found: {source_id}")
@@ -736,20 +858,25 @@ class DetectionRulesService:
         """The git source marked to receive Vigil's live ``fmt`` rules, if any."""
         return _deploy_target_of(self.sources, fmt)
 
-    def update_source(self, source_id: str) -> Dict[str, Any]:
-        """Update a single source (git pull or rescan)."""
+    def update_source(
+        self, source_id: str, who: Optional[tuple] = None
+    ) -> Dict[str, Any]:
+        """Update a single source: a library takes its repo whole at the commit
+        read now; a local source is rescanned."""
+        self.refresh()
         source = self.get_source(source_id)
         if not source:
-            raise ValueError(f"Source not found: {source_id}")
+            raise LookupError(f"Source not found: {source_id}")
 
         if source["type"] == "git":
-            clone_dir = Path(source["local_path"])
-            if not clone_dir.exists():
-                # Not cloned yet, clone it
-                self._git_clone(source["git_url"], source["local_path"])
-            else:
-                # Git pull
-                self._git_pull(source["local_path"])
+            from core.detections import rule_libraries
+
+            try:
+                return rule_libraries.take_whole(self, source, who)
+            except Exception as e:
+                # The saved status is left alone; the failed sync is health.
+                _record_health({**source, "status": "error"}, e)
+                raise
 
         # Rescan rule count
         source["rule_count"] = self._count_rules(
@@ -758,15 +885,18 @@ class DetectionRulesService:
         source["last_updated"] = datetime.now().isoformat()
         source["status"] = "ready"
         self._save_config()
+        _record_health(source)
         logger.info(f"Updated source: {source['name']} ({source['rule_count']} rules)")
         return source
 
-    def update_all(self) -> List[Dict[str, Any]]:
-        """Update all sources."""
+    def update_all(self, who: Optional[tuple] = None) -> List[Dict[str, Any]]:
+        """Update all sources, one after another: the reader clones at most two
+        repos at once, so libraries are not taken in parallel. One that fails
+        is a row with its error; the rest still update."""
         results = []
-        for source in self.sources:
+        for source in list(self.sources):
             try:
-                updated = self.update_source(source["id"])
+                updated = self.update_source(source["id"], who)
                 results.append(
                     {
                         "id": source["id"],
@@ -865,43 +995,6 @@ class DetectionRulesService:
             env_vars["STORY_PATHS"] = ",".join(story_paths)
 
         return env_vars
-
-    # --- Git operations ---
-
-    def _git_clone(self, url: str, target_path: str):
-        """Clone a git repository with shallow depth."""
-        # Re-checked here: update_source clones from a URL read back from config.
-        if not _GIT_URL_RE.match(url):
-            raise ValueError(f"Refusing to clone unsupported git URL: {url}")
-        self.base_dir.mkdir(parents=True, exist_ok=True)
-        logger.info(f"Cloning {url} to {target_path}...")
-        # Overrides any protocol.<name>.allow in the host's git config.
-        env = dict(os.environ)  # noqa: ENV001 - child process env
-        env["GIT_ALLOW_PROTOCOL"] = _GIT_ALLOWED_PROTOCOLS
-        result = subprocess.run(
-            ["git", "clone", "--quiet", "--depth", "1", "--", url, target_path],
-            capture_output=True,
-            text=True,
-            timeout=300,
-            env=env,
-        )
-        if result.returncode != 0:
-            raise RuntimeError(f"Git clone failed: {result.stderr.strip()}")
-        logger.info(f"Successfully cloned {url}")
-
-    def _git_pull(self, repo_path: str):
-        """Pull latest changes in a git repository."""
-        logger.info(f"Pulling updates in {repo_path}...")
-        result = subprocess.run(
-            ["git", "pull", "--quiet"],
-            cwd=repo_path,
-            capture_output=True,
-            text=True,
-            timeout=120,
-        )
-        if result.returncode != 0:
-            raise RuntimeError(f"Git pull failed: {result.stderr.strip()}")
-        logger.info(f"Successfully pulled updates in {repo_path}")
 
 
 # Global singleton

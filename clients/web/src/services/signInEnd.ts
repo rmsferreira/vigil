@@ -51,13 +51,17 @@ const REASON_TEXT: Record<string, string> = {
   expiry: 'You were signed out because the sign-in ran out.',
   sign_in_limit: 'You were signed out because a newer sign-in took its place under the account’s sign-in limit.',
   account_changed: 'You were signed out because your role, password, email or sign-in methods changed.',
+  recovery: 'You were signed out because you signed in with a recovery code.',
+  mfa_reset: 'You were signed out because two-step sign-in was reset.',
   ended_by_person: 'You were signed out because this sign-in was ended from the sign-in list.',
   ended_by_admin: 'You were signed out because an admin ended this sign-in.',
   everyone_signed_out: 'You were signed out because every sign-in was ended.',
   deactivated: 'You were signed out because the account was deactivated or deleted.',
   token_reuse: 'You were signed out because a sign-in token was used twice.',
   too_many_confirmations: 'You were signed out because confirming it was you failed three times in a row.',
+  restore: 'You were signed out because a restore ended every sign-in.',
   sign_out: 'You signed out from another tab or device.',
+  sso_required: 'You were signed out because your organization now signs in with SSO.',
 }
 
 export function endReasonText(reason: string | null): string {

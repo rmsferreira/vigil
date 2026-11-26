@@ -3,35 +3,56 @@
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import json
 import logging
 from contextlib import nullcontext
 from dataclasses import asdict
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Callable, Dict, Optional, Tuple
 
 from core.agents.attribution import current_claims
 from core.agents.mcp_tools import MCPFailure
 from core.agents.projections import pack_completed_hunts, read_replay
 from core.auth.permissions import APPROVE_PERMISSION, permission_refusal
+from core.cases.agent_closure import actor, service_session, title_edited_activities
+from core.cases.assignee import OwnerNotReader, require_owner_reads
+from core.cases.case_handoff import (
+    OwnerCannotWrite,
+    OwnerOffTeam,
+    assignee_needs_assign,
+    newly_set_owner,
+    require_case_owner_on_team,
+    require_owner_can_write,
+    require_owner_on_team,
+)
 from core.cases.case_sla_service import open_case
 from core.cases.case_status import (
     CASE_STATUSES,
+    CLOSED,
     CaseStatus,
+    StatusChange,
     record_status_change,
     status_change,
+)
+from core.cases.closure import (
+    ClosedByKind,
+    FalsePositiveCause,
+    false_positive_cause_value,
 )
 from core.cases.linked_entities import finding_entity_summary
 from core.detections.inventory.catalog import rule_for_finding
 from core.findings.anomaly_score import stored_anomaly_score
+from core.integrations.mcp.surface import current_caller
 from core.llm.tool_schemas import ALL_TOOLS as BACKEND_TOOLS
-from core.llm.tool_schemas import (
-    CALL_INTEGRATION_TOOL,
-    FIND_INTEGRATION_TOOLS,
-    INTEGRATION_TOOLS,
-)
+from core.llm.tool_schemas import FIND_INTEGRATION_TOOLS, INTEGRATION_TOOLS
 from core.memory.recall_contract import RECALL_TOOL
+from core.skills.skill_hold import agent_skills
 from core.skills.skill_library import READ_SKILL_TOOL, read_skill
+from core.storage.models import Finding
+from core.teams import default_team
+from core.workflows.workflow_run_service import run_unreadable
 
 if TYPE_CHECKING:
     from core.integrations.mcp.registry import MCPRegistry
@@ -46,7 +67,13 @@ MANIFEST: Dict[str, Dict[str, Any]] = {
 
 Args = Dict[str, Any]
 
-# Every chat tool names the permission execute_backend_tool checks. A run no
+# The run-start fact read (#4742): a backend tool in no catalogue, see _entity_facts.
+FACTS_TOOL = "read_entity_facts"
+# The site proposal's save (#5229): core/site_proposal.py; not on /mcp.
+SITE_PROPOSAL_TOOL = "save_site_proposal"
+
+# Every chat tool names the permission execute_backend_tool checks, except
+# call_integration_tool: it is checked as the tool it names. A run no
 # person started is bound by its run claims and holds no role: the autonomy
 # ceiling governs it at invoke. A caller bound to nothing is refused.
 TOOL_PERMISSIONS: Dict[str, str] = {
@@ -55,6 +82,7 @@ TOOL_PERMISSIONS: Dict[str, str] = {
     "identify_gaps": "detections.read",
     "get_coverage_stats": "detections.read",
     "detection_metrics": "detections.read",
+    "emulate_next": "detections.read",
     "get_detection_count": "detections.read",
     "lint_detections": "detections.read",
     "check_detection_candidate": "detections.read",
@@ -62,6 +90,7 @@ TOOL_PERMISSIONS: Dict[str, str] = {
     "detection_rule_exception": "detections.write",
     "reconstruct_run": "detections.read",
     "link_detection_rule": "detections.write",
+    SITE_PROPOSAL_TOOL: "ai_chat.use",
     "list_findings": "findings.read",
     "search_findings": "findings.read",
     "get_findings_stats": "findings.read",
@@ -72,6 +101,8 @@ TOOL_PERMISSIONS: Dict[str, str] = {
     "create_case": "cases.write",
     "add_finding_to_case": "cases.write",
     "update_case": "cases.write",
+    "restrict_case": "cases.write",
+    "change_case_readers": "cases.write",
     "add_resolution_step": "cases.write",
     "list_completed_hunts": "automation.read",
     "replay_hunt": "automation.read",
@@ -84,12 +115,12 @@ TOOL_PERMISSIONS: Dict[str, str] = {
     "lookup_indicators": "findings.read",
     "propose_feed_hunts": "findings.read",
     RECALL_TOOL: "automation.read",
+    FACTS_TOOL: "automation.read",
     "check_hunt_coverage": "automation.read",
     "list_learning_episodes": "automation.read",
     "export_learning_episodes": "automation.read",
     READ_SKILL_TOOL: "automation.read",
     FIND_INTEGRATION_TOOLS: "integrations.read",
-    CALL_INTEGRATION_TOOL: "integrations.write",
 }
 
 
@@ -217,6 +248,7 @@ def list_findings(
         "state": state,
         "cluster_id": cluster_id,
         "min_anomaly_score": min_anomaly_score,
+        "exclusions": "hide",
     }
     limit = _page_limit(limit)
     data = _data()
@@ -230,17 +262,27 @@ def list_findings(
     )
     return {
         "total": total,
+        **_excluded_note(data, filters, total),
         **_page(data, findings, offset=offset, limit=limit, total=total),
     }
 
 
+def _excluded_note(data: Any, filters: Args, shown: int) -> Args:
+    """How many matches name an analyst-excluded IP. Those are left out of the
+    page and the counts, as the analysts' own queue leaves them out, and only
+    counted here so the agent knows they exist."""
+    hidden = data.count_findings(**{**filters, "exclusions": "include"}) - shown
+    return {"excluded_ip_findings": hidden} if hidden > 0 else {}
+
+
 # The counts cover every match, not the page, and come before it so a capped
-# result keeps them (#2312).
+# result keeps them (#2312). Findings on an excluded IP are left out of both.
 def search_findings(**args: Any) -> Args:
     filters = {key: args.get(key) for key in ("severity", "data_source", "state")}
     if (bad := _bad_state(filters["state"])) is not None:
         return bad
     filters["search_query"] = args.get("query", "")
+    filters["exclusions"] = "hide"
     limit = _page_limit(args.get("limit", 20))
     offset = args.get("offset", 0)
     data = _data()
@@ -256,20 +298,27 @@ def search_findings(**args: Any) -> Args:
     return {
         "query": filters["search_query"],
         "total": total,
+        **_excluded_note(data, filters, total),
         **counts,
         **_page(data, findings, offset=offset, limit=limit, total=total),
     }
 
 
+# Counted as list_findings and search_findings count: excluded-IP findings out.
 def get_findings_stats(**_args: Any) -> Args:
-    summary = _data().get_findings_summary()
-    return {"total_findings": summary.pop("total"), **summary}
+    data = _data()
+    summary = data.get_findings_summary(exclusions="hide")
+    total = summary.pop("total")
+    return {"total_findings": total, **summary, **_excluded_note(data, {}, total)}
 
 
 # What an agent reads of one finding (#3276): the small fields and the stored
 # triage first, entity_context last, its flow preview cut to a sample, so the
 # rendered result fits result_cap. The REST endpoints still serve it whole.
+# records_offset pages through the stored records, SAMPLE_RECORDS at a time, a
+# page stopping early once its compact JSON passes RECORDS_CHARS (#4916).
 SAMPLE_RECORDS = 5
+RECORDS_CHARS = 8_000
 SAMPLE_RAW_TEXT = 2_000
 SAMPLE_PORT_RANGES = 16
 _HEAD = (
@@ -296,16 +345,50 @@ _TRIAGE_KEYS = (
 )
 
 
-def get_finding(*, finding_id: str) -> Any:
+# FindingSchema drops these. The frozen finding response stays without them;
+# the agent read puts the columns back on the dict it already returns.
+_NOISE_FIELDS = (
+    "noise_marked_at",
+    "noise_marked_by",
+    "noise_marked_by_kind",
+    "noise_reason",
+    "noise_cause",
+)
+
+
+def _iso_utc(value: Any) -> Any:
+    if not isinstance(value, datetime):
+        return value
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.isoformat()
+
+
+def _attach_noise(shaped: Args, finding_id: str) -> None:
+    with service_session() as session:
+        row = session.get(Finding, finding_id)
+        if row is None:
+            return
+        for key in _NOISE_FIELDS:
+            shaped[key] = _iso_utc(getattr(row, key))
+
+
+def get_finding(*, finding_id: str, records_offset: Any = 0) -> Any:
     finding = _data().get_finding(finding_id)
     if not isinstance(finding, dict):
         return finding
-    shaped = _for_agent(finding)
+    try:
+        records_offset = max(int(records_offset or 0), 0)
+    except (TypeError, ValueError):
+        records_offset = 0
+    shaped = _for_agent(finding, records_offset)
     shaped["detection_rule"] = rule_for_finding(finding)
+    if _data().is_using_database():
+        _attach_noise(shaped, finding_id)
     return shaped
 
 
-def _for_agent(finding: Args) -> Args:
+def _for_agent(finding: Args, records_offset: int = 0) -> Args:
     enrichment = finding.get("ai_enrichment")
     enrichment = dict(enrichment) if isinstance(enrichment, dict) else enrichment
     shaped: Args = {key: finding.get(key) for key in _HEAD if key in finding}
@@ -320,7 +403,9 @@ def _for_agent(finding: Args) -> Args:
     if enrichment:
         shaped["ai_enrichment"] = enrichment
     if "entity_context" in finding:
-        shaped["entity_context"] = _sampled_context(finding["entity_context"])
+        shaped["entity_context"] = _sampled_context(
+            finding["entity_context"], records_offset
+        )
     return shaped
 
 
@@ -344,7 +429,23 @@ def _triage(enrichment: Args) -> Optional[Args]:
     return triage or None
 
 
-def _sampled_context(context: Any) -> Any:
+def _records_page(records: list, offset: int) -> Tuple[list, str]:
+    page, used = [], 0
+    for record in records[offset : offset + SAMPLE_RECORDS]:
+        used += len(_compact_json(record)) + 1
+        if page and used > RECORDS_CHARS:
+            break
+        page.append(record)
+    total, end = len(records), offset + len(page)
+    if not page:
+        return page, f"none: records_offset {offset} is past the {total} stored"
+    shown = f"records {offset + 1}-{end} of the {total} stored; "
+    if end < total:
+        return page, shown + f"has_more, next_offset {end}: pass records_offset={end}"
+    return page, shown + "none remain"
+
+
+def _sampled_context(context: Any, records_offset: int = 0) -> Any:
     if not isinstance(context, dict):
         return context
     context = dict(context)
@@ -352,14 +453,16 @@ def _sampled_context(context: Any) -> Any:
     if isinstance(evidence, dict):
         evidence = dict(evidence)
         records = evidence.get("records")
-        if isinstance(records, list) and len(records) > SAMPLE_RECORDS:
-            evidence["records"] = records[:SAMPLE_RECORDS]
-            evidence["records_shown"] = (
-                f"{SAMPLE_RECORDS} of the {len(records)} stored; "
-                "netflow_digest counts every flow"
-                if "netflow_digest" in context
-                else f"{SAMPLE_RECORDS} of the {len(records)} stored"
-            )
+        if isinstance(records, list):
+            page, shown = _records_page(records, records_offset)
+            # Labelled only when the page is not every record.
+            if len(page) < len(records):
+                evidence["records"] = page
+                evidence["records_shown"] = (
+                    f"{shown}; netflow_digest counts every flow"
+                    if "netflow_digest" in context
+                    else shown
+                )
         raw = evidence.get("raw_text")
         if isinstance(raw, str) and len(raw) > SAMPLE_RAW_TEXT:
             evidence["raw_text"] = raw[:SAMPLE_RAW_TEXT]
@@ -386,17 +489,24 @@ def _sampled_context(context: Any) -> Any:
 
 # A dismissal is the finding's terminal state. The actor is the caller and the
 # kind is agent, as with a status edit that closes a case; the reason is what makes it a record.
-def dismiss_finding(*, finding_id: str, reason: str) -> Args:
+def dismiss_finding(
+    *, finding_id: str, reason: str, noise_cause: Optional[str] = None
+) -> Args:
     if refusal := permission_refusal("findings.write"):
         return refusal
     from core.cases.agent_closure import actor, service_session
-    from core.cases.closure import ClosedByKind
-    from core.storage.models import Finding
     from core.time import utcnow
 
     reason = (reason or "").strip()
     if not reason:
         return {"error": "A reason is required to dismiss a finding"}
+    try:
+        cause = false_positive_cause_value(noise_cause)
+    except ValueError:
+        return {
+            "error": f"{noise_cause!r} is not a false-positive cause",
+            "causes": [member.value for member in FalsePositiveCause],
+        }
     with service_session() as session:
         finding = session.get(Finding, finding_id)
         if finding is None:
@@ -405,12 +515,14 @@ def dismiss_finding(*, finding_id: str, reason: str) -> Args:
         finding.noise_marked_by = actor()
         finding.noise_marked_by_kind = ClosedByKind.AGENT.value
         finding.noise_reason = reason
+        finding.noise_cause = cause
         return {
             "success": True,
             "finding_id": finding_id,
             "noise_marked_by": finding.noise_marked_by,
             "noise_marked_by_kind": finding.noise_marked_by_kind,
             "noise_reason": reason,
+            "noise_cause": cause,
         }
 
 
@@ -425,11 +537,24 @@ def list_cases(
     # filters, and the cap, run in SQL. Two different priorities match nothing.
     if severity and priority and severity != priority:
         return []
-    return _data().get_cases(limit=limit, status=status, priority=priority or severity)
+    cases = _data().get_cases(limit=limit, status=status, priority=priority or severity)
+    return _with_owner_state([dict(case) for case in cases])
 
 
 def get_case(*, case_id: str) -> Any:
-    return _data().get_case(case_id)
+    case = _data().get_case(case_id)
+    return _with_owner_state([dict(case)])[0] if case else case
+
+
+def _with_owner_state(cases: list) -> list:
+    """Copies of ``cases`` with ``owner_state``, from one lookup. Demo has no accounts."""
+    from core.cases.agent_closure import service_session
+    from core.cases.assignee import with_owner_state
+
+    if not _data().is_using_database():
+        return with_owner_state(None, cases)
+    with service_session() as session:
+        return with_owner_state(session, cases)
 
 
 def _status_refusal(status: str) -> Optional[Args]:
@@ -438,6 +563,40 @@ def _status_refusal(status: str) -> Optional[Args]:
     return {
         "error": f"Unknown case status {status!r}; use one of {list(CASE_STATUSES)}"
     }
+
+
+def held_close(
+    case_id: Optional[str] = None,
+    *,
+    finding_ids: Optional[list] = None,
+    left_open: bool = True,
+) -> Optional[Args]:
+    """The refusal when autonomy holds a model's close (#4819), else None.
+
+    The run is the bound one, never an argument; none (an /mcp caller) or one
+    with no workflow (chat) follows the fleet. The case's findings, or for a
+    case not yet opened those ``finding_ids`` names, are checked for a declared
+    crown jewel (#5227). A held close of an existing case leaves a "Left open
+    for a person" activity, unless ``left_open`` is False, and writes nothing else.
+    """
+    from core.cases import case_journal_service
+    from core.response.ceiling import close_held, finding_keys
+
+    claims = current_claims()
+    run_id = claims.run_id if claims else None
+    held = close_held(
+        run_id,
+        lambda: finding_keys(case_id=case_id, finding_ids=finding_ids or ()),
+    )
+    if not held:
+        return None
+    message = f"Left open for a person: {held}"
+    if case_id and left_open:
+        details = {"reason": held, **({"run_id": run_id} if run_id else {})}
+        case_journal_service.append_activity(
+            _data(), case_id, "case_left_open", message, details
+        )
+    return {"error": message}
 
 
 def _resolve_assignee(
@@ -471,11 +630,26 @@ def create_case(
         return refusal
     if refusal := _status_refusal(status):
         return refusal
+    # Before the case is opened, so a held close leaves no case behind.
+    closing = status == CLOSED
+    if closing and (refusal := held_close(finding_ids=finding_ids)):
+        return refusal
+    # A stated owner, including a clear, stands over the closer (#4983).
+    named_owner = assignee is not None
     if assignee is not None:
         # Before the case is opened, so a refusal leaves no case behind.
         assignee, refusal = _resolve_assignee(assignee)
         if refusal:
             return refusal
+        if assignee:
+            try:
+                with service_session() as session:
+                    require_owner_can_write(session, assignee)
+                    # Before the insert, against the team the insert will use.
+                    team = default_team(session)
+                    require_owner_on_team(session, assignee, team.team_id, "{case_id}")
+            except (OwnerCannotWrite, OwnerOffTeam) as exc:
+                return {"error": exc.message, "code": exc.code}
     data = _data()
     ids = finding_ids or []
     case = open_case(
@@ -484,14 +658,30 @@ def create_case(
         finding_ids=ids,
         priority=priority or severity or "medium",
         description=description,
-        status=status,
+        # A closed case is opened, then closed, so it gets its closure row.
+        status="new" if closing else status,
+        assignee=assignee,
     )
     if not case:
         return {"error": "Failed to create case"}
-    # assignee and tags are edits, applied after the case exists.
+    if closing:
+        try:
+            with service_session() as session:
+                record_status_change(
+                    session,
+                    case["case_id"],
+                    StatusChange.CLOSE,
+                    closed_by=actor(),
+                    by_model=True,
+                    take_ownership=not named_owner,
+                )
+        except Exception:  # noqa: BLE001 — no open case left behind for a retry
+            logger.exception("could not close new case %s", case["case_id"])
+            data.delete_case(case["case_id"])
+            return {"error": "Failed to create case"}
+        case = data.get_case(case["case_id"]) or case
+    # Tags are an edit after the case exists. The owner is on the creation entry.
     edits: Args = {}
-    if assignee is not None:
-        edits["assignee"] = assignee
     if tags:
         edits["tags"] = tags
     if edits:
@@ -520,17 +710,24 @@ def update_case(
         return refusal
     if status is not None and (refusal := _status_refusal(status)):
         return refusal
-    from core.cases.agent_closure import actor, service_session
     from core.time import utcnow
 
     data = _data()
     case = data.get_case(case_id)
     if not case:
         return {"error": f"Case {case_id} not found"}
+    change = status_change(case.get("status"), status)
+    # Before anything is written, so a held close leaves the case as it was.
+    if change is StatusChange.CLOSE and (refusal := held_close(case_id)):
+        return refusal
 
     updates: Args = {}
     if title:
         updates["title"] = title
+        # Marked only when a principal stands behind the call (chat, /mcp): a run's
+        # own agent renaming the case must not hold off the run's retitle.
+        if current_caller() and (edited := title_edited_activities(case, title)):
+            updates["activities"] = edited
     if description:
         updates["description"] = description
     if status is not None:
@@ -538,20 +735,44 @@ def update_case(
     if priority:
         updates["priority"] = priority
     if assignee is not None:
-        if refusal := permission_refusal("cases.assign"):
-            return refusal
         # Blank unassigns; re-sending the stored value keeps it.
-        updates["assignee"], refusal = _resolve_assignee(
-            assignee, current=case.get("assignee")
-        )
+        stored_owner = case.get("assignee")
+        updates["assignee"], refusal = _resolve_assignee(assignee, current=stored_owner)
         if refusal:
             return refusal
+        new_owner = updates["assignee"]
+        if assignee_needs_assign(stored_owner, new_owner, actor()):
+            if refusal := permission_refusal("cases.assign"):
+                return refusal
+        if named := newly_set_owner(stored_owner, new_owner):
+            try:
+                with service_session() as session:
+                    require_owner_can_write(session, named)
+                    require_case_owner_on_team(session, case, named, case_id)
+                    require_owner_reads(session, case, named)
+            except (OwnerCannotWrite, OwnerOffTeam, OwnerNotReader) as exc:
+                return {"error": exc.message, "code": exc.code}
     if add_note:
         notes = list(case.get("notes") or [])
         notes.append({"timestamp": utcnow().isoformat() + "Z", "content": add_note})
         updates["notes"] = notes
 
-    change = status_change(case.get("status"), status)
+    # Open work keeps a current owner or none, refused before anything is
+    # written. Demo mode has no accounts to judge against.
+    from core.cases.assignee import OwnerNotCurrent, require_current_owner
+
+    owner = updates["assignee"] if "assignee" in updates else case.get("assignee")
+    if data.is_using_database():
+        try:
+            with service_session() as session:
+                require_current_owner(
+                    session,
+                    owner,
+                    is_open=updates.get("status", case.get("status")) != CLOSED,
+                )
+        except OwnerNotCurrent as exc:
+            return {"error": exc.message, "code": exc.code}
+
     # The write and a close share one session, so a refused close leaves the
     # case as it was. A write with no close owns its own session.
     with service_session() if change else nullcontext() as session:
@@ -563,8 +784,130 @@ def update_case(
                 case_id,
                 change,
                 closed_by=actor(),
+                by_model=change is StatusChange.CLOSE,
+                take_ownership=assignee is None,
             )
     return {"success": True, "case_id": case_id}
+
+
+# Restricting a case and removing readers (#4358). Both narrow, so any caller
+# holding cases.write may; widening (adding a reader, lifting) is a person's own
+# act in the console and is refused here by case_readers itself. A case the
+# caller can't read is not found.
+PERSON_IN_CONSOLE = "A person must do this in the console"
+
+
+def _restricter(session: Any) -> Any:
+    """Never a person acting directly. A chat turn or run acts for its bound person
+    (none when unattended); an MCP caller for its credential's person, or as
+    itself when that is a service account."""
+    from core.auth import principals
+    from core.cases.agent_closure import principal_for_username
+    from core.cases.case_readers import Restricter
+    from core.integrations.mcp.surface import current_caller
+    from core.storage.models import Principal
+
+    claims = current_claims()
+    if claims is not None:
+        return Restricter(principal_id=None, for_person=claims.person_id)
+    caller = current_caller()
+    principal = principal_for_username(session, caller) if caller else None
+    row = session.get(Principal, principal) if principal else None
+    if row is not None and row.kind == principals.SERVICE_ACCOUNT:
+        return Restricter(principal_id=principal, service_account=True)
+    return Restricter(principal_id=None, for_person=principal)
+
+
+def _named(session: Any, names: Optional[list]) -> Optional[list]:
+    """Principal ids for usernames or ids; one that names nobody is passed on as
+    sent, for case_readers to refuse."""
+    from core.cases.agent_closure import principal_for_username
+    from core.storage.models import Principal
+
+    if names is None:
+        return None
+    ids = []
+    for name in names:
+        text = str(name or "").strip()
+        if text and session.get(Principal, text) is None:
+            text = principal_for_username(session, text) or text
+        ids.append(text)
+    return ids
+
+
+def _change_readers(case_id: str, change: Callable[[Any, Any, Any], Any]) -> Args:
+    from core.auth.permissions import may_read_case
+    from core.cases.case_readers import ReadersRefused
+    from core.storage.models import Case
+
+    if not _data().is_using_database():
+        return {"error": "Demo cases can't be restricted"}
+    try:
+        with service_session() as session:
+            case = session.get(Case, case_id, with_for_update=True)
+            if case is None or not may_read_case(case):
+                return {"error": f"Case {case_id} not found"}
+            readers = change(session, case, _restricter(session))
+            teams = list(case.reader_team_ids or [])
+    except ReadersRefused as exc:
+        # Chat and MCP have no direct person: say where it can be done.
+        message = exc.message
+        if message.startswith("A person must do this"):
+            message = message.replace("A person must do this", PERSON_IN_CONSOLE, 1)
+        return {"error": message, "code": exc.code}
+    return {
+        "success": True,
+        "case_id": case_id,
+        "readers": readers,
+        "reader_teams": teams,
+    }
+
+
+def restrict_case(
+    *, case_id: str, readers: Optional[list] = None, reader_teams: Optional[list] = None
+) -> Args:
+    if refusal := permission_refusal("cases.write"):
+        return refusal
+    from core.cases import case_readers
+
+    def change(session: Any, case: Any, actor: Any) -> Any:
+        # An unattended run names nobody of its own: only the defaults, then removals.
+        if readers is not None and actor.principal_id is None and not actor.for_person:
+            raise case_readers.ReadersRefused(
+                "A run no person started names no reader: restrict without a "
+                "list (the owner and task assignees), then remove names"
+            )
+        return case_readers.restrict(
+            session, case, _named(session, readers), actor, reader_teams
+        )
+
+    return _change_readers(case_id, change)
+
+
+def change_case_readers(
+    *,
+    case_id: str,
+    remove: Optional[list] = None,
+    add: Optional[list] = None,
+    remove_teams: Optional[list] = None,
+    add_teams: Optional[list] = None,
+) -> Args:
+    if refusal := permission_refusal("cases.write"):
+        return refusal
+    from core.cases import case_readers
+
+    return _change_readers(
+        case_id,
+        lambda session, case, actor: case_readers.change_readers(
+            session,
+            case,
+            actor,
+            add=_named(session, add) or (),
+            remove=_named(session, remove) or (),
+            add_teams=add_teams or (),
+            remove_teams=remove_teams or (),
+        ),
+    )
 
 
 # One read-only bash command over a case's view, run in the agent-shell sidecar
@@ -576,7 +919,7 @@ async def _read_case_shell(args: Args) -> Args:
 
     import httpx
 
-    from core.cases.case_view import render_case_view, shell_address
+    from core.cases.case_view import render_case_view, shell_address, shell_token
 
     case_id = str(args.get("case_id") or "")
     command = str(args.get("command") or "")
@@ -593,11 +936,13 @@ async def _read_case_shell(args: Args) -> Args:
     if view is None:
         raise MCPFailure("invalid_args", f"case {case_id} not found")
     transport = httpx.AsyncHTTPTransport(uds=socket) if socket else None
+    token = shell_token()
     try:
         async with httpx.AsyncClient(
             transport=transport,
             base_url=url or "http://shell",
             timeout=httpx.Timeout(None, connect=5.0),
+            headers={"Authorization": f"Bearer {token}"} if token else None,
         ) as client:
             response = await client.post(
                 "/run",
@@ -614,6 +959,15 @@ async def _read_case_shell(args: Args) -> Args:
     )
     if response.status_code == 400:
         raise MCPFailure("invalid_args", str(answer.get("error") or response.text))
+    if response.status_code == 401:
+        raise MCPFailure(
+            "unavailable",
+            (
+                "the case shell refused this backend's SHELL_TOKEN"
+                if token
+                else "the case shell requires a bearer and this backend has no SHELL_TOKEN"
+            ),
+        )
     if response.status_code != 200:
         raise MCPFailure(
             "unavailable",
@@ -631,6 +985,8 @@ async def _read_case_shell(args: Args) -> Args:
         "stderr": answer.get("stderr", ""),
         # Cut by the shell, so nothing downstream cuts it again unannounced.
         "truncated": bool(answer.get("truncated")),
+        # The full length of stdout, so the agent knows how much a tail -c has left.
+        "stdout_bytes": answer.get("stdout_bytes"),
     }
 
 
@@ -793,7 +1149,12 @@ async def replay_hunt(
     only = _step(step, "step")
     if only is not None:
         first = last = only
-    report = await read_replay(str(run_id), decision_id or None)
+    # agent-serve answers any run id, so a run on a case the caller can't read
+    # (#4359) is refused here, worded as one with nothing to replay.
+    if await asyncio.to_thread(run_unreadable, str(run_id)):
+        report = None
+    else:
+        report = await read_replay(str(run_id), decision_id or None)
     if report is None:
         return {"error": f"Nothing to replay for run {run_id}"}
     return _replay_summary(report, first, last)
@@ -806,6 +1167,7 @@ _SECURITY_TOOLS = frozenset(
         "identify_gaps",
         "get_coverage_stats",
         "detection_metrics",
+        "emulate_next",
         "get_detection_count",
         "lint_detections",
         "check_detection_candidate",
@@ -823,6 +1185,10 @@ def _decided(action: Any, verb: str) -> Args:
     return {"error": f"Action not found or cannot be {verb}"}
 
 
+# The tool names a hash the way an analyst does. Feed rows store hash_*.
+_TOOL_HASH_TYPES = {"md5": "hash_md5", "sha1": "hash_sha1", "sha256": "hash_sha256"}
+
+
 # The local indicator database, fed by the threat-feed poller. A miss is returned
 # as a row: an indicator no feed knows is a finding, not an empty answer.
 def _indicator_lookup(args: Args) -> Any:
@@ -835,13 +1201,17 @@ def _indicator_lookup(args: Args) -> Any:
         )
 
     indicator_type = args.get("indicator_type", "ip")
-    hits = lookup_indicators(indicator_type, [str(v) for v in values])
+    hits = lookup_indicators(
+        _TOOL_HASH_TYPES.get(indicator_type, indicator_type),
+        [str(v) for v in values],
+    )
     return [
         {
+            **(hits.get(value) or {}),
+            # The row names the value as asked, not the feed's stored spelling.
             "indicator_type": indicator_type,
             "indicator_value": value,
             "known": value in hits,
-            **(hits.get(value) or {}),
         }
         for value in values
     ]
@@ -878,6 +1248,26 @@ def _recall(args: Args) -> Any:
     return recall_entity(args)
 
 
+# The run-start fact read on a run's trigger Entity Keys (#4742). The harness
+# calls it the way it calls Recall; it is in no catalogue, so no agent is offered
+# it. One mapping, for the same reason as _recall.
+async def _entity_facts(args: Args) -> Any:
+    from core.integrations import entity_facts
+
+    keys = args.get("entity_keys")
+    if not isinstance(keys, list):
+        raise MCPFailure("invalid_args", "entity_keys must be a list of Entity Keys")
+    case_id = args.get("case_id") or None
+    # declared_only (#5211): the applied site revision's rows alone; no source asked.
+    try:
+        held = await entity_facts.read_keys(
+            [str(k) for k in keys], case_id, args.get("declared_only") is True
+        )
+    except entity_facts.CaseUnreadable as exc:
+        raise MCPFailure("denied", str(exc)) from None
+    return held.journaled()
+
+
 # Report in, one of three answers out (#903). Reads only; never starts a hunt.
 def _check_hunt_coverage(args: Args) -> Any:
     from core.memory.hunt_coverage import check_coverage
@@ -908,6 +1298,7 @@ def _export_learning_episodes(args: Args) -> Any:
 
 _MEMORY_TOOLS: Dict[str, Callable[[Args], Any]] = {
     RECALL_TOOL: _recall,
+    FACTS_TOOL: _entity_facts,
     "check_hunt_coverage": _check_hunt_coverage,
     "list_learning_episodes": _list_learning_episodes,
     "export_learning_episodes": _export_learning_episodes,
@@ -915,12 +1306,21 @@ _MEMORY_TOOLS: Dict[str, Callable[[Args], Any]] = {
 
 
 def list_pending_approvals(**args: Any) -> Any:
+    from core.response.approval_service import screen_actions
+
     limit = args.get("limit", 50)
-    return [asdict(action) for action in _approvals().list_pending_approvals()[:limit]]
+    actions = _approvals().list_pending_approvals()[:limit]
+    return [asdict(action) for action in screen_actions(actions)]
 
 
-def get_approval_action(*, action_id: str) -> Args:
-    return _decided(_approvals().get_action(action_id), "read")
+# A containment is resolved, or its requested state read again, as it is read (#5059).
+async def get_approval_action(*, action_id: str) -> Args:
+    from core.response import containment
+    from core.response.approval_service import screen_action
+
+    action = await asyncio.to_thread(_approvals().get_action, action_id)
+    action = await containment.on_read(action, await containment.live_registry())
+    return _decided(screen_action(action), "read")
 
 
 # Chat and MCP do not approve. The row stays as it is; a person confirms it
@@ -929,8 +1329,11 @@ def get_approval_action(*, action_id: str) -> Args:
 def approve_action(*, action_id: str) -> Args:
     if refusal := permission_refusal(APPROVE_PERMISSION):
         return refusal
+    from core.response.approval_service import may_decide
+
     action = _approvals().get_action(action_id)
-    if action is None:
+    # One on a case the caller can't read is not found, as on the route (#4359).
+    if action is None or not may_decide(action):
         return {"error": f"Action {action_id} was not found"}
     return {
         "action_id": action.action_id,
@@ -940,7 +1343,7 @@ def approve_action(*, action_id: str) -> Args:
 
 
 async def reject_action(*, action_id: str, reason: str) -> Args:
-    from core.cases.agent_closure import actor, actor_identity
+    from core.cases.agent_closure import acting_principal, actor
     from core.response.approval_decisions import ActionNotFound, decide_reject
     from core.response.approval_service import AlreadyDecided
 
@@ -956,14 +1359,9 @@ async def reject_action(*, action_id: str, reason: str) -> Args:
         origin = action.workflow_run_id or (action.parameters or {}).get("run_id")
         if not origin or origin != claims.run_id:
             return {"error": f"Action {action_id} was not raised by this run"}
-    # Inside a run, its signed claims name who; over /mcp, the bound caller does.
-    if claims is not None:
-        principal = claims.person_id or claims.agent_id
-    else:
-        principal = actor_identity()[0]
     try:
         decided = await decide_reject(
-            _approvals(), action_id, reason, actor(), principal
+            _approvals(), action_id, reason, actor(), acting_principal()
         )
     except ActionNotFound:
         decided = None
@@ -992,6 +1390,8 @@ _OWNED = frozenset(
         "add_finding_to_case",
         "update_case",
         "add_resolution_step",
+        "restrict_case",
+        "change_case_readers",
         "get_technique_rollup",
         "list_completed_hunts",
         "replay_hunt",
@@ -1026,6 +1426,15 @@ async def execute_backend_tool(
     if tool_name == "read_case_shell":
         return await _read_case_shell(args), True
 
+    if tool_name == SITE_PROPOSAL_TOOL:
+        from core.site_proposal import save_site_proposal
+
+        fields = ("files", "provenance", "questions")
+        saved = await save_site_proposal(
+            **{k: args.get(k) for k in fields}, registry=registry
+        )
+        return saved, True
+
     if tool_name in _OWNED:
         result = globals()[tool_name](**args)
         if inspect.isawaitable(result):
@@ -1046,8 +1455,11 @@ async def execute_backend_tool(
             result = await result
         return result, True
 
-    # Agent skills (#925): reads from disk only, never a database.
+    # Agent skills: read from disk, except those the scan holds, which read as
+    # absent so the agent cannot learn their content. The verdicts come from the
+    # database, hence off the event loop.
     if tool_name == READ_SKILL_TOOL:
-        return read_skill(args.get("name"), args.get("file")), True
+        visible = await asyncio.to_thread(agent_skills)
+        return read_skill(args.get("name"), args.get("file"), skills=visible), True
 
     return None, False

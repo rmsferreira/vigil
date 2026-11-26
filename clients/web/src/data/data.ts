@@ -12,6 +12,9 @@ export type ConsoleScreenKey =
   | 'workflows'
   | 'health'
   | 'medic'
+  | 'supervisory'
+  | 'report'
+  | 'review'
   | 'settings'
 
 /** A nav item carrying a gate only renders when the gate is satisfied. */
@@ -31,6 +34,9 @@ export const NAV: [IconName, string, ConsoleScreenKey, NavGate?][] = [
   ['bars', 'Case Metrics', 'metrics'],
   ['flow', 'Agents & workflows', 'workflows'],
   ['eye', 'Medic', 'medic'],
+  ['brain', 'Supervisory model', 'supervisory'],
+  ['doc', 'Day 1 Report', 'report'],
+  ['check', 'Review', 'review'],
   ['gear', 'Settings', 'settings'],
 ]
 
@@ -52,6 +58,8 @@ export interface Finding {
   status: TerminalState | null
   /** the case the state reads, for "Case NNNN" */
   caseId?: string | null
+  /** in a restricted case the reader can't see, so there is no caseId */
+  caseRestricted?: boolean
   /** entity_context keys the fixed fields don't cover. Sources disagree about
    *  these (CrowdStrike sends device_id and no dest_ips, Splunk the reverse), so
    *  they are carried through and rendered as columns derived from the rows. */
@@ -85,7 +93,22 @@ export interface CaseRow {
   budgetHealth?: string | null
   comments?: number
   owner: string
+  /** The stored owner; '' is Unassigned. */
   ownerName: string
+  /** The stored owner is not a current account. */
+  ownerStale: boolean
+  /** The stored owner's state from the read; null when unassigned. */
+  ownerState?: 'current' | 'not_current' | null
+  /** False when the owner is not on the case's team. Null when unowned or unknown. */
+  ownerOnTeam?: boolean | null
+  /** True when the case is restricted and its owner isn't a reader. */
+  ownerCannotRead?: boolean | null
+  /** Restricted: only ``readers`` (principal ids) and members of ``readerTeams`` (team ids) open it. */
+  restricted: boolean
+  readers: string[]
+  readerTeams: string[]
+  teamId?: string
+  teamName?: string
   findings: number
   /** Read on the case page only; the queue reads 0. */
   alertsSinceLastRun: number
@@ -123,5 +146,8 @@ export const TITLES: Record<ConsoleScreenKey, [string, string]> = {
   workflows: ['Agents & workflows', 'How Vigil works a case. Workflows are the plays, agents do the work, skills are what agents know how to do, and tool permissions decide what they may change on their own.'],
   health: ['Health', 'Operational health — approvals waiting, recent workflow runs, probe scores'],
   medic: ['Medic', 'What Medic watches in this install, and the incidents it records'],
+  supervisory: ['Supervisory model', 'Setting changes it suggests, and the evidence behind each. Nothing changes until a person acts.'],
+  report: ['Day 1 Report', 'What this install can see, and what to fix first'],
+  review: ['Review', 'Confirm a re-decision before a Case can open'],
   settings: ['Settings', 'Configure Vigil — AI, integrations, users and platform'],
 }

@@ -12,7 +12,6 @@ from typing import Dict, List, Mapping, Optional
 from core.config import vigil_path
 from core.detections.detection_rules_service import DetectionRulesService
 from core.integrations.integration_bridge_service import IntegrationBridgeService
-from core.integrations.mcp.child_env import ca_bundle_env
 from core.integrations.mcp.packaged import installed_launch
 from core.secrets import get_secret
 
@@ -52,7 +51,8 @@ def extract_required_env_vars(
     for value in list((raw_env or {}).values()) + list(raw_args or []):
         if not isinstance(value, str):
             continue
-        for m in _ENV_PLACEHOLDER_RE.finditer(value):
+        # "$${VAR}" is a literal for the child to expand, not a placeholder.
+        for m in _ENV_PLACEHOLDER_RE.finditer(value.replace("$$", "")):
             name = m.group(1)
             if name in _PLACEHOLDER_BLACKLIST:
                 continue
@@ -130,10 +130,11 @@ class MCPService:
 
     # ---- Enabled / Disabled state persistence ----
 
-    def _load_enabled_state(self) -> Dict[str, bool]:
+    @classmethod
+    def _load_enabled_state(cls) -> Dict[str, bool]:
         """Load the enabled/disabled state from disk. Returns empty dict if no file."""
         try:
-            with open(vigil_path(self._STATE_FILENAME)) as f:
+            with open(vigil_path(cls._STATE_FILENAME)) as f:
                 return json.load(f).get("enabled", {})
         except FileNotFoundError:
             return {}
@@ -162,17 +163,26 @@ class MCPService:
         "splunk-selfhosted",
     }
 
+    @classmethod
+    def enabled_state(cls) -> Dict[str, bool]:
+        """Every saved server switch, read once, for a caller asking about many
+        servers; pass it to is_server_enabled as ``state``."""
+        return cls._load_enabled_state()
+
+    @classmethod
     def is_server_enabled(
-        self, server_name: str, state: Optional[Dict[str, bool]] = None
+        cls, server_name: str, state: Optional[Dict[str, bool]] = None
     ) -> bool:
         """Check whether a server is enabled. Internal platform servers default to True; all others default to False.
 
         Read from the file on every check: the other API worker and the daemon
         toggle the same file, and share the runner's one copy of each server.
+        A class method, so a reader with no service of its own (integration
+        health) reads the same file the same way.
         """
         if state is None:
-            state = self._load_enabled_state()
-        return state.get(server_name, server_name in self._DEFAULT_ENABLED)
+            state = cls._load_enabled_state()
+        return state.get(server_name, server_name in cls._DEFAULT_ENABLED)
 
     def set_server_enabled(self, server_name: str, enabled: bool) -> bool:
         """
@@ -231,6 +241,9 @@ class MCPService:
     ) -> str:
         """Expand ``${VAR}`` and ``${VAR:-default}`` in a config string.
 
+        ``$$`` is a literal ``$``, so ``$${VAR}`` reaches the child as
+        ``${VAR}`` for it to expand from its own env (keeps secrets off argv).
+
         Resolves against ``env`` — the environment the child is actually spawned
         with — so anything the spawn site pinned there is seen rather than
         collapsed to an empty string.
@@ -240,7 +253,8 @@ class MCPService:
         connector URL, say) cannot name another variable or secret to read.
         """
         source: Mapping[str, str] = os.environ if env is None else env  # noqa: ENV001
-        pattern = r"\$\{([^}:]+)(?::-((?:\$\{[^}]+\}|[^{}])*))?\}"
+        # A default may nest ${VAR} or an escaped $${VAR} (by then "\x00{VAR}").
+        pattern = r"\$\{([^}:]+)(?::-((?:[$\x00]\{[^}]+\}|[^{}])*))?\}"
 
         def replace_var(match):
             var_name = match.group(1)
@@ -258,6 +272,7 @@ class MCPService:
 
         # Repeat only to unwind nested defaults; resolved values carry no "$"
         # until the end, so they are never matched again.
+        value = value.replace("$$", _LITERAL_DOLLAR)
         prev = None
         while prev != value:
             prev = value
@@ -326,31 +341,21 @@ class MCPService:
                     for k, v in (server_config.get("env") or {}).items()
                     if not k.startswith("_")
                 }
-                # Inherit the backend's environment so servers that need
-                # runtime config not declared in mcp-config.json can connect
-                # — notably the POSTGRES_* vars DatabaseService reads for
-                # case/DB tools (vigil). Declared config env
-                # entries still take precedence. Required-credential
-                # detection scans the raw config above, not this spawn env,
-                # so dormancy behavior is unchanged.
-                env = os.environ.copy()  # noqa: ENV001 - MCP child env
+                # Substitution reads this process's environment; the server
+                # keeps only its declared keys. The rest of the child's env is
+                # built at connect time (child_env.stdio_env).
+                source = dict(os.environ)  # noqa: ENV001 - substitution source
                 # An mcp-config.json entry may refer to ${VIGIL_DIR}; unset, it
                 # would substitute to "" and root child paths at "/".
-                env.setdefault("VIGIL_DIR", str(vigil_path()))
-                # httpx ignores REQUESTS_CA_BUNDLE, so inheriting it is
-                # not enough.
-                env.update(ca_bundle_env())
-                env.update(
-                    {
-                        k: self._substitute_env_vars(v, env)
-                        for k, v in raw_env_strs.items()
-                    }
-                )
-                env["PYTHONPATH"] = project_path_str
+                source.setdefault("VIGIL_DIR", str(vigil_path()))
+                env = {
+                    k: self._substitute_env_vars(v, source)
+                    for k, v in raw_env_strs.items()
+                }
 
                 # Get args and perform environment variable substitution
                 raw_args = list(server_config.get("args") or [])
-                args = [self._substitute_env_vars(arg, env) for arg in raw_args]
+                args = [self._substitute_env_vars(arg, source) for arg in raw_args]
 
                 # Capture declared credential placeholders *before*
                 # substitution collapses missing vars to empty strings

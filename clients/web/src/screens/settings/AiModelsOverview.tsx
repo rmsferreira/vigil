@@ -3,21 +3,42 @@
    gateway provider, and which model each agent uses.
 
    Providers and keys come from Bifrost; assignments from Vigil's own
-   ai_model_configs. Hosted-or-local is the setup wizard's rule
-   (providerResidency), not a second one.
+   ai_model_configs. Where each provider's calls go is the server's class
+   (core/llm/residency.py, on the routability read), labelled by shared/residency.
    ============================================================ */
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useSearchParams } from 'react-router-dom'
 import { Icon } from '../../shared/icons'
-import { ConfirmDialog, EmptyState, Select, SettingsCard } from '../../shared/ui'
+import { ConfirmDialog, EmptyState, Field, Popup, Select, SettingsCard } from '../../shared/ui'
 import { LevelBadge } from '../../shared/LevelBadge'
 import { NotMeasured } from '../../shared/NotMeasured'
-import { type AIModelInfo, type ComponentAssignment } from '../../services/api'
-import type { BifrostKey, BifrostProvider } from '../../services/bifrostApi'
-import { bifrostStaysOnSite, residencyCopy } from '../setup/providerResidency'
+import {
+  aiConfigApi,
+  autonomyApi,
+  llmProviderApi,
+  type AIModelInfo,
+  type ModelChangePreview,
+  type ComponentAssignment,
+  type LLMProvider,
+  type StatementView,
+} from '../../services/api'
+import type { BifrostProvider, BifrostRoutability } from '../../services/bifrostApi'
+import {
+  RESIDENCY_LABEL,
+  residencyLabel,
+  residencyOf,
+  type Residency,
+  type ResidencyClass,
+  type SelfHostedBy,
+} from '../../shared/residency'
+import { useAuth } from '../../contexts/AuthContext'
 import { useToast } from '../../shell/toast'
 import { useBifrostProviders } from './useBifrost'
-import { useModelAssignment } from './useSettings'
+import { ROUTABILITY_CHANGED } from './routabilityChanged'
+import { useInvestigateWorkflows, useModelAssignment } from './useSettings'
+import { dropWhy } from '../../shared/autonomy'
 import { COMPONENT_LABELS, CHAT_DEFAULT_KEY, FALLBACK_KEY } from '../../config/aiComponents'
+import { InvestigationReplay } from './InvestigationReplay'
 import { PICK_AGENT_MODEL } from './modelPrompt'
 import type { SectionProps } from './types'
 import './aiModels.css'
@@ -67,11 +88,70 @@ function defaultProviderName(
  *  (Home's "Pick a model per agent" step sends ?tab=assignment, which AiConfigSection scrolls to). */
 export const AGENT_MODEL_TABLE_ID = 'ai-model-for-each-agent'
 
+/** Vigil's provider rows, for the Provider Statements each type holds. */
+function useProviderRows() {
+  const [rows, setRows] = useState<LLMProvider[] | null>(null)
+  const reload = useCallback(() => {
+    llmProviderApi
+      .list()
+      .then(({ data }) => setRows(data))
+      .catch(() => setRows(null))
+  }, [])
+  useEffect(reload, [reload])
+  return { rows, reload }
+}
+
+/** The row a statement save goes to: the gateway mirror first, else the type's first active row.
+ *  The server writes it onto every active row of the type. */
+function statementRow(rows: LLMProvider[] | null, name: string): LLMProvider | null {
+  const own = (rows || []).filter((r) => r.provider_type === name)
+  return (
+    own.find((r) => r.provider_id === `bifrost-${name}` && r.is_active) ||
+    own.find((r) => r.is_active) ||
+    own[0] ||
+    null
+  )
+}
+
+function selfHostedOf(row: LLMProvider | null): SelfHostedBy | null {
+  const s = row?.statements?.self_hosted
+  return s && s.state === 'held' && s.value === 'yes' && s.by_name && s.at ? { by: s.by_name, at: s.at } : null
+}
+
 export default function AiModelsOverview({ notify }: SectionProps) {
   const ma = useModelAssignment()
   const bf = useBifrostProviders()
+  const pr = useProviderRows()
+  // A write in the Keys panel below (its own hook) can change a provider's class.
+  const { reload } = bf
+  const { reload: reloadRows } = pr
+  useEffect(() => {
+    const both = () => {
+      reload()
+      reloadRows()
+    }
+    window.addEventListener(ROUTABILITY_CHANGED, both)
+    return () => window.removeEventListener(ROUTABILITY_CHANGED, both)
+  }, [reload, reloadRows])
   const names = bf.shown.map((p) => p.name)
   const defaultName = defaultProviderName(ma.assignments[CHAT_DEFAULT_KEY], ma.models, names)
+  // ?tab=statements&provider=<type> (the Day 1 Report's link) opens that provider's statements.
+  const [params, setParams] = useSearchParams()
+  const [stating, setStating] = useState<string | null>(null)
+  const linked = params.get('tab') === 'statements' ? params.get('provider') : null
+  useEffect(() => {
+    if (linked && pr.rows && names.includes(linked)) setStating(linked)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [linked, pr.rows, names.join()])
+  const closeStating = () => {
+    setStating(null)
+    if (linked) {
+      const next = new URLSearchParams(params)
+      next.delete('tab')
+      next.delete('provider')
+      setParams(next, { replace: true })
+    }
+  }
 
   return (
     <>
@@ -84,41 +164,81 @@ export default function AiModelsOverview({ notify }: SectionProps) {
       )}
       {bf.phase === 'ready' && names.length > 0 && (
         <>
-          <ResidencyBanner providers={bf.shown} keys={bf.keys} />
+          <ResidencyBanner
+            providers={bf.shown}
+            verdicts={bf.verdicts}
+            selfHosted={(name) => selfHostedOf(statementRow(pr.rows, name))}
+          />
           <div className="aim-cards">
             {bf.shown.map((provider) => (
               <ProviderCard
                 key={provider.name}
                 provider={provider}
                 keyCount={(bf.keys[provider.name] || []).length}
-                stays={bifrostStaysOnSite(provider.name, bf.keys[provider.name] || [], provider)}
+                residency={residencyOf(bf.verdicts?.residency?.[provider.name])}
+                selfHosted={selfHostedOf(statementRow(pr.rows, provider.name))}
                 isDefault={provider.name === defaultName}
                 // null verdicts is "could not ask" — no badge, never Poor
                 routable={bf.verdicts ? !!bf.verdicts.providers?.[provider.name] : null}
+                onStatements={pr.rows ? () => setStating(provider.name) : undefined}
               />
             ))}
           </div>
         </>
+      )}
+      {stating && (
+        <StatementsDialog
+          name={providerLabel(stating)}
+          row={statementRow(pr.rows, stating)}
+          onClose={closeStating}
+          onSaved={() => {
+            pr.reload()
+            notify('ok', `Statements for ${providerLabel(stating)} saved.`)
+            closeStating()
+          }}
+        />
       )}
       <AgentModelTable ma={ma} notify={notify} />
     </>
   )
 }
 
-// the residency copy leads with its label ("Hosted: …"); the banner names each group itself
-const residencyPhrase = (stays: boolean) => residencyCopy(stays).replace(/^(Hosted|Local): /, '')
+// One sentence per class, each naming its providers; unknown names its reason.
+const BANNER_GROUPS: { cls: ResidencyClass; text: (names: string) => string }[] = [
+  { cls: 'hosted', text: (n) => ` Hosted models (${n}): data leaves your site.` },
+  { cls: 'your_cloud', text: (n) => ` In your cloud account: ${n}.` },
+  { cls: 'local_by_address', text: (n) => ` ${RESIDENCY_LABEL.local_by_address}: ${n}.` },
+]
 
-function ResidencyBanner({ providers, keys }: { providers: BifrostProvider[]; keys: Record<string, BifrostKey[]> }) {
-  const stays = (p: BifrostProvider) => bifrostStaysOnSite(p.name, keys[p.name] || [], p)
-  const hosted = providers.filter((p) => !stays(p)).map((p) => providerLabel(p.name))
-  const local = providers.filter(stays).map((p) => providerLabel(p.name))
+function ResidencyBanner({ providers, verdicts, selfHosted }: {
+  providers: BifrostProvider[]
+  verdicts: BifrostRoutability | null
+  selfHosted: (name: string) => SelfHostedBy | null
+}) {
+  const of = (p: BifrostProvider) => residencyOf(verdicts?.residency?.[p.name])
+  // a held self-hosted statement takes the provider out of its class, as on its card
+  const stated = providers.filter((p) => of(p).class !== 'unknown' && selfHosted(p.name))
+  const named = (cls: ResidencyClass) =>
+    providers.filter((p) => of(p).class === cls && !stated.includes(p)).map((p) => providerLabel(p.name))
+  // unknown providers grouped by the server's reason
+  const unknown = new Map<string, string[]>()
+  for (const p of providers.filter((p) => of(p).class === 'unknown')) {
+    const why = residencyLabel(of(p)).replace(/^Not known: /, '')
+    unknown.set(why, [...(unknown.get(why) || []), providerLabel(p.name)])
+  }
   return (
     <div className="aim-banner" role="status">
       <Icon name="info" size={17} />
       <span>
         <b>Where your data goes:</b>
-        {hosted.length > 0 && ` hosted models (${hosted.join(', ')}): ${residencyPhrase(false)}.`}
-        {local.length > 0 && ` Local models (${local.join(', ')}): ${residencyPhrase(true)}.`}
+        {BANNER_GROUPS.map(({ cls, text }) => {
+          const names = named(cls)
+          return names.length > 0 && <Fragment key={cls}>{text(names.join(', '))}</Fragment>
+        })}
+        {stated.length > 0 && ` Self-hosted, as stated: ${stated.map((p) => providerLabel(p.name)).join(', ')}.`}
+        {[...unknown].map(([why, names]) => (
+          <Fragment key={why}>{` Not known for ${names.join(', ')}: ${why}.`}</Fragment>
+        ))}
         {' '}Changing the default model asks you to confirm and is logged.
       </span>
     </div>
@@ -135,12 +255,14 @@ function hostOf(url: string | undefined): string | null {
   }
 }
 
-function ProviderCard({ provider, keyCount, stays, isDefault, routable }: {
+function ProviderCard({ provider, keyCount, residency, selfHosted, isDefault, routable, onStatements }: {
   provider: BifrostProvider
   keyCount: number
-  stays: boolean
+  residency: Residency
+  selfHosted: SelfHostedBy | null
   isDefault: boolean
   routable: boolean | null
+  onStatements?: () => void
 }) {
   const { name } = provider
   const url = provider.network_config?.base_url
@@ -150,7 +272,7 @@ function ProviderCard({ provider, keyCount, stays, isDefault, routable }: {
   let keys: string
   if (keyCount > 0) keys = `${count} · ${host ?? 'via the gateway'}`
   else if (keyLess && host) keys = `No key needed · ${host}`
-  else keys = stays ? 'Local server · no key' : 'Not set up'
+  else keys = 'Not set up'
   return (
     <div className={`aim-card${isDefault ? ' default' : ''}`}>
       <div className="aim-card-top">
@@ -161,10 +283,190 @@ function ProviderCard({ provider, keyCount, stays, isDefault, routable }: {
         {routable !== null && (keyCount > 0 || keyLess) && <LevelBadge variant="pill" level={routable ? 'good' : 'poor'} />}
       </div>
       <span className="aim-card-keys" title={host ? url : undefined}>{keys}</span>
-      <span className={`aim-card-where${stays ? ' local' : ''}`}>
-        {residencyCopy(stays)}
+      <span className={`aim-card-where ${selfHosted ? 'self_hosted' : residency.class}`}>
+        {residencyLabel(residency, selfHosted)}
       </span>
+      {onStatements && (
+        <button type="button" className="btn ghost aim-card-statements" onClick={onStatements}>
+          <Icon name="edit" size={14} /> Statements
+        </button>
+      )}
     </div>
+  )
+}
+
+/* ---------------- Provider Statements ---------------- */
+// Each statement's list, "Not stated" first. The ids match core/llm/statements.py VALUES.
+const STATEMENT_FIELDS: { name: string; label: string; hint: string; options: { value: string; label: string }[] }[] = [
+  {
+    name: 'self_hosted',
+    label: 'Self-hosted',
+    hint: 'The model runs on hardware you control. An address on your network is not this statement.',
+    options: [
+      { value: 'yes', label: 'Yes, on hardware we control' },
+      { value: 'no', label: 'No' },
+    ],
+  },
+  {
+    name: 'baa',
+    label: 'Business associate agreement',
+    hint: 'A BAA signed with this provider (yours as covered entity or business associate).',
+    options: [
+      { value: 'signed', label: 'Signed' },
+      { value: 'none', label: 'None' },
+    ],
+  },
+  {
+    name: 'hipaa_account',
+    label: 'HIPAA-eligible account mode',
+    hint: 'The account is in the provider’s HIPAA-eligible mode.',
+    options: [
+      { value: 'on', label: 'On' },
+      { value: 'off', label: 'Off' },
+    ],
+  },
+  {
+    name: 'region',
+    label: 'Processing and support region',
+    hint: 'Where the provider processes and supports this account.',
+    options: [
+      { value: 'us', label: 'United States' },
+      { value: 'eu_eea', label: 'EU/EEA' },
+      { value: 'other', label: 'Elsewhere' },
+    ],
+  },
+  {
+    name: 'fedramp',
+    label: 'FedRAMP authorization',
+    hint: 'The provider’s FedRAMP authorization for this service.',
+    options: [
+      { value: 'high', label: 'High' },
+      { value: 'moderate', label: 'Moderate' },
+      { value: 'low', label: 'Low' },
+      { value: 'none', label: 'None' },
+    ],
+  },
+  {
+    name: 'transfer_basis',
+    label: 'EU transfer basis',
+    hint: 'What covers transfers of EU personal data to this provider.',
+    options: [
+      { value: 'adequacy', label: 'Adequacy decision covering the processing country' },
+      { value: 'dpf', label: 'EU–US Data Privacy Framework, provider on its list' },
+      { value: 'scc', label: 'Standard contractual clauses' },
+      { value: 'bcr', label: 'Binding corporate rules' },
+      { value: 'art49', label: 'Art. 49 derogation' },
+      { value: 'none', label: 'None' },
+    ],
+  },
+]
+const NOT_STATED = 'not_stated'
+
+/** What a statement stands on now, in a sentence. */
+function standingText(s: StatementView | undefined, field: (typeof STATEMENT_FIELDS)[number]): string | null {
+  if (!s || s.state === 'absent') return s?.why ? `Not stated: ${s.why}.` : null
+  const who = s.by_name && s.at ? `stated by ${s.by_name} on ${s.at.slice(0, 10)}` : 'stated'
+  const Who = who.charAt(0).toUpperCase() + who.slice(1)
+  if (s.state === 'held') return `${Who}.`
+  if (s.state === 'cleared') {
+    const was = field.options.find((o) => o.value === s.value)?.label ?? s.value
+    return `Was “${was}”, ${who}, then cleared: ${s.why}. Pick it again to state it.`
+  }
+  // a flag from before statements has no author: the reason says so
+  if (!s.by_name && s.why) return `${s.why.charAt(0).toUpperCase()}${s.why.slice(1)}.`
+  return `${Who}; ${s.why}.`
+}
+
+function StatementsDialog({ name, row, onClose, onSaved }: {
+  name: string
+  row: LLMProvider | null
+  onClose: () => void
+  onSaved: () => void
+}) {
+  const { hasPermission } = useAuth()
+  const canEdit = hasPermission('platform.write')
+  const stored = row?.statements || {}
+  // A standing statement shows its value; a cleared one starts at Not stated.
+  const shownValue = (n: string) => {
+    const s = stored[n]
+    return (s?.state === 'held' || s?.state === 'pending') && s.value ? s.value : NOT_STATED
+  }
+  const [draft, setDraft] = useState<Record<string, string>>(() =>
+    Object.fromEntries(STATEMENT_FIELDS.map((f) => [f.name, shownValue(f.name)])),
+  )
+  // Pending statements the person chose to re-confirm unchanged.
+  const [confirm, setConfirm] = useState<string[]>([])
+  const [saving, setSaving] = useState(false)
+  const [err, setErr] = useState<string | null>(null)
+  // What a save writes: only what this person changed or chose to re-confirm.
+  const written = Object.fromEntries(
+    STATEMENT_FIELDS.filter(
+      ({ name: n }) => draft[n] !== shownValue(n) || (confirm.includes(n) && draft[n] !== NOT_STATED),
+    ).map(({ name: n }) => [n, draft[n]]),
+  )
+  const submit = async () => {
+    if (!row) return
+    setSaving(true)
+    setErr(null)
+    try {
+      await llmProviderApi.state(row.provider_id, written)
+      onSaved()
+    } catch (e) {
+      const detail = (e as { response?: { data?: { detail?: unknown } } })?.response?.data?.detail
+      setErr(typeof detail === 'string' ? detail : 'The statements were not saved.')
+    } finally {
+      setSaving(false)
+    }
+  }
+  return (
+    <Popup open onClose={onClose} title={`Statements · ${name}`} width={520}>
+      <p className="text-sm text-tx-2 mb-3">
+        What you state about this provider, for the Day 1 Report’s check on where model processing runs. Each
+        statement is tied to the provider’s address: a new address clears it, and a new key asks for it to be
+        re-confirmed. Saving records your name and the date on the audit trail.
+      </p>
+      {!row && <div className="settings-banner err mb-3"><Icon name="alert" size={14} /> This provider has no row in Vigil yet. Add a key it can route with first.</div>}
+      {err && <div className="settings-banner err mb-3"><Icon name="alert" size={14} /> {err}</div>}
+      <div className="aim-statements">
+        {STATEMENT_FIELDS.map((f) => {
+          const standing = standingText(stored[f.name], f)
+          const pending = stored[f.name]?.state === 'pending' && draft[f.name] === shownValue(f.name)
+          const confirming = confirm.includes(f.name)
+          return (
+            <div key={f.name} className="aim-statement">
+              <Field label={f.label} hint={standing ? `${f.hint} ${standing}` : f.hint}>
+                <Select
+                  label={f.label}
+                  value={draft[f.name]}
+                  disabled={!canEdit || !row || saving}
+                  options={[{ value: NOT_STATED, label: 'Not stated' }, ...f.options]}
+                  onSelect={(v) => setDraft((d) => ({ ...d, [f.name]: v }))}
+                />
+              </Field>
+              {pending && canEdit && (
+                <button
+                  type="button"
+                  className="btn ghost"
+                  aria-pressed={confirming}
+                  disabled={saving}
+                  onClick={() => setConfirm((c) => (confirming ? c.filter((n) => n !== f.name) : [...c, f.name]))}
+                >
+                  <Icon name={confirming ? 'check2' : 'refresh'} size={14} /> {confirming ? 'Re-confirmed on save' : 'Re-confirm'}
+                </button>
+              )}
+            </div>
+          )
+        })}
+      </div>
+      <div className="flex justify-end gap-2.5 mt-5">
+        <button className="btn ghost" onClick={onClose} disabled={saving}>Cancel</button>
+        {canEdit && (
+          <button className="btn primary" disabled={saving || !row || Object.keys(written).length === 0} onClick={submit}>
+            <Icon name="check2" /> {saving ? 'Saving…' : 'Save'}
+          </button>
+        )}
+      </div>
+    </Popup>
   )
 }
 
@@ -188,6 +490,36 @@ const rowFor = (c: string, a: ComponentAssignment | undefined): RowState =>
   a
     ? { inherit: false, providerId: a.provider_id, modelId: a.model_id, effort: savedEffort(a) }
     : { inherit: c !== CHAT_DEFAULT_KEY, providerId: '', modelId: '', effort: '' }
+
+function errorDetail(e: unknown): string {
+  const detail = (e as { response?: { data?: { detail?: unknown } } })?.response?.data?.detail
+  return typeof detail === 'string' && detail ? detail : (e as { message?: string })?.message || 'no reason given'
+}
+
+/** The Act workflows a model change would drop to Assist, each with the judgement's reason. */
+function DropList({ preview, label }: { preview: ModelChangePreview; label: string }) {
+  const { workflows } = useInvestigateWorkflows()
+  const name = (id: string) => workflows?.find((w) => w.id === id)?.name ?? id
+  const dropping = preview.workflows.filter((w) => w.outcome === 'drop')
+  return (
+    <>
+      <p className="aim-replay-line">
+        Saving {label} on {preview.model_id} moves investigation from {preview.investigation_model_before ?? 'an unresolved model'} to{' '}
+        {preview.investigation_model_after ?? 'an unresolved model'}. {dropping.length === 1 ? 'This workflow' : `These ${dropping.length} workflows`} would
+        drop from Act to Assist:
+      </p>
+      <ul className="aim-replay-cases">
+        {dropping.map((w) => (
+          <li key={w.workflow_id}>
+            <span className="aim-replay-id">{name(w.workflow_id)}</span>
+            {' · '}
+            {dropWhy(w.reason)}
+          </li>
+        ))}
+      </ul>
+    </>
+  )
+}
 
 function AgentModelTable({ ma, notify }: { ma: ReturnType<typeof useModelAssignment> } & SectionProps) {
   const { components, assignments, models, phase, error, reload, assign, clearAssign } = ma
@@ -229,18 +561,20 @@ function AgentModelTable({ ma, notify }: { ma: ReturnType<typeof useModelAssignm
   const [saving, setSaving] = useState<string[]>([])
   const lock = (component: string, on: boolean) =>
     setSaving((s) => (on ? [...s, component] : s.filter((x) => x !== component)))
-  const persist = async (component: string, next: RowState) => {
+  // Whether it saved; an investigation or Chat save also points the replay row back at the assigned model.
+  const persist = async (component: string, next: RowState): Promise<boolean> => {
+    if (component === 'investigation' || component === CHAT_DEFAULT_KEY) setReplayFor(null)
     try {
       if (next.inherit) {
         if (assignments[component] !== undefined) {
           await clearAssign(component)
           notify('ok', `${component} set to inherit.`)
         }
-        return
+        return true
       }
-      if (!next.providerId || !next.modelId) return
+      if (!next.providerId || !next.modelId) return false
       const a = assignments[component]
-      if (a && a.provider_id === next.providerId && a.model_id === next.modelId && savedEffort(a) === next.effort) return
+      if (a && a.provider_id === next.providerId && a.model_id === next.modelId && savedEffort(a) === next.effort) return true
       lock(component, true) // the fallback PUT would carry this row's old model
       try {
         // Other settings keys are carried over; the PUT replaces the whole object.
@@ -255,10 +589,78 @@ function AgentModelTable({ ma, notify }: { ma: ReturnType<typeof useModelAssignm
         lock(component, false)
       }
       notify('ok', `${component} saved.`)
+      return true
     } catch (e) {
       notify('err', (e as { message?: string })?.message || `Failed to save ${component}.`)
       setRows((prev) => ({ ...prev, [component]: rowFor(component, assignments[component]) }))
+      return false
     }
+  }
+
+  // A change that moves the investigation model asks the server's judgement first; one that drops
+  // no Act workflow (or can't be previewed) saves as before, with no extra step.
+  const [drops, setDrops] = useState<{ component: string; next: RowState; preview: ModelChangePreview } | null>(null)
+  // The candidate the replay row runs while it is replayed first, unsaved; null is the assigned model.
+  const [replayFor, setReplayFor] = useState<{ providerId: string; modelId: string } | null>(null)
+  const [replayKey, setReplayKey] = useState(0)
+  const dropsRef = useRef<HTMLDivElement>(null)
+  useEffect(() => {
+    if (drops) dropsRef.current?.scrollIntoView?.({ block: 'nearest' })
+  }, [drops])
+
+  const save = async (component: string, next: RowState) => {
+    // a newer pick on the same row replaces the list it had open
+    if (drops?.component === component) setDrops(null)
+    const a = assignments[component]
+    // Investigation going back to the default runs on Chat's model: previewed as that assignment.
+    const chat = assignments[CHAT_DEFAULT_KEY]
+    const to =
+      component === 'investigation' && next.inherit
+        ? a && chat && { providerId: chat.provider_id, modelId: chat.model_id }
+        : !next.inherit && next.providerId && next.modelId && { providerId: next.providerId, modelId: next.modelId }
+    const moves =
+      (component === 'investigation' || component === CHAT_DEFAULT_KEY) &&
+      !!to &&
+      (!a || a.provider_id !== to.providerId || a.model_id !== to.modelId)
+    if (!moves || !to) return void (await persist(component, next))
+    let preview: ModelChangePreview
+    lock(component, true)
+    try {
+      preview = (await autonomyApi.previewModelChange(component, to.providerId, to.modelId)).data
+    } catch (e) {
+      // 403 without ai_autonomy.read, 503 when it can't be judged: the save goes ahead, said plainly
+      lock(component, false)
+      if (await persist(component, next)) {
+        notify('info', `The preview of which Act workflows this drops was unavailable (${errorDetail(e)}). The server still judged the change after saving.`)
+      }
+      return
+    }
+    lock(component, false)
+    if (preview.moves && preview.workflows.some((w) => w.outcome === 'drop')) setDrops({ component, next, preview })
+    else await persist(component, next)
+  }
+
+  const dropAnyway = () => {
+    if (drops) persist(drops.component, drops.next)
+    setDrops(null)
+  }
+  const dropCancel = () => {
+    if (drops) setRows((prev) => ({ ...prev, [drops.component]: rowFor(drops.component, assignments[drops.component]) }))
+    setDrops(null)
+  }
+  // Starts a replay of the candidate and leaves the assignment as it is.
+  const replayFirst = async () => {
+    if (!drops) return
+    const { providerId, modelId } = drops.next
+    dropCancel()
+    try {
+      await aiConfigApi.startInvestigationReplay({ provider_id: providerId, model_id: modelId })
+      setReplayFor({ providerId, modelId })
+      notify('ok', `Replaying ${modelId}. The assignment was not changed.`)
+    } catch (e) {
+      notify('err', `The replay of ${modelId} did not start: ${errorDetail(e)}. The assignment was not changed.`)
+    }
+    setReplayKey((k) => k + 1) // the replay row reads the new replay
   }
 
   // Saves on select, no confirm: a fallback only acts once the model is unavailable.
@@ -293,7 +695,7 @@ function AgentModelTable({ ma, notify }: { ma: ReturnType<typeof useModelAssignm
     setRows((prev) => ({ ...prev, [component]: next }))
     // chat_default is every unset component's fallback, so it asks first
     if (component === CHAT_DEFAULT_KEY && changes(component, next)) setPending({ component, next })
-    else persist(component, next)
+    else save(component, next)
   }
 
   const resetting = fusing.includes(RESET_KEY)
@@ -362,9 +764,17 @@ function AgentModelTable({ ma, notify }: { ma: ReturnType<typeof useModelAssignm
   }
 
   const confirm = () => {
-    if (pending) persist(pending.component, pending.next)
+    if (pending) save(pending.component, pending.next)
     setPending(null)
   }
+
+  // The model this row is showing: its own, or Chat's while it inherits (including a pending reset).
+  const replayOf = ownOf('investigation') ?? assignments[CHAT_DEFAULT_KEY]
+  const replayIds =
+    replayFor ??
+    (replayOf?.provider_id && replayOf.model_id
+      ? { providerId: replayOf.provider_id, modelId: replayOf.model_id }
+      : { providerId: '', modelId: '' })
 
   // An inheriting row runs on chat_default's row, so it shows that fallback
   const fallbackOf = (c: string) =>
@@ -398,7 +808,7 @@ function AgentModelTable({ ma, notify }: { ma: ReturnType<typeof useModelAssignm
           {providerIds.length === 0 && (
             <EmptyState compact icon="sparkle" title="No assignable models discovered" body="Add and test at least one active provider before assigning models to Vigil components." />
           )}
-          <div className="table-wrap">
+          <div className="table-wrap aim-table-wrap">
             <table className="tbl aim-table">
               <thead>
                 <tr>
@@ -422,7 +832,8 @@ function AgentModelTable({ ma, notify }: { ma: ReturnType<typeof useModelAssignm
                   const shown = ownOf(c) ?? assignments[CHAT_DEFAULT_KEY]
                   const shownModel = shown && models.find((m) => m.provider_id === shown.provider_id && m.model_id === shown.model_id)
                   return (
-                    <tr key={c}>
+                    <Fragment key={c}>
+                    <tr>
                       <td style={{ minWidth: 200, maxWidth: 300 }}>
                         <div className="aim-who">{meta.label}</div>
                         <div className="aim-note">{meta.description}</div>
@@ -501,6 +912,37 @@ function AgentModelTable({ ma, notify }: { ma: ReturnType<typeof useModelAssignm
                         </button>
                       </td>
                     </tr>
+                    {c === 'investigation' && (
+                      <tr className="aim-replay-row">
+                        <td colSpan={6}>
+                          {drops && (
+                            <div className="aim-replay" ref={dropsRef}>
+                              <DropList
+                                preview={drops.preview}
+                                label={COMPONENT_LABELS[drops.component]?.label ?? drops.component}
+                              />
+                              <div className="aim-replay-top">
+                                <button type="button" className="btn primary" onClick={dropAnyway}>Change anyway</button>
+                                <button type="button" className="btn ghost" onClick={() => void replayFirst()}>Replay first</button>
+                                <button type="button" className="btn ghost" onClick={dropCancel}>Cancel</button>
+                              </div>
+                            </div>
+                          )}
+                          {replayFor && (
+                            <div className="aim-replay">
+                              <p className="aim-replay-line">
+                                Replaying {replayFor.modelId}, not saved: the assignment is unchanged.{' '}
+                                <button type="button" className="aim-replay-more" onClick={() => setReplayFor(null)}>
+                                  Back to the assigned model
+                                </button>
+                              </p>
+                            </div>
+                          )}
+                          <InvestigationReplay key={replayKey} providerId={replayIds.providerId} modelId={replayIds.modelId} />
+                        </td>
+                      </tr>
+                    )}
+                    </Fragment>
                   )
                 })}
               </tbody>

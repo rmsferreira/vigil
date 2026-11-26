@@ -30,6 +30,8 @@ from sqlalchemy import (
 from sqlalchemy.orm import aliased, noload
 
 from core.agents.projections import run_id_for
+from core.auth.permissions import case_read_clause
+from core.daemon_config import OrchestratorConfig
 from core.federation.lag import source_collection_lag
 from core.findings.alert_outcomes import _cases_for, alert_group
 from core.findings.arrival_counts import arrivals_today_by_source, utc_day_bounds
@@ -45,7 +47,6 @@ from core.storage.models import (
 )
 from core.storage.shared_ioc_repository import CaseMatch
 from core.time import utcnow
-from services.daemon.config import OrchestratorConfig
 from services.daemon.orchestrator import _link_note, intake_rank_inputs, rank_intake_row
 
 ROW_CAP = 200
@@ -60,6 +61,9 @@ EXCLUDED_STATE = "excluded"
 # An alert whose finding has no data_source counts and filters under this name.
 UNKNOWN_SOURCE = "Unknown"
 NOISE_LABEL = "Dismissed as noise"
+RESTRICTED_LABEL = "Added to a restricted case"
+# What a non-reader of a row's restricted case is not shown (#4359).
+_CASE_FIELDS = ("case_id", "merged_into", "linked_case", "merge_note", "run_id")
 
 ARRIVAL_INFO_ALL = "Arrivals count every finding stored. The list is one row per alert."
 _TRUST_FLOOR_INFO = {
@@ -198,7 +202,7 @@ def _document_line(kind: str, payload: dict) -> Optional[str]:
 
 def _ranking(row: dict, now: datetime, config: OrchestratorConfig) -> dict:
     ttl = config.intake_ttl_seconds
-    band, promoted, age = intake_rank_inputs(
+    band, promoted, age, raised = intake_rank_inputs(
         row,
         now=now,
         ttl_seconds=ttl,
@@ -209,6 +213,8 @@ def _ranking(row: dict, now: datetime, config: OrchestratorConfig) -> dict:
         "age_seconds": age,
         "ttl_seconds": ttl,
         "last_quarter": promoted,
+        # what launches it ahead of older rows in its band; null when nothing does
+        "raised_by": raised,
     }
 
 
@@ -388,6 +394,17 @@ def _page_keys(
         if finding_id is not None:
             row["_finding"] = {"severity": severity}
         queued.append(row)
+    # The entity context the daemon's raised term reads, so both orders agree.
+    contexts = dict(
+        session.query(Finding.finding_id, Finding.entity_context).filter(
+            Finding.finding_id.in_(
+                {row["finding_id"] for row in queued if "_finding" in row}
+            )
+        )
+    )
+    for row in queued:
+        if "_finding" in row:
+            row["_finding"]["entity_context"] = contexts.get(row["finding_id"])
     queued.sort(
         key=lambda row: rank_intake_row(
             row,
@@ -504,6 +521,18 @@ def _load(
             .all()
         }
     case_ids = set(activities)
+    # Restricted cases the caller can't read, among every case a row names.
+    named = {
+        cid for row in triggers for cid in (row.case_id, row.merged_into) if cid
+    } | set(linked.values())
+    hidden: set[str] = set()
+    if named:
+        hidden = {
+            cid
+            for (cid,) in session.query(Case.case_id).filter(
+                Case.case_id.in_(named), ~case_read_clause()
+            )
+        }
     rows = []
     for row_id, finding_id, state in keys:
         row = by_id.get(row_id) if row_id is not None else None
@@ -512,7 +541,10 @@ def _load(
             # an alert with no intake row
             if finding is not None:
                 rows.append(
-                    _no_intake_row(finding, state, linked.get(finding_id or ""))
+                    _hide_restricted(
+                        _no_intake_row(finding, state, linked.get(finding_id or "")),
+                        hidden,
+                    )
                 )
             continue
         raw = row.payload if isinstance(row.payload, dict) else {}
@@ -520,40 +552,50 @@ def _load(
         # this row is not a holder of the internal token, and does not need it.
         payload = {key: value for key, value in raw.items() if key != "principal"}
         rows.append(
-            {
-                "id": row.id,
-                "kind": row.kind,
-                "state": state,
-                "source": (
-                    _finding_name(finding)
-                    if row.kind == "detection"
-                    else _OTHER_SOURCES.get(row.kind, UNKNOWN_SOURCE)
-                ),
-                "priority": row.priority,
-                "finding_id": row.finding_id,
-                "payload": payload,
-                "investigation_id": row.investigation_id,
-                "run_id": (
-                    derived[row.investigation_id]
-                    if derived.get(row.investigation_id) in recorded
-                    else None
-                ),
-                "case_id": row.case_id,
-                "merged_into": row.merged_into,
-                "linked_case": linked.get(row.finding_id or ""),
-                "merge_note": (
-                    _merge_note(row, activities.get(row.merged_into or "", []))
-                    if state == "merged"
-                    else None
-                ),
-                "reason": (
-                    _not_picked_up_reason(row) if state == NOT_PICKED_UP else None
-                ),
-                "created_at": _naive(row.created_at),
-                "decided_at": _naive(row.decided_at),
-            }
+            _hide_restricted(
+                {
+                    "id": row.id,
+                    "kind": row.kind,
+                    "state": state,
+                    "source": (
+                        _finding_name(finding)
+                        if row.kind == "detection"
+                        else _OTHER_SOURCES.get(row.kind, UNKNOWN_SOURCE)
+                    ),
+                    "priority": row.priority,
+                    "finding_id": row.finding_id,
+                    "payload": payload,
+                    "investigation_id": row.investigation_id,
+                    "run_id": (
+                        derived[row.investigation_id]
+                        if derived.get(row.investigation_id) in recorded
+                        else None
+                    ),
+                    "case_id": row.case_id,
+                    "merged_into": row.merged_into,
+                    "linked_case": linked.get(row.finding_id or ""),
+                    "merge_note": (
+                        _merge_note(row, activities.get(row.merged_into or "", []))
+                        if state == "merged"
+                        else None
+                    ),
+                    "reason": (
+                        _not_picked_up_reason(row) if state == NOT_PICKED_UP else None
+                    ),
+                    "created_at": _naive(row.created_at),
+                    "decided_at": _naive(row.decided_at),
+                },
+                hidden,
+            )
         )
     return rows, findings, workflows, case_ids
+
+
+def _hide_restricted(row: dict, hidden: set[str]) -> dict:
+    """A row on a case the caller can't read names no case, run or note."""
+    if hidden and any(row.get(f) in hidden for f in _CASE_FIELDS[:3]):
+        row.update(dict.fromkeys(_CASE_FIELDS), restricted=True)
+    return row
 
 
 _OTHER_SOURCES = {"schedule": "Schedule", "human_ask": "Ask"}
@@ -669,6 +711,22 @@ def _triage(finding: Optional[dict]) -> dict:
     return {"state": "none"}
 
 
+_TI_OUTCOMES = ("hit", "no_hit", "nothing_to_check", "could_not_check")
+
+
+def _threat_intel_check(finding: Optional[dict]) -> Optional[dict]:
+    """The daemon's threat-intel outcome as stored; None when none was recorded."""
+    enrichment = ((finding or {}).get("ai_enrichment") or {}).get("enrichment")
+    check = (enrichment or {}).get("threat_intel_check")
+    if not isinstance(check, dict) or check.get("outcome") not in _TI_OUTCOMES:
+        return None
+    detail = check.get("detail")
+    return {
+        "outcome": check["outcome"],
+        "detail": detail if isinstance(detail, str) and detail else None,
+    }
+
+
 def _present(
     row: dict,
     finding: Optional[dict],
@@ -681,8 +739,10 @@ def _present(
     label, door = _state_label(
         row["state"], row.get("case_id"), row.get("merged_into"), case_ids
     )
+    if row.get("restricted") and row["state"] in _PICKUP_STATES:
+        label = RESTRICTED_LABEL
     # On a case but no door of its own (a queued or expired row, or none): Overview's case.
-    if door is None and row["state"] in _PICKUP_STATES:
+    elif door is None and row["state"] in _PICKUP_STATES:
         door = row.get("linked_case")
     dismissed = row["state"] == NOISE_STATE
     ranking = _ranking(row, now, config)
@@ -722,6 +782,9 @@ def _present(
         "title": finding.get("title") if finding else None,
         "description": finding.get("description") if finding else None,
         "triage": _triage(finding) if kind == "detection" else None,
+        "threat_intel_check": (
+            _threat_intel_check(finding) if kind == "detection" else None
+        ),
         "finding_id": row.get("finding_id"),
         "created_at": _iso(created if isinstance(created, datetime) else None),
         "decided_at": _iso(decided if isinstance(decided, datetime) else None),

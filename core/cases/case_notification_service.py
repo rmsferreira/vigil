@@ -10,10 +10,31 @@ from typing import Dict, List, Optional
 
 from sqlalchemy.orm import Session
 
-from core.storage.models import Case, CaseNotification, CaseWatcher
+from core.storage.models import Case, CaseNotification, CaseWatcher, User
 from core.storage.unit_of_work import unit_of_work
 
 logger = logging.getLogger(__name__)
+
+
+def principal_of(session: Session, name: str) -> Optional[str]:
+    """A watcher or a mention is named by username or by account id."""
+    from core.cases.agent_closure import principal_for_username
+
+    principal = principal_for_username(session, name)
+    if principal is None:
+        row = session.get(User, name)
+        principal = row.principal_id if row is not None else None
+    return principal
+
+
+def may_receive(session: Session, case: Optional[Case], name: str) -> bool:
+    """Notices about a restricted case go only to its readers (#4357)."""
+    from core.cases.assignee import principal_reads_case
+
+    if case is None:
+        return True
+    return principal_reads_case(case, principal_of(session, name), session)
+
 
 # The notification types a watcher can switch off via
 # ``case_watchers.notification_preferences``. This is the whole vocabulary:
@@ -27,7 +48,7 @@ logger = logging.getLogger(__name__)
 WATCHER_NOTIFICATION_TYPES = frozenset(
     {
         "new_comment",  # core/cases/case_collaboration_service.py
-        "sla_warning",  # notify_sla_warning, below
+        "alert_joined",  # services/daemon/orchestrator.py, through notices.notify
     }
 )
 
@@ -118,7 +139,7 @@ class CaseNotificationService:
         """
         with unit_of_work(session) as session:
             case = session.query(Case).filter(Case.case_id == case_id).first()
-            if not case:
+            if not case or not may_receive(session, case, mentioned_user):
                 return False
 
             # Truncate comment for notification
@@ -140,66 +161,6 @@ class CaseNotificationService:
                     "comment_author": comment_author,
                     "comment_content": comment_content,
                 },
-                session=session,
-            )
-
-            return True
-
-    def notify_sla_warning(
-        self,
-        case_id: str,
-        threshold_percent: int,
-        sla_type: str,
-        session: Optional[Session] = None,
-    ) -> bool:
-        """
-        Notify about approaching SLA deadline.
-
-        Args:
-            case_id: Case ID
-            threshold_percent: Percentage of SLA elapsed
-            sla_type: Type of SLA (response or resolution)
-            session: Database session (optional)
-
-        Returns:
-            True if successful
-        """
-        with unit_of_work(session) as session:
-            case = session.query(Case).filter(Case.case_id == case_id).first()
-            if not case:
-                return False
-
-            # Notify assignee if assigned
-            if case.assignee:
-                urgency = "urgent" if threshold_percent >= 90 else "high"
-
-                self.create_notification(
-                    user_id=case.assignee,
-                    notification_type="sla_warning",
-                    title=f"SLA Warning: {threshold_percent}% Elapsed",
-                    message=(
-                        f'Case "{case.title}" has reached {threshold_percent}% '
-                        f"of its {sla_type} SLA deadline"
-                    ),
-                    case_id=case_id,
-                    delivery_channel="ui",
-                    priority=urgency,
-                    metadata={
-                        "threshold_percent": threshold_percent,
-                        "sla_type": sla_type,
-                    },
-                    session=session,
-                )
-
-            # Also notify watchers
-            self.notify_watchers(
-                case_id=case_id,
-                notification_type="sla_warning",
-                title=f"SLA Warning: {threshold_percent}%",
-                message=(
-                    f'Case "{case.title}" has reached {threshold_percent}% '
-                    f"of its {sla_type} SLA deadline"
-                ),
                 session=session,
             )
 
@@ -244,9 +205,12 @@ class CaseNotificationService:
             watchers = (
                 session.query(CaseWatcher).filter(CaseWatcher.case_id == case_id).all()
             )
+            case = session.get(Case, case_id)
 
             count = 0
             for watcher in watchers:
+                if not may_receive(session, case, watcher.user_id):
+                    continue
                 # Check if user wants this type of notification
                 prefs = watcher.notification_preferences or {}
                 if prefs.get(notification_type, True):  # Default to True

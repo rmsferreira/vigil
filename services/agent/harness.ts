@@ -5,9 +5,10 @@ import { httpPrices } from "./core/prices.js";
 import { Limiter } from "./core/limiter.js";
 import type { Harness } from "./core/loop.js";
 import { nullMemory } from "./core/memory.js";
+import { httpFacts } from "./core/facts.js";
 import { httpRecall } from "./core/recall.js";
 import { registryOf } from "./core/registry.js";
-import { remoteDispatch } from "./core/remote.js";
+import { remoteDispatch, skillBodies } from "./core/remote.js";
 import type { Memory, State } from "./core/seams.js";
 import type { RunSpec } from "./core/spec.js";
 import { httpVirtualKey } from "./core/vk.js";
@@ -16,6 +17,12 @@ import { toolsFrom } from "./tools/remote.js";
 
 export function internalToken(): string {
   return process.env["AGENT_INTERNAL_TOKEN"] ?? "";
+}
+
+// Accepted while a restart moves one process at a time. Outbound calls keep
+// sending internalToken(); an empty value is unset.
+export function previousInternalToken(): string {
+  return process.env["AGENT_INTERNAL_TOKEN_PREVIOUS"] ?? "";
 }
 
 // One per process, not one per run. A client per run opens its own connection pool
@@ -77,12 +84,19 @@ export function harnessFor<K extends Record<string, unknown>>(
     // deployment's tools itself and grants them by the plugin's needs.
     registry: registryOf(toolsFrom(spec.tools), {}),
     dispatch: remoteDispatch({ url: tools, token: internalToken(), ...(principal === undefined ? {} : { principal }) }),
+    skillBodies: skillBodies({ url: tools, token: internalToken() }),
     budget: budgetOf(spec.budgets, unmeteredQuota, Date.now, seed, prices),
     // Wrapped rather than replaced: whatever the caller passed still answers the
     // cue-shaped recall, and the keyed read is added over the same endpoint the
     // tools go to -- one address for the far side, not two to keep in step.
-    memory: httpRecall(memory, { url: tools, token: internalToken(), ...(principal === undefined ? {} : { principal }) }),
+    // The run-start fact read (#4742) travels the same way.
+    memory: httpFacts(httpRecall(memory, { url: tools, token: internalToken(), ...(principal === undefined ? {} : { principal }) }), {
+      url: tools,
+      token: internalToken(),
+      ...(principal === undefined ? {} : { principal }),
+    }),
     state,
+    ...(spec.instructions === undefined ? {} : { instructions: spec.instructions }),
   };
 }
 

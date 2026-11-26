@@ -1,6 +1,7 @@
-import type { ProposedAction, ResolutionPayload, RunOutcome, Severity, StopCause, TerminalHandoff } from "../../contracts/events.js";
+import type { ProposedAction, ResolutionPayload, RunOutcome, StopCause, TerminalHandoff } from "../../contracts/events.js";
 import { httpAnswers } from "../../core/answers.js";
 import { errorFields, logger } from "../../core/log.js";
+import { bridgeHeaders, RunRefused } from "../../core/principal.js";
 
 const log = logger("agent.mirror");
 
@@ -38,8 +39,11 @@ export interface TerminalResult {
   finished_at?: string;
   handoffs?: TerminalHandoff[];
   proposed_actions?: ProposedAction[];
-  severity?: Severity;
   disposition?: string;
+  // What the report stands on, from the terminal; absent where the run did not say.
+  capped?: boolean;
+  citation_count?: number;
+  grounded?: boolean;
 }
 
 // Where a run stands while it is still open. paused is a run waiting on someone
@@ -111,26 +115,30 @@ export const nullMirror: Mirror = {
 export interface MirrorOptions {
   url: string;
   token: string;
+  principal?: string;
   fetch?: typeof globalThis.fetch;
 }
 
 export function httpMirror(options: MirrorOptions): Mirror {
   const call = options.fetch ?? globalThis.fetch;
   const base = options.url.replace(/\/$/, "");
-  const headers = { "content-type": "application/json", authorization: `Bearer ${options.token}` };
+  const headers = bridgeHeaders(options.token, options.principal);
 
   // Progress is not the run. A backend that cannot take an update must not fail
   // the phase that produced it, so this reports and carries on -- and answers
-  // whether it landed, for the one caller that has to know.
+  // whether it landed, for the one caller that has to know. A 403 is the one
+  // exception: the run's own principal was refused, and no later call will fare better.
   const post = async (path: string, body: unknown): Promise<boolean> => {
+    let response: Response;
     try {
-      const response = await call(`${base}${path}`, { method: "POST", headers, body: JSON.stringify(body) });
-      if (!response.ok) log.warn("mirror was refused", { path, status: response.status });
-      return response.ok;
+      response = await call(`${base}${path}`, { method: "POST", headers, body: JSON.stringify(body) });
     } catch (error) {
       log.warn("mirror failed", { path, ...errorFields(error) });
       return false;
     }
+    if (response.status === 403) throw new RunRefused();
+    if (!response.ok) log.warn("mirror was refused", { path, status: response.status });
+    return response.ok;
   };
 
   return {

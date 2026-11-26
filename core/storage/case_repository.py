@@ -25,6 +25,7 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import Session, selectinload
 
+from core.storage.case_read_hook import read_clause as case_read_clause
 from core.storage.models import (
     Case,
     CaseClosureInfo,
@@ -32,6 +33,7 @@ from core.storage.models import (
     CaseSLA,
     Finding,
     Investigation,
+    Team,
     WorkflowRun,
     WorkflowRunPhase,
     case_findings,
@@ -39,9 +41,13 @@ from core.storage.models import (
 from core.storage.models.workflow import (
     LIVE_CASE_STATES,
     LIVE_INVESTIGATION_STATUSES,
+    PARKED_INVESTIGATION_STATUSES,
     RUN_LIVE_STATE,
 )
 from core.time import utcnow
+
+# A live run an agent is working, as opposed to one parked on a person.
+_AGENT_WORKING = ("assigned", "executing")
 
 # CaseSchema reads only ``finding_ids``: load the links, not each finding's
 # MITRE prediction rows.
@@ -72,6 +78,32 @@ def _as_list(value: Filterable) -> List[str]:
     if isinstance(value, str):
         return [value]
     return list(value)
+
+
+def _waiting(live):
+    """Open cases waiting on a person.
+
+    Unowned, with no assigned or executing live run, plus any case whose live
+    run is ``waiting_approval`` or ``paused``. The caller excludes closed
+    cases. The live status is the newest live run.
+    """
+    unowned = or_(Case.assignee.is_(None), Case.assignee == "")
+    not_working = or_(
+        live.c.live_status.is_(None),
+        live.c.live_status.notin_(_AGENT_WORKING),
+    )
+    parked = live.c.live_status.in_(PARKED_INVESTIGATION_STATUSES)
+    return or_(and_(unowned, not_working), parked)
+
+
+def _assignee_clause(assignee: Filterable, unassigned: bool):
+    """Exact owners, plus no owner (NULL or "") when ``unassigned``; None is no filter."""
+    clauses = []
+    if _as_list(assignee):
+        clauses.append(Case.assignee.in_(_as_list(assignee)))
+    if unassigned:
+        clauses.append(or_(Case.assignee.is_(None), Case.assignee == ""))
+    return or_(*clauses) if clauses else None
 
 
 def _ranked(stmt: Select, name: str):
@@ -307,6 +339,42 @@ def _closed_by_person_exists(person_channels: Sequence[str]):
     )
 
 
+def _drawn_on_agent_channel(person_channels: Sequence[str]):
+    """A sampled dismissal still closed on a channel that is not a person's.
+
+    The channel test is the one ``_closed_by_person_exists`` uses, on the row
+    that holds ``sampled_at``. Answering the draw moves that channel onto a
+    person, so the case leaves this filter.
+    """
+    return exists(
+        select(CaseClosureInfo.case_id).where(
+            CaseClosureInfo.case_id == Case.case_id,
+            CaseClosureInfo.sampled_at.isnot(None),
+            CaseClosureInfo.close_channel.notin_(list(person_channels)),
+        )
+    )
+
+
+def first_finding_id(session, case_id: str) -> Optional[str]:
+    """The finding the case was opened from: the earliest one linked to it.
+
+    A merge or the case matcher links later ones, so the earliest ``added_at``
+    is the opener. A case opened with several findings links them in the order
+    given, within one write; where those share a time, the earliest event wins.
+    """
+    return session.execute(
+        select(case_findings.c.finding_id)
+        .join(Finding, Finding.finding_id == case_findings.c.finding_id)
+        .where(case_findings.c.case_id == case_id)
+        .order_by(
+            case_findings.c.added_at,
+            Finding.timestamp.asc().nulls_last(),
+            case_findings.c.finding_id,
+        )
+        .limit(1)
+    ).scalar_one_or_none()
+
+
 def _alerts_in_span_exists(span: AlertSpan):
     """Cases holding an alert created in ``span`` (``None`` bounds are open).
 
@@ -360,6 +428,12 @@ class CaseQueueRow:
     resolution_completed_at: Optional[datetime]
     is_paused: bool
     description: Optional[str] = None
+    team_id: Optional[str] = None
+    team_name: Optional[str] = None
+    team_is_default: bool = False
+    readers: Tuple[str, ...] = ()
+    reader_teams: Tuple[str, ...] = ()
+    restricted: bool = False
 
 
 @dataclass(frozen=True)
@@ -369,6 +443,7 @@ class CaseQueueStrip:
     closed_today: int
     agent_closure_share: float
     needs_you: int = 0
+    waiting: int = 0
 
 
 class CaseRepository:
@@ -415,6 +490,7 @@ class CaseRepository:
         status: Filterable = None,
         priority: Filterable = None,
         assignee: Filterable = None,
+        unassigned: bool = False,
         tags: Optional[Sequence[str]] = None,
         mitre_techniques: Optional[Sequence[str]] = None,
         created_after: Optional[datetime] = None,
@@ -451,11 +527,13 @@ class CaseRepository:
         for column, value in (
             (Case.status, status),
             (Case.priority, priority),
-            (Case.assignee, assignee),
         ):
             values = _as_list(value)
             if values:
                 conditions.append(column.in_(values))
+        owner = _assignee_clause(assignee, unassigned)
+        if owner is not None:
+            conditions.append(owner)
 
         # Array-contains filters: a case must carry every requested tag/technique.
         for tag in _as_list(tags):
@@ -520,22 +598,40 @@ class CaseRepository:
         cases = self.find(limit=limit, offset=offset, order_by=order_by, **filters)
         return cases, int(total)
 
-    def summary_counts(self) -> Tuple[int, Dict[str, int], Dict[str, int]]:
-        """``(total, by_status, by_priority)`` over every case, in SQL.
+    def summary_counts(self) -> Tuple[int, Dict[str, int], Dict[str, int], int]:
+        """``(total, by_status, by_priority, hidden)`` over every case the
+        reader may read, in SQL; ``hidden`` is the restricted cases left out.
 
         Counts and groups in the database, so the numbers cover the whole
         table rather than a loaded page of rows (#1438).
         """
-        total = self.session.execute(select(func.count()).select_from(Case)).scalar()
+        readable = case_read_clause()
+        total = self.session.execute(
+            select(func.count()).select_from(Case).where(readable)
+        ).scalar()
         return (
             int(total or 0),
-            self._grouped_counts(Case.status),
-            self._grouped_counts(Case.priority),
+            self._grouped_counts(Case.status, readable),
+            self._grouped_counts(Case.priority, readable),
+            self.hidden_count(),
         )
 
-    def _grouped_counts(self, column) -> Dict[str, int]:
+    def hidden_count(self) -> int:
+        """Restricted cases the reader may not read: "N restricted not counted".
+
+        Never filtered: a count that followed a text or owner filter would let a
+        non-reader probe what a restricted case holds.
+        """
+        return int(
+            self.session.execute(
+                select(func.count()).select_from(Case).where(~case_read_clause())
+            ).scalar()
+            or 0
+        )
+
+    def _grouped_counts(self, column, readable) -> Dict[str, int]:
         counts: Dict[str, int] = {}
-        stmt = select(column, func.count()).group_by(column)
+        stmt = select(column, func.count()).where(readable).group_by(column)
         for value, count in self.session.execute(stmt).all():
             key = "unknown" if value is None else value
             counts[key] = counts.get(key, 0) + int(count)
@@ -557,6 +653,26 @@ class CaseRepository:
         )
         return self.session.execute(stmt).scalar_one_or_none()
 
+    def owners(self) -> List[str]:
+        """Distinct non-blank stored owners on cases the queue can list, closed included.
+
+        Goes through ``_restrict`` with its filters off, so any reader scoping
+        added there narrows this list too.
+        """
+        stmt = self._restrict(
+            select(Case.assignee).distinct().order_by(Case.assignee),
+            workflow=None,
+            data_source=None,
+            sla_at_risk=False,
+            state=None,
+            closed=None,
+            open_only=False,
+            now=utcnow(),
+        )
+        return [
+            value for value in self.session.scalars(stmt) if value and value.strip()
+        ]
+
     def _restrict(
         self,
         stmt: Select,
@@ -574,10 +690,13 @@ class CaseRepository:
         workflow_ids: Optional[set[str]] = None,
         only_ids: Optional[set[str]] = None,
     ) -> Select:
-        """Queue filters. Joins are added only when the caller has not already.
+        """Queue filters, and the restricted-case read rule. Joins are added only
+        when the caller has not already.
 
         ``workflow_ids`` and ``only_ids`` restrict to those workflows / case ids.
         ``None`` leaves the filter off, and an empty set matches no rows.
+        Every case list reads through here, so the read rule is applied here,
+        always.
         """
         if (workflow or workflow_ids is not None) and latest is None:
             latest = _latest_investigations()
@@ -589,7 +708,7 @@ class CaseRepository:
             sla = _latest_slas()
             stmt = stmt.outerjoin(sla, sla.c.sla_case_id == Case.case_id)
 
-        clauses = []
+        clauses = [case_read_clause()]
         if workflow:
             clauses.append(latest.c.workflow_id == workflow)
         if workflow_ids is not None:
@@ -606,9 +725,7 @@ class CaseRepository:
             clauses.append(_combined_sql(live) == state)
         elif open_only:
             clauses.append(Case.status != "closed")
-        if clauses:
-            stmt = stmt.where(and_(*clauses))
-        return stmt
+        return stmt.where(and_(*clauses))
 
     def queue(
         self,
@@ -618,6 +735,7 @@ class CaseRepository:
         query_text: Optional[str] = None,
         priority: Filterable = None,
         assignee: Filterable = None,
+        unassigned: bool = False,
         workflow: Optional[str] = None,
         data_source: Optional[str] = None,
         sla_at_risk: bool = False,
@@ -631,8 +749,10 @@ class CaseRepository:
         closed_by: Optional[str] = None,
         person_channels: Sequence[str] = (),
         alerts_span: Optional[AlertSpan] = None,
-    ) -> Tuple[List[CaseQueueRow], int]:
-        """One page of the queue.
+        team_ids: Optional[Sequence[str]] = None,
+    ) -> Tuple[List[CaseQueueRow], int, int]:
+        """One page of the queue, its total, and how many restricted cases the
+        reader may not read were left out (``hidden_count``, never filtered).
 
         Ids in ``needs_you_ids`` sort first, then soonest resolution, no SLA
         last. The tie-break is last activity descending: the later of
@@ -646,8 +766,10 @@ class CaseRepository:
         investigation ran one of those workflows (an empty set returns none).
 
         ``working`` keeps open cases outside ``needs_you_ids``. ``closed_by``
-        (``agent`` or ``person``) keeps closed cases; ``person_channels`` are the
-        close channels that read as a person, and no closure row reads as an agent.
+        keeps closed cases: ``person`` is a person channel, ``agent`` is any
+        other close, and ``draw`` is a sampled dismissal still on a channel
+        that is not a person's. ``person_channels`` are the close channels
+        that read as a person.
         ``alerts_span`` keeps cases holding an alert created in ``(start, end)``,
         either bound open.
         """
@@ -682,6 +804,9 @@ class CaseRepository:
                 Case.priority,
                 Case.assignee,
                 Case.created_at,
+                Team.team_id.label("team_id"),
+                Team.name.label("team_name"),
+                Team.is_default.label("team_is_default"),
                 latest.c.workflow_id,
                 latest.c.iteration_count,
                 latest.c.cost_usd,
@@ -697,8 +822,11 @@ class CaseRepository:
                 sla.c.is_paused,
                 sla.c.sla_created_at,
                 last_activity.label("last_activity"),
+                Case.reader_principal_ids,
+                Case.reader_team_ids,
             )
             .select_from(Case)
+            .outerjoin(Team, Team.team_id == Case.team_id)
             .outerjoin(latest, latest.c.inv_case_id == Case.case_id)
             .outerjoin(live, live.c.live_case_id == Case.case_id)
             .outerjoin(sla, sla.c.sla_case_id == Case.case_id)
@@ -719,8 +847,11 @@ class CaseRepository:
             )
         if _as_list(priority):
             stmt = stmt.where(Case.priority.in_(_as_list(priority)))
-        if _as_list(assignee):
-            stmt = stmt.where(Case.assignee.in_(_as_list(assignee)))
+        owner = _assignee_clause(assignee, unassigned)
+        if owner is not None:
+            stmt = stmt.where(owner)
+        if team_ids:
+            stmt = stmt.where(Case.team_id.in_(list(team_ids)))
         stmt = self._restrict(
             stmt,
             workflow=workflow,
@@ -742,7 +873,12 @@ class CaseRepository:
                 stmt = stmt.where(Case.case_id.notin_(sorted(needs_you_ids)))
         if closed_by:
             person = _closed_by_person_exists(person_channels)
-            stmt = stmt.where(person if closed_by == "person" else ~person)
+            if closed_by == "person":
+                stmt = stmt.where(person)
+            elif closed_by == "draw":
+                stmt = stmt.where(_drawn_on_agent_channel(person_channels))
+            else:
+                stmt = stmt.where(~person)
         if alerts_span is not None:
             stmt = stmt.where(_alerts_in_span_exists(alerts_span))
         total = self.session.execute(
@@ -796,9 +932,17 @@ class CaseRepository:
                     resolution_completed_at=record["resolution_completed_at"],
                     is_paused=bool(record["is_paused"]),
                     description=record["description"],
+                    team_id=record["team_id"],
+                    team_name=record["team_name"],
+                    team_is_default=bool(record["team_is_default"]),
+                    readers=tuple(record["reader_principal_ids"] or ()),
+                    reader_teams=tuple(record["reader_team_ids"] or ()),
+                    restricted=bool(
+                        record["reader_principal_ids"] or record["reader_team_ids"]
+                    ),
                 )
             )
-        return rows, int(total)
+        return rows, int(total), self.hidden_count()
 
     def strip(
         self,
@@ -806,12 +950,15 @@ class CaseRepository:
         now: Optional[datetime] = None,
         needs_you_ids: Optional[set[str]] = None,
         alerts_span: Optional[AlertSpan] = None,
+        team_ids: Optional[Sequence[str]] = None,
     ) -> CaseQueueStrip:
         """Open cases by combined state, SLA at risk, closures today.
 
         ``needs_you`` counts the open (not closed) cases in ``needs_you_ids``.
-        ``alerts_span``, when set, narrows those three counts to cases holding
-        an alert in it, as the queue's filter does; ``None`` counts every case.
+        ``waiting`` counts unowned open cases with no assigned or executing
+        live run, plus open cases whose live run is waiting on a person.
+        ``alerts_span`` and ``team_ids``, when set, narrow every count here;
+        ``None`` counts every case. The other queue filters are ignored.
 
         At risk is the same SQL predicate as the queue filter, over cases
         that are not closed. Today's closures are ``case_closure_info`` rows
@@ -821,12 +968,17 @@ class CaseRepository:
         now = now or utcnow()
         live = _live_investigations()
         combined = _combined_sql(live)
-        in_span = [] if alerts_span is None else [_alerts_in_span_exists(alerts_span)]
+        # Restricted cases the reader may not read are not counted here either.
+        narrowed = [case_read_clause()]
+        if alerts_span is not None:
+            narrowed.append(_alerts_in_span_exists(alerts_span))
+        if team_ids:
+            narrowed.append(Case.team_id.in_(list(team_ids)))
         grouped = self.session.execute(
             select(combined.label("state"), func.count())
             .select_from(Case)
             .outerjoin(live, live.c.live_case_id == Case.case_id)
-            .where(Case.status != "closed", *in_span)
+            .where(Case.status != "closed", *narrowed)
             .group_by(combined)
         ).all()
         by_state = {state: int(count) for state, count in grouped if state}
@@ -836,29 +988,38 @@ class CaseRepository:
             select(func.count())
             .select_from(Case)
             .outerjoin(sla, sla.c.sla_case_id == Case.case_id)
-            .where(Case.status != "closed", _sla_at_risk(sla, now), *in_span)
+            .where(Case.status != "closed", _sla_at_risk(sla, now), *narrowed)
         ).scalar_one()
 
-        waiting = 0
+        needs = 0
         if needs_you_ids:
-            waiting = self.session.execute(
+            needs = self.session.execute(
                 select(func.count())
                 .select_from(Case)
                 .where(
                     Case.status != "closed",
                     Case.case_id.in_(sorted(needs_you_ids)),
-                    *in_span,
+                    *narrowed,
                 )
             ).scalar_one()
+
+        waiting = self.session.execute(
+            select(func.count())
+            .select_from(Case)
+            .outerjoin(live, live.c.live_case_id == Case.case_id)
+            .where(Case.status != "closed", _waiting(live), *narrowed)
+        ).scalar_one()
 
         start = now.replace(hour=0, minute=0, second=0, microsecond=0)
         end = start + timedelta(days=1)
         today = (
             select(func.count())
             .select_from(CaseClosureInfo)
+            .join(Case, Case.case_id == CaseClosureInfo.case_id)
             .where(
                 CaseClosureInfo.closed_at >= start,
                 CaseClosureInfo.closed_at < end,
+                *narrowed,
             )
         )
         closed_today = int(self.session.execute(today).scalar_one())
@@ -873,5 +1034,6 @@ class CaseRepository:
             sla_at_risk=int(at_risk),
             closed_today=closed_today,
             agent_closure_share=share,
-            needs_you=int(waiting),
+            needs_you=int(needs),
+            waiting=int(waiting),
         )

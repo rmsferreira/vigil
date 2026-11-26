@@ -28,6 +28,7 @@ from tests.medic_compose.compose import (
     compose_project,
     require_compose_project,
 )
+from tests.medic_eval import medic_api
 from tests.medic_eval.sample import SERVICES as SAMPLED
 
 HERE = Path(__file__).resolve().parent
@@ -38,6 +39,8 @@ IMAGES = ("backend", "daemon", "agent")  # <project>-<name>:local, see compose.e
 # enable-compose.sh builds these and reads the gateway's by tag.
 MEDIC_IMAGES = ("vigil-medic:local", "vigil-medic-gateway:local", "vigil-medic-dockerproxy:local")
 ADMIN_USER = "evaladmin"
+# core/auth/bootstrap_code.py SETUP_CODE_LOG_MARK (the harness runs on the host, so no import).
+SETUP_CODE_LOG_MARK = "First-run setup code:"
 INSTALL = (
     "postgres",
     "redis",
@@ -216,7 +219,7 @@ class Stack:
         if stale:
             subprocess.run(["docker", "rm", "-f", *stale], capture_output=True, check=False)
         self.compose("down", "-v", "--remove-orphans", check=False)
-        self.compose("build", "backend", "soc-daemon", "agent-serve")
+        self.compose("build", "backend", "soc-daemon", "agent-shell")
         self.compose("up", "-d", *INSTALL)
         self.wait(
             lambda: self.sql(
@@ -239,9 +242,16 @@ class Stack:
 
     def bootstrap_admin(self) -> None:
         """The first-run flow: a fresh database has no admin (Medic's Viewer is a service account)."""
-        code = self.py(
-            "backend", "from core.auth.bootstrap_code import setup_code; print(setup_code())"
+        # Read the code from the API's log as an operator does; a bare `python -c` has no
+        # database for the key ring. Announced by a background task, so wait for it.
+        out = self.wait(
+            lambda: self.logs("backend"), lambda out: SETUP_CODE_LOG_MARK in out
         )
+        # The line is JSON by default (message and msg_template both contain the
+        # mark). Take the hex value, which is what a text line has too.
+        found = re.findall(r"First-run setup code:\s*([0-9a-fA-F]{32})", out)
+        assert found, "the setup code was not in the backend log"
+        code = found[-1]
         status, body = self.api(
             "POST",
             "/api/auth/bootstrap",
@@ -278,6 +288,8 @@ class Stack:
             lambda: self.http("GET", "backend", 6987, "/api/health")[0],
             lambda c: c == 200,
         )
+        # The image's bundled pack is the last release's and lacks the lane-1 rules.
+        medic_api.import_source_pack(self)
 
     def stop(self) -> None:
         self.compose("down", "-v", "--remove-orphans", check=False)
@@ -444,6 +456,15 @@ class Stack:
             },
         )
         assert status == 200, (status, body)
+
+    def signal_daemon(self, name: str) -> None:
+        """Signal soc-daemon's PID 1; does not recreate it."""
+        self.compose("kill", "-s", name, "soc-daemon")
+
+    def daemon_started(self) -> str:
+        """Changes when soc-daemon restarts."""
+        cid = self.compose("ps", "-q", "soc-daemon").stdout.strip()
+        return docker_api(f"/containers/{cid}/json")["State"]["StartedAt"]
 
     def wait_daemon(self) -> None:
         """The daemon is up and its poller has started (it answers the webhook, one way or the other)."""

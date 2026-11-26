@@ -51,21 +51,20 @@ spec:
           imagePullPolicy: {{ include "vigil.imagePullPolicy" (dict "context" . "component" "agentServe") }}
           {{- /* The image's CMD is the worker; this is the other entry point. */}}
           command: ["node", "dist/serve.js"]
+          {{- /* ConfigMap whole. The app Secret is named below, not loaded whole. */}}
           envFrom:
-            {{- include "vigil.envFrom" . | nindent 12 }}
+            - configMapRef:
+                name: {{ include "vigil.configmap.fullname" . }}
           env:
-            - name: POSTGRES_PASSWORD
-              valueFrom:
-                secretKeyRef:
-                  name: {{ include "vigil.postgres.appPasswordSecret" . }}
-                  key: {{ include "vigil.postgres.appPasswordSecretKey" . }}
+            {{- include "vigil.agentPostgresEnv" . | nindent 12 }}
             - name: AGENT_HTTP_PORT
               value: {{ .Values.agentServe.service.port | toString | quote }}
             {{- /* vigil.env supplies POSTGRES_* and REDIS_URL. Serve ignores
                    every Redis variable -- it never touches the queue -- but the
                    block is shared, and one it does not read costs nothing. */}}
-            {{- include "vigil.env" . | nindent 12 }}
+            {{- include "vigil.agentEnv" . | nindent 12 }}
             {{- include "vigil.caBundleEnv" . | nindent 12 }}
+            {{- include "vigil.agentSecretEnv" (dict "context" . "extraEnv" .Values.agentServe.extraEnv) | nindent 12 }}
             {{- with .Values.agentServe.extraEnv }}
             {{- toYaml . | nindent 12 }}
             {{- end }}

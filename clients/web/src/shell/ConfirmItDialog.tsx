@@ -1,18 +1,22 @@
 import { useEffect, useRef, useState, type FormEvent } from 'react'
+import { useLocation, useNavigate } from 'react-router-dom'
+import { basePath } from '../config/basePath'
 import { useAuth } from '../contexts/AuthContext'
 import { requestErrorMessage } from '../screens/login/requestErrorMessage'
 import { confirmApi, mfaApi } from '../services/api'
 import { cancelPrompt, confirmWithKey, KeyProblem, keysSupported, NoKeyUsed } from '../services/webauthn'
-import { CONFIRMATION_REQUIRED, registerStepUp, type StepUpDetail } from '../services/stepUp'
+import { CONFIRMATION_REQUIRED, registerStepUp, STEP_UP_MFA_SETUP, type StepUpDetail } from '../services/stepUp'
 import { Icon } from '../shared/icons'
 import { Field, PasswordInput, Popup } from '../shared/ui'
 import TwoStepDialog from './TwoStepDialog'
+import { useToast } from './toast'
 import { KEY_AFTER_CONTINUE, KeyWaiting } from './SecurityKeyParts'
 
 type Pending = { detail: StepUpDetail; resolve: () => void; reject: (reason?: unknown) => void }
 
 // The one place a refused privileged change asks "Confirm it's you" (api.ts hands the refusal
-// here and retries the request once this resolves). Mounted once, in the console.
+// here and retries the request once this resolves). Mounted once per page:
+// the console, the setup wizard and the OAuth consent screen.
 export default function ConfirmItHost() {
   const { user } = useAuth()
   const [pending, setPending] = useState<Pending | null>(null)
@@ -44,9 +48,40 @@ export default function ConfirmItHost() {
     else entry?.reject(new Error('cancelled'))
   }
 
+  // Back from confirming at the provider: say how it went, and drop the marker from the address.
+  const location = useLocation()
+  const navigate = useNavigate()
+  const { notify } = useToast()
+  const params = new URLSearchParams(location.search)
+  const ssoOutcome = params.get(SSO_OUTCOME)
+  // once per arrival, though a dev render runs the effect twice
+  const told = useRef<string | null>(null)
+  // the provider confirmed who, but not a second factor: set up Vigil's own (#4757)
+  const [factorFirst, setFactorFirst] = useState(false)
+  useEffect(() => {
+    if (!ssoOutcome || told.current === location.key) return
+    told.current = location.key
+    if (ssoOutcome === STEP_UP_MFA_SETUP) setFactorFirst(true)
+    else if (ssoOutcome === 'ok') notify('ok', "Confirmed. Make your change again; Vigil won't ask for a while.")
+    else notify('err', "Vigil couldn't confirm it's you at your SSO provider. Try again, signing in as yourself.")
+    params.delete(SSO_OUTCOME)
+    const rest = params.toString()
+    navigate({ pathname: location.pathname, search: rest ? `?${rest}` : '', hash: location.hash }, { replace: true })
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [ssoOutcome])
+
+  if (factorFirst)
+    return (
+      <TwoStepDialog
+        open
+        note="Set up two-step sign-in before changes like this. Your SSO provider didn't confirm a second factor, and privileged actions usually need a Vigil one."
+        onClose={() => setFactorFirst(false)}
+      />
+    )
   if (!pending) return null
+  if (pending.detail.variant === 'sso') return <ConfirmAtProvider detail={pending.detail} onCancel={() => finish(false)} />
   return pending.detail.code === CONFIRMATION_REQUIRED ? (
-    <ConfirmIt detail={pending.detail} mfa={!!user?.mfa_enabled} onDone={finish} />
+    <ConfirmIt detail={pending.detail} onDone={finish} />
   ) : (
     // No two-step sign-in yet: set it up (that starts the window), then the change goes through.
     <TwoStepDialog
@@ -57,10 +92,46 @@ export default function ConfirmItHost() {
   )
 }
 
-/** "Confirm it's you to …": a current code or a key touch (the password with no MFA); strong adds the password. */
-function ConfirmIt({ detail, mfa, onDone }: { detail: StepUpDetail; mfa: boolean; onDone: (ok: boolean) => void }) {
+// The callback's query mark on the way back from the provider.
+const SSO_OUTCOME = 'sso_confirm'
+
+/** No password and no Vigil MFA: confirm by signing in again at the provider, then come back here (#4285). */
+function ConfirmAtProvider({ detail, onCancel }: { detail: StepUpDetail; onCancel: () => void }) {
+  const [busy, setBusy] = useState(false)
+  const go = () => {
+    setBusy(true)
+    // a plain navigation: the server answers with the provider's redirect, and the callback returns here
+    const back = window.location.pathname + window.location.search
+    window.location.assign(`${basePath}/api/auth/sso/start?confirm=${encodeURIComponent(back)}`)
+  }
+  return (
+    <Popup open onClose={() => !busy && onCancel()} title={`Confirm it's you to ${detail.action}`} width={480}>
+      <div className="flex flex-col gap-3.5">
+        <p className="m-0 text-sm text-tx-2 leading-relaxed">
+          You haven't confirmed in the last {detail.window_minutes ?? 10} minutes. You sign in through SSO, so
+          you confirm by signing in there again. You'll come back to this page; then make the change again.
+        </p>
+        {/* wraps: a provider's host can be long */}
+        <div className="flex flex-wrap justify-end gap-2.5 mt-1">
+          <button type="button" className="btn ghost" disabled={busy} onClick={onCancel}>
+            Cancel
+          </button>
+          <button type="button" className="btn primary" disabled={busy} autoFocus onClick={go}>
+            {busy ? 'Opening…' : `Confirm at ${detail.provider || 'your SSO provider'}`}
+          </button>
+        </div>
+      </div>
+    </Popup>
+  )
+}
+
+/** "Confirm it's you to …": a current code or a key touch, or the password when the refusal says so; strong adds the password. */
+function ConfirmIt({ detail, onDone }: { detail: StepUpDetail; onDone: (ok: boolean) => void }) {
   const strong = detail.variant === 'strong'
-  const needPassword = strong || !mfa
+  // The refusal says what the server will accept now, not the methods loaded with the page.
+  const { user } = useAuth()
+  const mfa = detail.accepts === 'code' || (detail.accepts == null && !!user?.mfa_enabled)
+  const needPassword = strong || detail.accepts === 'password' || (detail.accepts == null && !mfa)
   const [password, setPassword] = useState('')
   const [code, setCode] = useState('')
   const [error, setError] = useState<{ field: 'password' | 'code'; text: string } | null>(null)
@@ -68,7 +139,6 @@ function ConfirmIt({ detail, mfa, onDone }: { detail: StepUpDetail; mfa: boolean
 
   // Keys: only where this install offers them and the person has one. A person with an app
   // and a key chooses; one with only keys has no code to type.
-  const { user } = useAuth()
   const keysOn = mfa && !!user?.security_keys?.available && keysSupported()
   const [held, setHeld] = useState<{ keys: boolean; app: boolean }>({ keys: false, app: true })
   useEffect(() => {

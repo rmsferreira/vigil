@@ -6,14 +6,17 @@ from __future__ import annotations
 import asyncio
 import logging
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Literal, Optional, Tuple
+from typing import Any, Dict, List, Literal, Optional, Tuple, Union
 
 from fastapi import APIRouter, Depends, Header, HTTPException
 from pydantic import BaseModel, Field
 
 from core.agents.attribution import note_child, note_terminal
-from core.agents.internal_auth import authorise
-from core.cases.agent_closure import activity_actor
+from core.agents.internal_auth import authorise_run
+from core.auth import tool_principal
+from core.auth.permissions import builtin_reader_request
+from core.auth.tool_principal import Claims
+from core.cases.agent_closure import TITLE_EDITED, activity_actor
 from core.deps import provide_approvals, provide_mcp_registry, provide_workflow_runs
 from core.integrations.mcp.registry import MCPRegistry
 from core.integrations.pagerduty.page import page_proposed_containment
@@ -30,7 +33,9 @@ from core.time import utcnow
 from core.workflows.handoff_cases import handoff_case_id
 from core.workflows.workflow_run_service import WorkflowRunService
 
-router = APIRouter()
+# The agent layer writes a run's outputs onto its case, restricted or not: the
+# built-in reader class until #4345 scopes each call to its run's principal.
+router = APIRouter(dependencies=[Depends(builtin_reader_request)])
 
 ROUTER_META = RouterMeta(
     prefix="/internal/runs",
@@ -99,15 +104,39 @@ class TerminalUpdate(BaseModel):
     # Loose on purpose: each item is checked on its own, so one malformed proposal
     # is dropped rather than refusing the terminal that carries the rest.
     proposed_actions: List[Any] = Field(default_factory=list)
-    # How bad the run rated what it found, for the case it was started from. A free
-    # string: an unrecognised rating is ignored, not grounds to refuse the terminal.
-    severity: Optional[str] = None
-    # The run's verdict as its guard left it. Loose like severity: only benign and
+    # The run's verdict as its guard left it. A free string: only benign and
     # false_positive act, and anything else leaves the case as it is.
     disposition: Optional[str] = None
+    # A short title for the case, naming what the run found. Loose like the rest:
+    # blank or absent leaves the title as it is.
+    title: Optional[str] = None
     # When the agent sealed the report. The row's finished_at, so Ended and the
     # history agree. Absent, or unreadable, and the row is stamped on arrival.
     finished_at: Optional[str] = None
+    # What the report stands on, for the case's choice of run (#4962). Loose: a
+    # wrong type is stored as unsaid, never grounds to refuse the terminal.
+    capped: Optional[Any] = None
+    citation_count: Optional[Any] = None
+    grounded: Optional[Any] = None
+
+    def facts(self) -> Dict[str, Any]:
+        """The three facts as the row stores them; None where unsaid or unreadable."""
+
+        def flag(value: Any) -> Optional[bool]:
+            return value if isinstance(value, bool) else None
+
+        count = self.citation_count
+        # Within the INTEGER column, or the whole terminal's write would fail.
+        readable = (
+            isinstance(count, int)
+            and not isinstance(count, bool)
+            and 0 <= count < 2**31
+        )
+        return {
+            "capped": flag(self.capped),
+            "citation_count": count if readable else None,
+            "grounded": flag(self.grounded),
+        }
 
 
 class CitedFindings(BaseModel):
@@ -158,10 +187,15 @@ def record_phase(
     run_id: str,
     update: PhaseUpdate,
     authorization: Optional[str] = Header(default=None),
+    x_vigil_run_principal: Optional[str] = Header(
+        default=None, alias="X-Vigil-Run-Principal"
+    ),
     run_service: WorkflowRunService = Depends(provide_workflow_runs),
     approvals: ApprovalService = Depends(provide_approvals),
 ) -> None:
-    authorise(authorization, "run progress")
+    authorise_run(
+        "run progress", run_id, x_vigil_run_principal, authorization=authorization
+    )
 
     now = utcnow()
     run_service.upsert_phase(
@@ -193,9 +227,14 @@ def record_status(
     run_id: str,
     update: StatusUpdate,
     authorization: Optional[str] = Header(default=None),
+    x_vigil_run_principal: Optional[str] = Header(
+        default=None, alias="X-Vigil-Run-Principal"
+    ),
     run_service: WorkflowRunService = Depends(provide_workflow_runs),
 ) -> None:
-    authorise(authorization, "run status")
+    authorise_run(
+        "run status", run_id, x_vigil_run_principal, authorization=authorization
+    )
     run_service.set_status(
         run_id, update.status, reason=update.reason, cost_usd=update.cost_usd
     )
@@ -208,9 +247,14 @@ def record_progress(
     run_id: str,
     update: ProgressUpdate,
     authorization: Optional[str] = Header(default=None),
+    x_vigil_run_principal: Optional[str] = Header(
+        default=None, alias="X-Vigil-Run-Principal"
+    ),
     run_service: WorkflowRunService = Depends(provide_workflow_runs),
 ) -> None:
-    authorise(authorization, "run progress")
+    authorise_run(
+        "run progress", run_id, x_vigil_run_principal, authorization=authorization
+    )
     run_service.set_progress(
         run_id, iteration=update.iteration, max_cost_usd=update.max_cost_usd
     )
@@ -235,11 +279,16 @@ def record_terminal(
     run_id: str,
     update: TerminalUpdate,
     authorization: Optional[str] = Header(default=None),
+    x_vigil_run_principal: Optional[str] = Header(
+        default=None, alias="X-Vigil-Run-Principal"
+    ),
     run_service: WorkflowRunService = Depends(provide_workflow_runs),
     approvals: ApprovalService = Depends(provide_approvals),
     registry: Optional[MCPRegistry] = Depends(provide_mcp_registry),
 ) -> None:
-    authorise(authorization, "run outcome")
+    authorise_run(
+        "run outcome", run_id, x_vigil_run_principal, authorization=authorization
+    )
 
     withdraw_for_run(
         run_id,
@@ -261,6 +310,7 @@ def record_terminal(
         reason=update.reason or None,
         stop_cause=update.stop_cause,
         finished_at=_parse_finished_at(update.finished_at),
+        facts=update.facts(),
     )
 
     # The case the run was started from, so its report reaches the case rather than
@@ -271,10 +321,17 @@ def record_terminal(
         # After the withdrawal above, and never linked to the run, so nothing that
         # cleans up after the run takes them back: they are what it leaves to decide.
         if update.outcome == "completed" and update.proposed_actions:
-            _propose_actions(origin, run_id, update.proposed_actions, approvals)
-        # Only a run that reached its conclusion has rated anything.
+            _propose_actions(
+                origin,
+                run_id,
+                update.proposed_actions,
+                approvals,
+                registry,
+                _run_claims(run_id, x_vigil_run_principal),
+            )
+        # Only a run that reached its conclusion can dismiss its case.
         if update.outcome == "completed":
-            _raise_priority(origin, run_id, update.severity)
+            _retitle_case(origin, run_id, update.title)
             _close_dismissed(origin, run_id, update)
 
     # A threat hunt that proved a compromise tees up the backward root-cause run.
@@ -304,9 +361,14 @@ def record_child(
     run_id: str,
     body: ChildStart,
     authorization: Optional[str] = Header(default=None),
+    x_vigil_run_principal: Optional[str] = Header(
+        default=None, alias="X-Vigil-Run-Principal"
+    ),
 ) -> None:
     """A child run's start. The actor is the parent's agent; the origin is this run."""
-    authorise(authorization, "child run")
+    authorise_run(
+        "child run", run_id, x_vigil_run_principal, authorization=authorization
+    )
     session = get_db_session()
     try:
         # unlinked is not success: the agent retries, and a second post is a no-op
@@ -340,10 +402,15 @@ def record_handoff(
     run_id: str,
     handoff: TerminalHandoff,
     authorization: Optional[str] = Header(default=None),
+    x_vigil_run_principal: Optional[str] = Header(
+        default=None, alias="X-Vigil-Run-Principal"
+    ),
     run_service: WorkflowRunService = Depends(provide_workflow_runs),
     registry: Optional[MCPRegistry] = Depends(provide_mcp_registry),
 ) -> None:
-    authorise(authorization, "run handoff")
+    authorise_run(
+        "run handoff", run_id, x_vigil_run_principal, authorization=authorization
+    )
     origin = _origin_case(run_id, run_service)
     _process_handoff(
         run_id, handoff, origin, _source_is_hunt(run_id), run_service, registry
@@ -358,9 +425,14 @@ def record_findings(
     run_id: str,
     cited: CitedFindings,
     authorization: Optional[str] = Header(default=None),
+    x_vigil_run_principal: Optional[str] = Header(
+        default=None, alias="X-Vigil-Run-Principal"
+    ),
     run_service: WorkflowRunService = Depends(provide_workflow_runs),
 ) -> None:
-    authorise(authorization, "run findings")
+    authorise_run(
+        "run findings", run_id, x_vigil_run_principal, authorization=authorization
+    )
     case_id = _origin_case(run_id, run_service)
     if case_id:
         _link_findings(case_id, run_id, cited.finding_ids)
@@ -496,34 +568,37 @@ PROPOSAL_TITLES = {
     "block_domain": "Block domain",
     "quarantine_file": "Quarantine file",
     "disable_user": "Disable user",
+    "revoke_session": "Revoke sessions of",
     "custom": "Act on",
 }
 
 
-def _proposal(raw: Any) -> Optional[Dict[str, Any]]:
-    if not isinstance(raw, dict):
-        return None
-    action_type, target, reason = (
-        raw.get("action_type"),
-        raw.get("target"),
-        raw.get("reason"),
+# A proposal or why it was refused, as (code, target_kind). The target must fit
+# its action (core/response/proposal_targets.py) and the confidence be a stated
+# view above zero; neither rule reaches ApprovalService, whose checkpoints and
+# rule deploys pass 0.0 on purpose.
+def _proposal(raw: Any) -> Union[Dict[str, Any], Tuple[str, str]]:
+    from core.response.proposal_targets import (
+        check_confidence,
+        check_target,
+        target_kind,
     )
-    if action_type not in PROPOSAL_TITLES:
-        return None
-    if not isinstance(target, str) or not target.strip():
-        return None
-    if not isinstance(reason, str) or not reason.strip():
-        return None
-    confidence = raw.get("confidence", 0.0)
-    if isinstance(confidence, bool) or not isinstance(confidence, (int, float)):
-        return None
-    if not 0.0 <= confidence <= 1.0:
-        return None
+
+    if not isinstance(raw, dict):
+        return "action_type_unknown", "missing"
+    action_type, reason = raw.get("action_type"), raw.get("reason")
+    kind = target_kind(raw.get("target"))
+    target, code = check_target(action_type, raw.get("target"))
+    if code is None and (not isinstance(reason, str) or not reason.strip()):
+        code = "reason_missing"
+    code = code or check_confidence(raw)
+    if code:
+        return code, kind
     return {
         "action_type": action_type,
-        "target": target.strip(),
+        "target": target,
         "reason": reason.strip(),
-        "confidence": float(confidence),
+        "confidence": float(raw["confidence"]),
     }
 
 
@@ -540,6 +615,8 @@ def _propose_actions(
     run_id: str,
     proposals: List[Any],
     approvals: Optional[ApprovalService],
+    registry: Optional[MCPRegistry] = None,
+    run_claims: Optional[Claims] = None,
 ) -> None:
     from core.response.approval_service import ActionType
 
@@ -549,13 +626,15 @@ def _propose_actions(
     created: List[Tuple[str, str]] = []  # (title, target) newly filed in this call
     for index, raw in enumerate(proposals):
         proposal = _proposal(raw)
-        if proposal is None:
+        if isinstance(proposal, tuple):
             logger.warning(
-                "dropped proposed action %d of %s: not a valid proposal: %r",
+                "dropped proposed action %d of %s: %s: %r",
                 index,
                 run_id,
+                proposal[0],
                 raw,
             )
+            _record_rejection(case_id, run_id, index, raw, *proposal)
             continue
         action_type, target = proposal["action_type"], proposal["target"]
         title = f"{PROPOSAL_TITLES[action_type]} {target}"
@@ -569,7 +648,10 @@ def _propose_actions(
                 service, match, case_id, run_id, title
             ):
                 continue
-            action = service.create_action(
+            # This run's own ask failed before: a re-sent terminal files it again
+            # for a person, not for the ceiling.
+            resent = match is not None and match.idempotency_key == key
+            action, inserted = service._put_action(
                 action_type=ActionType(action_type),
                 title=title,
                 description=proposal["reason"],
@@ -591,7 +673,11 @@ def _propose_actions(
             )
             continue
         filed.append(action.action_id)
-        created.append((title, target))
+        if inserted and not resent and run_claims is not None:
+            action = _release_under_ceiling(action, run_claims, registry)
+        # One the ceiling carried out is no one's to decide: nobody is paged.
+        if action.status == "pending":
+            created.append((title, target))
 
     if filed:
         _record_proposals(case_id, run_id, filed)
@@ -601,9 +687,50 @@ def _propose_actions(
         page_proposed_containment(case_id, run_id, created)
 
 
+# The run's own claims when no person started it (#5235), else None: read from
+# the token authorise_run already verified, and checked against the run's start
+# entry so a run a person started, at any remove, always waits.
+def _run_claims(run_id: str, principal: Optional[str]) -> Optional[Claims]:
+    from core.agents.attribution import originating_person
+    from core.response.containment import unattended
+    from core.storage.connection import get_db_manager
+
+    try:
+        claims = unattended(tool_principal.read(principal or ""))
+        if claims is None or claims.run_id != run_id:
+            return None
+        with get_db_manager().session_scope() as session:
+            return None if originating_person(session, run_id) else claims
+    except Exception:  # noqa: BLE001 — unreadable is a person's to decide
+        logger.exception("could not read who started %s", run_id)
+        return None
+
+
+# Run on the app's loop, where the vendor servers' connections live: this route
+# runs in a worker thread. Any failure leaves the row pending.
+def _release_under_ceiling(
+    action: Any, claims: Claims, registry: Optional[MCPRegistry]
+) -> Any:
+    from anyio import from_thread
+
+    from core.auth.tool_principal import bound_claims
+    from core.response.containment import release_under_ceiling
+
+    async def release() -> Any:
+        with bound_claims(claims):
+            return await release_under_ceiling(action, claims, registry)
+
+    try:
+        return from_thread.run(release)
+    except Exception:  # noqa: BLE001 — filed either way
+        logger.exception("%s not released under the ceiling", action.action_id)
+        return action
+
+
 # True when another run's proposal already covers this one: a pending ask now
 # lists this case too, and an approved or executed one is noted here. A rejected
-# or failed one is not an answer to this run's evidence, so it is asked again.
+# or failed one is not an answer to this run's evidence, so it is asked again;
+# nor is an executed one undone since (a released host, an enabled user).
 def _already_asked(
     service: ApprovalService, match: Any, case_id: str, run_id: str, title: str
 ) -> bool:
@@ -619,6 +746,10 @@ def _already_asked(
                 {"action_id": match.action_id, "run_id": run_id, "case_id": first},
             )
             return True
+    from core.response.proposal_targets import undone
+
+    if match.status == "executed" and undone(match.action_type, match.execution_result):
+        return False
     if match.status in ("approved", "executed"):
         when = (match.executed_at or match.approved_at or "")[:10]
         _note_shared(
@@ -648,6 +779,44 @@ def _note_shared(case_id: str, description: str, details: Dict[str, Any]) -> Non
         logger.exception("could not note %r on case %s", description, case_id)
 
 
+# Once per run and index, so a re-sent terminal says nothing new. Neither the
+# target nor any text from it is copied: the case reads an activity as fact, and
+# the run's conclusion already holds what was asked.
+def _record_rejection(
+    case_id: str, run_id: str, index: int, raw: Any, code: str, kind: str
+) -> None:
+    from core.response.proposal_targets import ACTION_PHRASES, REASON_SENTENCES
+    from core.storage.database_data_service import DatabaseDataService
+
+    action_type = raw.get("action_type") if isinstance(raw, dict) else None
+    if not isinstance(action_type, str) or action_type not in ACTION_PHRASES:
+        action_type = None
+    try:
+        case = DatabaseDataService().get_case(case_id) or {}
+        if any(
+            a.get("activity_type") == "proposal_rejected"
+            and (a.get("details") or {}).get("run_id") == run_id
+            and (a.get("details") or {}).get("index") == index
+            for a in case.get("activities") or []
+        ):
+            return
+        asked = ACTION_PHRASES.get(action_type or "", "propose an action")
+        _add_activity(
+            case_id,
+            "proposal_rejected",
+            f"The run asked to {asked} and nothing was filed: {REASON_SENTENCES[code]}",
+            {
+                "run_id": run_id,
+                "index": index,
+                "action_type": action_type,
+                "reason_code": code,
+                "target_kind": kind,
+            },
+        )
+    except Exception:  # noqa: BLE001 — the run ended either way
+        logger.exception("could not record a refused proposal of %s", run_id)
+
+
 # Once per run: a re-sent terminal finds the same approvals, and the case already
 # says they were proposed.
 def _record_proposals(case_id: str, run_id: str, action_ids: List[str]) -> None:
@@ -674,77 +843,125 @@ def _record_proposals(case_id: str, run_id: str, action_ids: List[str]) -> None:
         )
 
 
-# The ratings a concluding run may give, which are the case priorities a human sets.
-# unknown is the absence of one, so it is never a conclusion.
-CONCLUDED_SEVERITIES = ("critical", "high", "medium", "low")
+TITLE_MAX = 200
 
 
-# The run's rating of what it found, as its case's priority. Only ever raised:
-# lowering a case is a dismissal, which the investigate guard and agent closure
-# own, so a conclusion rated below the case's priority leaves it alone.
-def _raise_priority(case_id: str, run_id: str, severity: Optional[str]) -> None:
-    from core.cases.case_workflow_service import preferred_merge_priority
+# The case is titled once, from its first alert, so after the run it still reads
+# like that alert. A title a person has edited is never replaced, and a closed
+# case keeps the title it was closed under.
+def _retitle_case(case_id: str, run_id: str, title: Optional[str]) -> None:
+    from core.cases.agent_closure import service_session
     from core.storage.database_data_service import DatabaseDataService
+    from core.storage.models import Case
 
-    rated = (severity or "").strip().lower()
-    if rated not in CONCLUDED_SEVERITIES:
+    new = " ".join((title or "").split())[:TITLE_MAX]
+    if not new:
         return
     try:
-        data = DatabaseDataService()
-        case = data.get_case(case_id)
-        if not case:
-            return
-        current = str(case.get("priority") or "").strip().lower() or "unknown"
-        if preferred_merge_priority(current, rated) == current:
-            return
-        if not data.update_case(case_id, priority=rated):
-            logger.error("could not raise the priority of case %s", case_id)
-            return
-        _add_activity(
-            case_id,
-            "agent_run_priority",
-            f"Priority raised from {current} to {rated} by the investigation",
-            {"run_id": run_id, "from": current, "to": rated},
-        )
+        # The case row stays locked from the read to the write, so a person's
+        # edit made meanwhile is waited for and then seen, never overwritten.
+        with service_session() as session:
+            case = session.get(Case, case_id, with_for_update=True)
+            if case is None or str(case.status or "").lower() == "closed":
+                return
+            old = str(case.title or "")
+            if new == old:
+                return
+            activities = list(case.activities or [])
+            if any(a.get("activity_type") == TITLE_EDITED for a in activities):
+                return
+            # The title and its activity in one write, so the write is not taken
+            # for a person's edit.
+            activities.append(
+                {
+                    "timestamp": utcnow().isoformat() + "Z",
+                    "activity_type": "agent_run_retitled",
+                    "description": f"Retitled by the investigation: {old} \u2192 {new}",
+                    "details": {"run_id": run_id, "from": old, "to": new},
+                    **activity_actor(session=session),
+                }
+            )
+            if not DatabaseDataService().update_case(
+                case_id, session=session, title=new, activities=activities
+            ):
+                logger.error("could not retitle case %s", case_id)
     except Exception:  # noqa: BLE001 — the run ended either way
-        logger.exception(
-            "could not apply the severity of %s to case %s", run_id, case_id
-        )
+        logger.exception("could not apply the title of %s to case %s", run_id, case_id)
 
 
-# The verdicts that dismiss a case. Both close it as a false positive: the alert that
-# opened it was not the attack it looked like.
+# The verdicts that dismiss a case. Both close it as a false positive, where the run
+# may act: the alert that opened it was not the attack it looked like.
 DISMISSALS = {"benign", "false_positive"}
+
+
+def _already_closed(case_id: str) -> bool:
+    """True when the case is gone or closed; False when it can't be read, so
+    the close path decides with its own read."""
+    from core.cases.agent_closure import service_session
+    from core.storage.models import Case
+
+    try:
+        with service_session() as session:
+            status = session.query(Case.status).filter(Case.case_id == case_id).scalar()
+    except Exception:  # noqa: BLE001 — the close path reads it again
+        logger.exception("could not read the status of case %s", case_id)
+        return False
+    return status is None or status == "closed"
 
 
 def _close_dismissed(case_id: str, run_id: str, update: TerminalUpdate) -> None:
     from core.cases.agent_closure import service_session
     from core.cases.case_workflow_service import CaseWorkflowService
-    from core.cases.closure import ClosureCategory
+    from core.cases.closure import DISMISSAL_CAUSES, ClosureCategory
+    from core.response.ceiling import close_held, finding_keys
     from core.storage.models import Case
 
     disposition = (update.disposition or "").strip().lower()
     if disposition not in DISMISSALS:
         return
+    # close_case overwrites a standing false_positive close, an analyst's
+    # included, so a case closed already, by anyone, is left as it is, and
+    # with nothing said about leaving it open.
+    if _already_closed(case_id):
+        return
+    # Closing is a reversible act; under Assist a person decides.
+    if held := close_held(run_id, lambda: finding_keys(case_id=case_id)):
+        _add_activity(
+            case_id,
+            "agent_run_left_open",
+            f"Left open for a person: the investigation concluded {disposition}, "
+            f"and {held}",
+            {"run_id": run_id, "disposition": disposition, "reason": held},
+        )
+        return
     try:
         with service_session() as session:
             case = session.query(Case).filter(Case.case_id == case_id).first()
-            # close_case overwrites a standing false_positive close, an analyst's
-            # included, so a case closed already, by anyone, is left as it is.
+            # Checked again on the session that closes: it may have closed since.
             if case is None or case.status == "closed":
                 return
+            # A cause only where the disposition names one; omitted, it stores null.
+            cause = DISMISSAL_CAUSES.get(disposition)
             CaseWorkflowService().close_case(
                 session,
                 case_id,
                 closure_category=ClosureCategory.FALSE_POSITIVE,
                 closed_by=run_id,
                 closure_notes=update.summary or None,
+                by_model=True,
+                **({"false_positive_cause": cause.value} if cause else {}),
             )
+        recorded = "expected activity" if cause else "a false positive"
         _add_activity(
             case_id,
             "agent_run_closed",
-            f"Closed as a false positive: the investigation concluded {disposition}",
-            {"run_id": run_id, "disposition": disposition},
+            f"Closed as {recorded}: the investigation concluded {disposition}",
+            {
+                "run_id": run_id,
+                "disposition": disposition,
+                "closure_category": ClosureCategory.FALSE_POSITIVE.value,
+                "false_positive_cause": cause.value if cause else None,
+            },
         )
     except Exception:  # noqa: BLE001 — the run ended either way
         logger.exception(
@@ -1050,16 +1267,29 @@ def record_checkpoint(
     run_id: str,
     raised: CheckpointRaised,
     authorization: Optional[str] = Header(default=None),
+    x_vigil_run_principal: Optional[str] = Header(
+        default=None, alias="X-Vigil-Run-Principal"
+    ),
     approvals: ApprovalService = Depends(provide_approvals),
 ) -> None:
-    authorise(authorization, "run checkpoint")
+    authorise_run(
+        "run checkpoint", run_id, x_vigil_run_principal, authorization=authorization
+    )
 
+    # A tool call's question carries its arguments, which the card shows whole from
+    # the parameters, so the title only names the tool rather than cutting them.
+    tool = (raised.context or {}).get("tool")
+    tool = tool if isinstance(tool, str) else ""
     # Idempotent per checkpoint inside raise_for_checkpoint, because a parked run
     # is announced on every sweep and would otherwise queue the question each time.
     raise_for_checkpoint(
         run_id=run_id,
         checkpoint_id=raised.checkpoint_id,
-        title=raised.question[:120] or raised.checkpoint_class,
+        title=(
+            f"Approve {tool}"
+            if tool
+            else raised.question[:120] or raised.checkpoint_class
+        ),
         description=raised.question,
         reason=_CHECKPOINT_REASONS.get(
             raised.checkpoint_class, "The run is waiting on your answer."
@@ -1079,11 +1309,16 @@ def record_checkpoint(
 def list_decisions(
     run_id: str,
     authorization: Optional[str] = Header(default=None),
+    x_vigil_run_principal: Optional[str] = Header(
+        default=None, alias="X-Vigil-Run-Principal"
+    ),
     approvals: ApprovalService = Depends(provide_approvals),
 ) -> Decisions:
     from core.response.approval_service import ActionStatus
 
-    authorise(authorization, "run decisions")
+    authorise_run(
+        "run decisions", run_id, x_vigil_run_principal, authorization=authorization
+    )
 
     decided: List[Decision] = []
     for status, answer in (

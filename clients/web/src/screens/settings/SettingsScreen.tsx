@@ -20,6 +20,9 @@ import { IntegrationsStateProvider, useIntegrationsState } from './IntegrationsS
 import SlaPoliciesSection, { SLA_DESC } from './SlaPoliciesSection'
 import DataUploadsSection from './DataUploadsSection'
 import AuditSection, { AUDIT_DESC } from './AuditSection'
+import EntityFactsSection from './EntityFactsSection'
+import OperatorInstructionsSection, { OPERATOR_INSTRUCTIONS_DESC } from './OperatorInstructionsSection'
+import SelectionSection from './SelectionSection'
 import NavigationSection from './NavigationSection'
 import { useAuth } from '../../contexts/AuthContext'
 import type { SectionProps } from './types'
@@ -28,15 +31,17 @@ const IS_DEV_MODE = import.meta.env.VITE_DEV_MODE === 'true'
 
 type NavKey =
   | 'ai-config'
+  | 'operator-instructions'
   | 'integrations'
   | 'federation'
   | 'sla'
   | 'autoinvestigate'
   | 'data'
   | 'audit'
+  | 'entity-facts'
   | 'system'
 
-type SystemTabKey = 'services' | 'system' | 'general' | 'dev' | 'users' | 'sessions' | 'appearance'
+type SystemTabKey = 'services' | 'system' | 'general' | 'jurisdictions' | 'dev' | 'users' | 'sessions' | 'appearance'
 
 interface NavDef {
   key: NavKey
@@ -63,6 +68,7 @@ const SYSTEM_TAB_DEFS: SystemTabDef[] = [
   { key: 'services', label: 'Services', perm: 'platform.read', Component: ServicesSection },
   { key: 'system', label: 'System', perm: 'platform.read', Component: SystemSection },
   { key: 'general', label: 'General', perm: 'platform.read', Component: GeneralSection },
+  { key: 'jurisdictions', label: 'Jurisdictions & kinds', perm: 'platform.read', Component: SelectionSection },
   { key: 'dev', label: 'Developer', devOnly: true, perm: 'platform.read', Component: DeveloperSection },
   { key: 'users', label: 'Team & access', perm: 'platform.read', Component: UsersSection },
   { key: 'sessions', label: 'Sessions', perm: 'sessions.manage', Component: SessionsSection },
@@ -105,12 +111,14 @@ function SystemTabs({ notify }: SectionProps) {
 
 const NAV: NavDef[] = [
   { key: 'ai-config', label: 'AI models', desc: AI_CONFIG_DESC, icon: 'sparkle', Component: AiConfigSection, ownsHead: true, perm: 'platform.read' },
+  { key: 'operator-instructions', label: 'Operator instructions', desc: OPERATOR_INSTRUCTIONS_DESC, icon: 'note', Component: OperatorInstructionsSection, perm: 'platform.read' },
   { key: 'integrations', label: 'Integrations', desc: INTEGRATIONS_DESC, icon: 'link', Component: IntegrationsSection, ownsHead: true, perm: 'integrations.read' },
   { key: 'federation', label: 'Alert collection', desc: 'Pull alerts from your SIEM and EDR tools on a schedule, so agents can start on them without anyone forwarding them.', icon: 'graph', Component: FederationSection, perm: 'platform.read' },
   { key: 'sla', label: 'SLA policies', desc: SLA_DESC, icon: 'clock', Component: SlaPoliciesSection, ownsHead: true, perm: 'platform.read' },
   { key: 'autoinvestigate', label: 'Limits & autonomy', desc: 'How much Vigil may do without you: whether agents start on their own, how many run at once, what they may spend, and which tools may act alone.', icon: 'bolt', Component: AutoInvestigateSection, perm: 'ai_autonomy.read' },
   { key: 'data', label: 'Data & uploads', desc: 'Bring data in without a live connector, and manage the detection rules applied to it.', icon: 'upload', Component: DataUploadsSection, perm: 'platform.read' },
   { key: 'audit', label: 'Audit', desc: AUDIT_DESC, icon: 'shield', Component: AuditSection, ownsHead: true, perm: 'audit.read' },
+  { key: 'entity-facts', label: 'Entity facts', desc: 'What Vigil holds about the users and hosts in findings, from where, how old it is, how often triage reuses it, and the limits it is kept under.', icon: 'user', Component: EntityFactsSection, perm: 'findings.read' },
   // ungated for the Appearance tab; its admin tabs gate themselves
   { key: 'system', label: 'System', desc: 'Service health, system information, general options, users, and how the console looks for you.', icon: 'wrench', Component: SystemTabs },
 ]

@@ -19,7 +19,17 @@ import re
 from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from typing import Any, Callable, Collection, Dict, List, Mapping, Optional, Tuple
+from typing import (
+    Any,
+    Callable,
+    Collection,
+    Dict,
+    List,
+    Mapping,
+    Optional,
+    Sequence,
+    Tuple,
+)
 
 from sqlalchemy import String, cast
 
@@ -90,9 +100,14 @@ def read_alert_labels(
     context: str = "", since: Optional[datetime] = None
 ) -> AlertLabels:
     """Scope by ``context``: empty is every alert, a case id is that case, else a label
-    match; with ``since``, only alerts stored at or after it."""
+    match; with ``since``, only alerts stored at or after it. A case the caller may
+    not read is no case: ``context`` is then a label match, as an unknown id is."""
+    # Here, not at import: core.auth needs the JWT secret, which image builds lack.
+    from core.auth.permissions import may_read_case
+
     with get_db_manager().session_scope() as session:
-        is_case = bool(context) and session.get(Case, context) is not None
+        case = session.get(Case, context) if context else None
+        is_case = case is not None and may_read_case(case)
         rows = session.query(
             FindingMitrePrediction.finding_id, FindingMitrePrediction.technique_id
         )
@@ -372,6 +387,8 @@ def _not_active_reason(entry: Optional[Mapping[str, Any]]) -> str:
 # --- Runs rules missed -------------------------------------------------------
 
 LEDGER_KINDS = ("hunt", "case")
+# A compose run with an execute trace, scored per technique (learning_episodes).
+EMULATION = "emulation"
 RULED_OUT = ("disproven", "false_positive")
 # A Verdict's entity keys, as the reconstruction step spells them. Other key types
 # (hash, domain, url...) are not entities a Finding is joined on.
@@ -402,21 +419,9 @@ def read_ledger(since_days: int = 30) -> List[Dict[str, Any]]:
             EpisodicVerdict.investigation_kind.in_(LEDGER_KINDS),
             EpisodicVerdict.concluded_at >= since,
         )
-        verdicts = [
-            {
-                "investigation_kind": v.investigation_kind,
-                "investigation_id": v.investigation_id,
-                "hypothesis_id": v.hypothesis_id,
-                "outcome": "proven" if v.outcome == "handed_off" else v.outcome,
-                "trust": v.trust,
-                "techniques": {t.strip().upper() for t in v.techniques or []},
-                "subjects": list(v.subject_entities or []),
-                "first_seen": _naive_utc(v.first_seen),
-                "last_seen": _naive_utc(v.last_seen),
-                "concluded_at": v.concluded_at,
-            }
-            for v in query.all()
-        ]
+        verdicts = [verdict_row(v) for v in query.all()]
+        hidden = _unreadable_runs(session, verdicts)
+        verdicts = [v for v in verdicts if _run(v) not in hidden]
         case_ids = {
             v["investigation_id"] for v in verdicts if v["investigation_kind"] == "case"
         }
@@ -487,6 +492,76 @@ def read_ledger(since_days: int = 30) -> List[Dict[str, Any]]:
     return verdicts
 
 
+def verdict_row(v: EpisodicVerdict) -> Dict[str, Any]:
+    """A Verdict as the ledger reads it. A ``handed_off`` outcome reads as ``proven``."""
+    return {
+        "investigation_kind": v.investigation_kind,
+        "investigation_id": v.investigation_id,
+        "hypothesis_id": v.hypothesis_id,
+        "outcome": "proven" if v.outcome == "handed_off" else v.outcome,
+        "trust": v.trust,
+        "techniques": {t.strip().upper() for t in v.techniques or []},
+        "subjects": list(v.subject_entities or []),
+        "first_seen": _naive_utc(v.first_seen),
+        "last_seen": _naive_utc(v.last_seen),
+        "concluded_at": v.concluded_at,
+    }
+
+
+def read_window_findings(start: datetime, end: datetime) -> List[Dict[str, Any]]:
+    """The Findings a Verdict's window is reconstructed against."""
+    from core.storage.database_data_service import DatabaseDataService
+
+    return DatabaseDataService().get_findings(
+        limit=FINDINGS_LIMIT, timestamp_start=start, timestamp_end=end
+    )
+
+
+def _unreadable_runs(session: Any, verdicts: List[Dict[str, Any]]) -> set:
+    """The (kind, id) of Verdicts on a restricted Case the caller may not read: a
+    Case Verdict on it, or a hunt or emulation run on it (trigger_context.case_id)."""
+    from core.auth.permissions import case_read_clause
+
+    ids = {
+        kind: {
+            v["investigation_id"] for v in verdicts if v["investigation_kind"] == kind
+        }
+        for kind in LEDGER_KINDS + (EMULATION,)
+    }
+    unreadable = ~case_read_clause()
+    hidden = set()
+    if ids["case"]:
+        hidden |= {
+            ("case", case_id)
+            for (case_id,) in session.query(Case.case_id).filter(
+                Case.case_id.in_(ids["case"]), unreadable
+            )
+        }
+    if ids["hunt"]:
+        hidden |= {
+            ("hunt", hunt_id)
+            for (hunt_id,) in session.query(EpisodicDistilMarker.investigation_id)
+            .join(
+                WorkflowRun,
+                WorkflowRun.run_id == cast(EpisodicDistilMarker.origin_run_id, String),
+            )
+            .join(Case, Case.case_id == WorkflowRun.trigger_context["case_id"].astext)
+            .filter(
+                EpisodicDistilMarker.investigation_kind == "hunt",
+                EpisodicDistilMarker.investigation_id.in_(ids["hunt"]),
+                unreadable,
+            )
+        }
+    if ids[EMULATION]:
+        hidden |= {
+            (EMULATION, run_id)
+            for (run_id,) in session.query(WorkflowRun.run_id)
+            .join(Case, Case.case_id == WorkflowRun.trigger_context["case_id"].astext)
+            .filter(WorkflowRun.run_id.in_(ids[EMULATION]), unreadable)
+        }
+    return hidden
+
+
 def _subject_entities(keys: List[str]) -> Dict[str, List[str]]:
     entities: Dict[str, List[str]] = {key: [] for key in _STEP_KEYS.values()}
     for key in normalise_keys(keys):
@@ -494,6 +569,17 @@ def _subject_entities(keys: List[str]) -> Dict[str, List[str]]:
         if kind in _STEP_KEYS:
             entities[_STEP_KEYS[kind]].append(value)
     return entities
+
+
+def _instant(value: Any) -> Optional[datetime]:
+    """An episode's ISO ``concluded_at`` as an aware UTC datetime."""
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        at = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return at if at.tzinfo else at.replace(tzinfo=timezone.utc)
 
 
 def _run(v: Mapping[str, Any]) -> Tuple[str, str]:
@@ -531,6 +617,7 @@ def missed_runs_report(
     rules_by_technique: Mapping[str, Collection[int]],
     since_days: int,
     since: Optional[datetime] = None,
+    emulations: Sequence[Mapping[str, Any]] = (),
 ) -> Dict[str, Any]:
     """Proven runs no rule alerted on, grouped by technique.
 
@@ -539,6 +626,12 @@ def missed_runs_report(
     (no host/IP/user, or a Findings read that was cut off) is unknown, never missed.
     With ``since``, only proven Verdicts concluded at or after it are reconstructed;
     ruled-out runs are still read across the whole window.
+
+    ``emulations`` are scored compose runs (``learning_episodes`` episodes, already
+    left out when on a Case the reader cannot read). A technique row of one whose
+    verdict is ``missed`` or ``loglm`` lists the run as ``("emulation", run_id)``,
+    counted as confirmed: the step is known to have run. One whose steps are all
+    ``unknown`` is listed in ``unknown`` with their reasons. Not read for a Case.
     """
     # Hunt Verdicts store techniques unchecked: an id that is not an active ATT&CK
     # technique never reaches a group, so a made-up one cannot become a Case.
@@ -599,6 +692,39 @@ def missed_runs_report(
     # Proven runs that also count a technique-less Verdict are not technique-less.
     without_technique -= {_run(v) for v in missed if v["techniques"]}
 
+    emulated = set()
+    emulations_caught = 0
+    for episode in () if is_case else emulations:
+        at = _instant(episode.get("concluded_at"))
+        if at is None or (since is not None and _naive_utc(at) < _naive_utc(since)):
+            continue
+        run = (EMULATION, str(episode["investigation_id"]))
+        for row in (episode.get("payload") or {}).get("techniques") or []:
+            technique = str(row.get("technique_id") or "").strip().upper()
+            if not _is_listable(technique) or not in_scope(technique):
+                continue
+            if row.get("verdict") == "unknown":
+                reasons = sorted(
+                    {s.get("reason") for s in row.get("steps") or [] if s.get("reason")}
+                )
+                unknown.append(
+                    {
+                        **_run_row(run),
+                        "technique": technique,
+                        "reason": "; ".join(reasons) or "no step could be judged",
+                    }
+                )
+                continue
+            if row.get("verdict") not in ("missed", "loglm"):
+                emulations_caught += 1
+                continue
+            emulated.add(run)
+            group = groups.setdefault(
+                technique, {"runs": {}, "confirmed": set(), "last": None}
+            )
+            group["runs"][run] = max(group["runs"].get(run, at), at)
+            group["confirmed"].add(run)
+
     ruled_out: Dict[str, set] = {}
     for v in verdicts:
         if v["outcome"] in RULED_OUT:
@@ -629,7 +755,9 @@ def missed_runs_report(
         "since_days": since_days,
         "proven_verdicts": len(proven),
         "verdicts_caught_by_rule": caught,
-        "missed_runs": len({_run(v) for v in missed}),
+        "missed_runs": len({_run(v) for v in missed} | emulated),
+        "emulation_runs_missed": len(emulated),
+        "emulated_techniques_caught_by_rule": emulations_caught,
         "missed_runs_without_technique": len(without_technique),
         "groups": listed,
         "groups_not_listed": len(rows) - len(listed),

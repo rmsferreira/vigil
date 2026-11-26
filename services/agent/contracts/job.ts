@@ -60,6 +60,30 @@ export interface StartRequest {
   // resolved Python-side. Journaled on the spec, so a resume needs no request.
   manifest?: string;
   manifest_skills?: SkillSpec[];
+  // The skills an operator added, less any a content scan holds, resolved Python-side.
+  // Every run is offered them beside its plugin's own. Journaled on the spec.
+  added_skills?: SkillSpec[];
+  // The declared zone a hunt starts on (#5212), resolved Python-side by core/site.py:
+  // its selectors are the hunt's scope, and its overlapping blind spots open as gaps.
+  zone?: ZoneScope;
+}
+
+// A blind spot of the applied site revision, as the zone's resolution carries it.
+export interface ZoneBlindSpot {
+  what: string;
+  selectors: string[];
+  file: string;
+  line: number;
+  revision: string;
+}
+
+export interface ZoneScope {
+  name: string;
+  selectors: string[];
+  file: string;
+  line: number;
+  revision: string;
+  blind_spots: ZoneBlindSpot[];
 }
 
 // A resume carries no request, so a resume path that read one would not compile.

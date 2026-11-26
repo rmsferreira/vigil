@@ -38,15 +38,26 @@ from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from core.auth import mfa_coverage, password_validator, token_expiry
+from core.auth import (
+    break_glass,
+    key_age,
+    mfa_coverage,
+    password_validator,
+    token_expiry,
+    token_policy,
+    token_unused,
+)
 from core.auth.auth_cookies import warn_if_cookie_insecure_in_production
 from core.auth.bootstrap_code import announce_setup_code
 from core.auth.key_ring import adopt_when_ready
+from core.auth.medic_notices import register as register_medic_notices
+from core.cases.indicator_notices import register as register_indicator_notices
 from core.platform.monitoring import (
     get_metrics_response,
     init_sentry,
     require_metrics_token,
 )
+from core.response.containment import register as register_ceiling_cap
 from core.storage.connection import MissingPostgresPasswordError
 from core.telemetry import configure_logging, init_telemetry
 from core.version import __version__
@@ -95,15 +106,26 @@ async def lifespan(app: FastAPI):
     await _startup(app)
     from mcp.server.transport_security import TransportSecuritySettings
 
+    from services.daemon.gaps import start_gaps_run
     from tools.mcp.vigil import mcp as vigil_mcp
+    from tools.mcp.vigil import serve_day1_runs, serve_gaps_runs
 
-    # The MCP session manager runs whether or not the surface is open: the
-    # toggle is a runtime one, so turning it on must not need a restart, and
-    # with the gate refusing every request the manager simply has nothing to do.
+    # start_gaps_run on /mcp queues through the daemon's intake, which tools/ can't import.
+    serve_gaps_runs(start_gaps_run)
+    # start_day1_report builds the report from this process's health.
+    serve_day1_runs(app.state.process_health)
+
+    # Stateless: no MCP session lives in a process's memory, so a client's
+    # requests may land on any worker or replica. Nothing needs a session --
+    # McpSurfaceGate authenticates and binds the caller on every request.
     #
-    # Built here, not at import: each app carries its own session manager and a
-    # manager runs once, so a process that starts the app twice -- a test, a
-    # reloader -- needs a new one rather than the same one again.
+    # The manager still runs, open surface or not: each request's server task
+    # starts in its task group, and the toggle is a runtime one, so turning the
+    # surface on must not need a restart.
+    #
+    # Built here, not at import: each app carries its own manager and a manager
+    # runs once, so a process that starts the app twice -- a test, a reloader --
+    # needs a new one rather than the same one again.
     #
     # The app serves at ``/mcp`` of its own accord; mounted at ``/mcp`` that
     # would put the real endpoint at /mcp/mcp. It is the mount that decides
@@ -122,6 +144,7 @@ async def lifespan(app: FastAPI):
     # deployment's DNS name, and getting a 421 whenever it drifted.
     _mcp_gate.app = vigil_mcp.streamable_http_app(
         streamable_http_path="/",
+        stateless_http=True,
         transport_security=TransportSecuritySettings(
             enable_dns_rebinding_protection=False,
         ),
@@ -200,6 +223,12 @@ if _cors_origins_raw:
 else:
     _cors_origins = _DEFAULT_CORS_ORIGINS
 
+# Caps every request body before the app reads it. Added before CORS so CORS
+# and the security headers wrap its 413; nothing outside it reads a body.
+from services.api.middleware.body_limit import BodyLimitMiddleware  # noqa: E402
+
+app.add_middleware(BodyLimitMiddleware)
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_cors_origins,
@@ -228,7 +257,27 @@ warn_if_cookie_insecure_in_production()
 mfa_coverage.register()
 password_validator.register()
 token_expiry.register()
+token_policy.register()
+token_unused.register()
+key_age.register()
+break_glass.register()
+register_medic_notices()
+register_indicator_notices()
+register_ceiling_cap()
+
+# The OAuth authorization server at the host root (#4787). Inside CSRF, which
+# exempts its unprefixed /token, /register and /revoke, and outside the app's
+# CORS, so the SDK's own CORS answers a connector's preflight.
+from services.api.oauth_surface import OAuthSurface  # noqa: E402
+
+app.add_middleware(OAuthSurface)
 app.add_middleware(CSRFMiddleware)
+
+# A 401 on /scim/ never reaches the handler. The note counts it and does not
+# read the body or the Authorization header (#4423).
+from services.api.middleware.scim_auth import ScimAuthNoteMiddleware  # noqa: E402
+
+app.add_middleware(ScimAuthNoteMiddleware)
 
 # Security headers added AFTER CORS so it is the outermost middleware on the
 # response path. That way HSTS/CSP/X-Frame-Options apply to CORS preflight
@@ -511,6 +560,12 @@ async def _startup(app: FastAPI):
     _build_services(app)
     _announce_mcp_surface()
 
+    from core.auth.auth_service import warn_retired_settings
+    from core.workflows.playbook_resolver import warn_default_wall
+
+    warn_retired_settings()
+    warn_default_wall()
+
     _testing = get_settings().testing
 
     # Initialize Sentry error tracking (was never called before — bug fix)
@@ -669,9 +724,30 @@ async def _startup(app: FastAPI):
     app.state.key_ring_task = asyncio.create_task(adopt_when_ready())
     app.state.setup_code_task = asyncio.create_task(announce_setup_code())
     if not _testing:
+        app.state.key_age_task = asyncio.create_task(key_age.run())
         from services.api.dormancy import run as dormancy_sweeper
 
         app.state.dormancy_task = asyncio.create_task(dormancy_sweeper())
+
+        from services.api.readiness import run as readiness_sweeper
+
+        app.state.readiness_task = asyncio.create_task(readiness_sweeper())
+
+        from services.api.capped_recheck import run as capped_recheck_driver
+
+        app.state.capped_recheck_task = asyncio.create_task(capped_recheck_driver())
+
+        from services.api.opencti_facts import run as opencti_facts
+
+        app.state.opencti_facts_task = asyncio.create_task(opencti_facts())
+
+        from services.api.skill_sweep import run as skill_sweeper
+
+        app.state.skill_sweep_task = asyncio.create_task(skill_sweeper())
+
+        from services.api.token_sweep import run as token_sweeper
+
+        app.state.token_sweep_task = asyncio.create_task(token_sweeper())
 
     if _testing:
         logger.info(
@@ -704,7 +780,22 @@ def _start_audit_feed(app) -> None:
 
 
 async def _stop_setup_code(app) -> None:
-    for name in ("key_ring_task", "setup_code_task", "dormancy_task"):
+    # Cancelling the task cannot stop the thread a sweep runs in; this does, at
+    # the next skill, so shutdown is not held for the rest of a long sweep.
+    from core.skills import skill_hold
+
+    skill_hold.cancel.set()
+    for name in (
+        "key_ring_task",
+        "key_age_task",
+        "setup_code_task",
+        "dormancy_task",
+        "readiness_task",
+        "capped_recheck_task",
+        "opencti_facts_task",
+        "skill_sweep_task",
+        "token_sweep_task",
+    ):
         task = getattr(app.state, name, None)
         if task is None:
             continue
@@ -1008,12 +1099,15 @@ _SERVED_BY_THE_BACKEND = (
     "/api",
     "/internal",
     "/mcp",
+    "/scim",
     "/assets",
     "/metrics",
     "/docs",
     "/redoc",
     "/openapi.json",
 )
+# The OAuth server's addresses sit at the host root, whatever the context path.
+from services.api.oauth_surface import ROOT_PREFIXES as _OAUTH_AT_ROOT  # noqa: E402
 
 
 def inject_index_head(raw: str, context_path: str, tags: list[str]) -> str:
@@ -1044,9 +1138,10 @@ def serves_the_app_shell(path: str, method: str, context_path: str = "") -> bool
     """
     if method not in ("GET", "HEAD"):
         return False
+    prefixed = [f"{context_path}{prefix}" for prefix in _SERVED_BY_THE_BACKEND]
     return not any(
-        path == f"{context_path}{prefix}" or path.startswith(f"{context_path}{prefix}/")
-        for prefix in _SERVED_BY_THE_BACKEND
+        path == prefix or path.startswith(f"{prefix}/")
+        for prefix in prefixed + list(_OAUTH_AT_ROOT)
     )
 
 

@@ -17,7 +17,8 @@ from fastapi import Header, HTTPException, Request, status
 from fastapi.concurrency import run_in_threadpool
 from sqlalchemy.orm import Session
 
-from core.auth import security_keys, session_policy, sign_ins
+from core.audit import trail
+from core.auth import security_keys, session_policy, sign_ins, trail_events
 from core.auth.auth_cookies import ACCESS_COOKIE_NAME
 from core.auth.auth_service import AuthService
 from core.auth.mcp_credential_service import (
@@ -36,6 +37,11 @@ logger = logging.getLogger(__name__)
 # The request ``get_current_user`` is authenticating, for the rest of that request.
 current_request: ContextVar[Optional[Request]] = ContextVar(
     "vigil_current_request", default=None
+)
+# The principal the DEV_MODE bypass runs as. Dev mode notes no HTTP actor, and the
+# restricted-case rule must still read as someone (#4354).
+dev_principal: ContextVar[Optional[str]] = ContextVar(
+    "vigil_dev_principal", default=None
 )
 
 ACCESS_TOKEN_TYPE = "access"
@@ -69,19 +75,33 @@ NEEDS_KEY = "Add a security key to continue"
 
 
 def setup_needed(
-    db: Session, user: User, held: list[str], current: session_policy.SessionPolicy
+    db: Session,
+    user: User,
+    held: list[str],
+    current: session_policy.SessionPolicy,
+    row: Optional[SignIn] = None,
 ) -> Optional[str]:
     """Why the requirement holds this account at setup, or None: it is covered and
     has no MFA, or it is covered by require_phishing_resistant, holds no key and
     keys are available (unavailable, the app still counts: a step-down). The one
-    check behind the gate and the console's setup screen."""
+    check behind the gate and the console's setup screen. ``row`` is the sign-in
+    asking: an SSO one whose provider met MFA counts as MFA, one that met it with
+    ``phr`` as a key, and a break-glass one is never held (the code carried it)."""
+    if row is not None and row.auth_method in sign_ins.NOT_HELD:
+        return None
+    met = row.mfa_met if row is not None else None
     machine = user.service_account is True
-    if not user.mfa_enabled and session_policy.mfa_covered(
-        held, machine, current.require_mfa
+    if (
+        not user.mfa_enabled
+        and met not in sign_ins.MET
+        and session_policy.mfa_covered(held, machine, current.require_mfa)
     ):
         return NEEDS_MFA
     if (
-        session_policy.mfa_covered(held, machine, current.require_phishing_resistant)
+        met != sign_ins.PROVIDER_PHR
+        and session_policy.mfa_covered(
+            held, machine, current.require_phishing_resistant
+        )
         and not security_keys.has_keys(db, user.principal_id)
         and security_keys.availability().available
     ):
@@ -176,7 +196,9 @@ def _check_sign_in(
     sign-in found past a limit is ended here, with its reason, and commits with the 401.
     An account the MFA requirement covers, with no MFA yet (or the key requirement,
     with no key), is refused with 403 ``mfa_setup_required`` unless the route is a setup route. Judged on every
-    request, so a role edit or a raised setting applies at the next one.
+    request, so a role edit or a raised setting applies at the next one. An idle
+    setting of 0 is no idle limit (``limits`` returns None), so idleness never
+    ends the sign-in; a new limit is counted from ``last_action_at`` on the next request.
     """
     with unit_of_work() as db:
         user = db.query(User).filter(User.user_id == user_id).first()
@@ -208,7 +230,7 @@ def _check_sign_in(
         limit = session_policy.limits(held, machine, current)
         now = utcnow()
         over = None
-        if row.started_at + limit.absolute <= now:
+        if sign_ins.end_of(row, limit.absolute) <= now:
             over = sign_ins.LENGTH_LIMIT
         elif limit.idle and row.last_action_at + limit.idle <= now:
             over = sign_ins.IDLE
@@ -216,7 +238,7 @@ def _check_sign_in(
             sign_ins.end(sid, over, db)
             return None, (status.HTTP_401_UNAUTHORIZED, _SIGN_IN_ENDED, over)
 
-        needed = None if setup_route else setup_needed(db, user, held, current)
+        needed = None if setup_route else setup_needed(db, user, held, current, row)
         if needed:
             return None, (
                 status.HTTP_403_FORBIDDEN,
@@ -236,6 +258,31 @@ def _bearer(authorization: Optional[str]) -> Optional[str]:
     if len(parts) == 2 and parts[0].lower() == "bearer":
         return parts[1]
     return None
+
+
+def _end_medic_password(user_id: str, principal_id: str, credential_id: str) -> None:
+    """Medic's password ends on its token's first accepted use (#4427).
+
+    A conditional clear, so concurrent first requests write one trail entry.
+    """
+    try:
+        with unit_of_work() as session:
+            ended = (
+                session.query(User)
+                .filter(User.user_id == user_id, User.password_hash.isnot(None))
+                .update({User.password_hash: None}, synchronize_session=False)
+            )
+            if ended:
+                sign_ins.end_all_for_user(user_id, sign_ins.ACCOUNT_CHANGED, session)
+                trail_events.record(
+                    session,
+                    "auth.password_ended",
+                    actor=trail.SYSTEM,
+                    principal=principal_id,
+                    credential_id=credential_id,
+                )
+    except Exception:  # noqa: BLE001 - the token stands; the next use tries again
+        logger.exception("Could not end Medic's password")
 
 
 def is_token_request(request: Optional[Request] = None) -> bool:
@@ -283,12 +330,15 @@ async def get_current_user(
     clear_http_actor()
     # For deny_unless, which has no request: a privileged write asks to confirm.
     current_request.set(request)
+    dev_principal.set(None)
     request.state.vigil_http_actor = None
 
     # DEV MODE: Bypass authentication and return mock user
     if DEV_MODE:
         logger.debug("DEV_MODE: Bypassing authentication")
-        return await run_in_threadpool(_detached, _get_dev_user)
+        user = await run_in_threadpool(_detached, _get_dev_user)
+        dev_principal.set(getattr(user, "principal_id", None))
+        return user
 
     presented = _bearer(authorization)
     if presented and looks_like_api_token(presented):
@@ -298,6 +348,17 @@ async def get_current_user(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail=_BAD_TOKEN,
                 headers={"WWW-Authenticate": "Bearer"},
+            )
+        # Lazy: service_account imports permissions, which imports this module.
+        from core.auth.service_account import is_medic
+
+        # The user row is loaded already: anyone else costs nothing more here.
+        if found.user.password_hash and is_medic(found.user):
+            await run_in_threadpool(
+                _end_medic_password,
+                found.user.user_id,
+                found.user.principal_id,
+                found.credential_id,
             )
         # No sign-in row and no claims: what needs a person's sign-in refuses it.
         request.state.vigil_http_actor = note_http_actor(

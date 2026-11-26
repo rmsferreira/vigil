@@ -7,7 +7,7 @@ elapsed cuts as ``CaseSLAService.get_sla_status``.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Optional
 
@@ -128,9 +128,19 @@ class QueueItem:
     needs_you: bool = False
     description: Optional[str] = None
     sla_paused: bool = False
+    # From core.cases.assignee.owner_states; None when unassigned.
+    owner_state: Optional[str] = None
+    # {id, name, is_default} of the owning team.
+    team: Optional[dict] = None
+    # Restricted cases (#4354): the reader list, which only its readers see.
+    restricted: bool = False
+    readers: list = field(default_factory=list)
+    reader_teams: list = field(default_factory=list)
 
 
-def queue_item(row, now: datetime, *, needs_you: bool = False) -> QueueItem:
+def queue_item(
+    row, now: datetime, *, needs_you: bool = False, owner_state: Optional[str] = None
+) -> QueueItem:
     """Apply combined state and the 75 / 90 health words to one SQL row."""
     health, seconds_left = sla_clock(
         now=now,
@@ -162,4 +172,17 @@ def queue_item(row, now: datetime, *, needs_you: bool = False) -> QueueItem:
         needs_you=needs_you,
         description=row.description,
         sla_paused=row.is_paused,
+        owner_state=owner_state,
+        team=(
+            {
+                "id": row.team_id,
+                "name": row.team_name,
+                "is_default": row.team_is_default,
+            }
+            if row.team_id
+            else None
+        ),
+        restricted=row.restricted,
+        readers=list(row.readers),
+        reader_teams=list(row.reader_teams),
     )

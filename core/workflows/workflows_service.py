@@ -15,15 +15,17 @@ from core.agents.attribution import (
     principal_id_for_username,
 )
 from core.agents.queue import new_run_id
+from core.agents.run_limits import OverrideRefused, check_overrides, check_wall_minutes
 from core.auth import sign_in_runs, sign_ins, tool_principal
 from core.auth.principals import SYSTEM_PRINCIPAL_ID
-from core.documents.fence import fenced_document
+from core.documents.fence import FINDING_NOTE, fenced, fenced_document
 from core.findings.anomaly_score import format_anomaly_score
 from core.frontmatter import FrontmatterError, split_frontmatter
 from core.threat_intel.mitre_lookup import iter_techniques, rank_by_confidence
 from core.workflows.custom_workflow_service import CustomWorkflowService
 from core.workflows.enablement import disabled_message, is_enabled
 from core.workflows.hypothesis_subjects import kept_subjects
+from core.workflows.redecision_hold import NOT_STARTED_HERE, WORKFLOW_ID
 from core.workflows.workflow_run_service import WorkflowRunService
 
 logger = logging.getLogger(__name__)
@@ -75,21 +77,20 @@ def _run_token(
     origin: str,
     sid: Optional[str] = None,
 ) -> str:
-    """The token the run carries. A token we signed is re-signed with this run.
+    """The token the run carries. Always re-signed for this run.
 
-    A value this process did not sign is kept as it arrived: the caller already
-    decided what the agent layer will carry.
+    A token this process signed lends its person and sign-in. One that does
+    not verify is not carried forward.
     """
     if principal:
         try:
             claims = tool_principal.read(principal)
         except tool_principal.InvalidPrincipal:
-            return principal
-        if claims.run_id and claims.agent_id:
-            return principal
-        username = username or claims.username
-        person_id = person_id or claims.person_id
-        sid = sid or claims.sid
+            claims = None
+        if claims is not None:
+            username = username or claims.username
+            person_id = person_id or claims.person_id
+            sid = sid or claims.sid
     return tool_principal.mint(
         username,
         person_id=person_id,
@@ -649,6 +650,8 @@ class WorkflowsService:
         origin_kind: Optional[str] = None,
         # The parent run, when origin_kind is parent.
         origin_id: Optional[str] = None,
+        # A declared zone a hunt starts on (#5212); its selectors become the scope.
+        zone: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Start a workflow as a compose run on the agent layer.
 
@@ -656,12 +659,16 @@ class WorkflowsService:
         and the outcome are read back through the run record, which the
         agent layer mirrors as each phase completes.
         """
-        from core.agents.operator_manifest import operator_request
+        from core.agents.operator_manifest import SkillHeld, operator_request
         from core.agents.queue import build_start_job, enqueue_run
 
         workflow = self.get_workflow(workflow_id)
         if not workflow:
             return {"success": False, "error": f"Workflow not found: {workflow_id}"}
+        # The re-decision starter calls begin_run and enqueue_run itself. The
+        # console, MCP and the handoff all come through here.
+        if workflow.id == WORKFLOW_ID:
+            return {"success": False, "error": NOT_STARTED_HERE}
         # The one check every starter reaches, the router and the handoff alike.
         if not is_enabled(workflow_id):
             return {
@@ -707,6 +714,22 @@ class WorkflowsService:
                 ),
             }
 
+        # Resolved before a run record exists, so a refused zone leaves none.
+        zoned = None
+        if zone:
+            if workflow.run_kind != HUNT_RUN_KIND:
+                return {
+                    "success": False,
+                    "error": "A zone scopes a hunt only",
+                    "refused": True,
+                }
+            from core import site
+
+            try:
+                zoned = await asyncio.to_thread(site.resolve_zone, zone)
+            except ValueError as exc:
+                return {"success": False, "error": str(exc), "refused": True}
+
         workflow_dict = workflow.to_dict(include_body=False)
         run_service = self._workflow_runs
         # One id for one run: the workflow run record and the agent ledger are two
@@ -734,6 +757,23 @@ class WorkflowsService:
             sid = await asyncio.to_thread(sign_in_runs.inherited_sid, origin_id)
         if sid and await asyncio.to_thread(sign_ins.ended_for_compromise, sid):
             return {"success": False, "error": sign_ins.STOP_REASON}
+        # Before a row exists: a refused limit must not leave a run queued.
+        ceiling = (parameters or {}).get("max_cost_usd")
+        minutes = (parameters or {}).get("max_wall_minutes")
+        budgets_override: Dict[str, Any] = {}
+        if ceiling:
+            budgets_override["max_cost_usd"] = ceiling
+        if minutes is not None:
+            try:
+                budgets_override["max_wall_ms"] = check_wall_minutes(minutes) * 60_000
+            except OverrideRefused as exc:
+                return {"success": False, "error": str(exc), "refused": True}
+        overrides = {"budgets": budgets_override} if budgets_override else None
+        if overrides is not None:
+            try:
+                check_overrides(overrides)
+            except OverrideRefused as exc:
+                return {"success": False, "error": str(exc), "refused": True}
         context = {**dict(parameters or {}), "run_kind": workflow.run_kind}
         agents = phase_actors(workflow.phases)
         if agents:
@@ -777,7 +817,6 @@ class WorkflowsService:
         )
         origin_value = _origin_value(resolved_origin, person_id, origin_id)
         asked = _asked_hypotheses(parameters)
-        ceiling = (parameters or {}).get("max_cost_usd")
         spec = _omit_unset(
             {
                 # A reference, not a path: the layers resolve at run start, so an
@@ -791,13 +830,12 @@ class WorkflowsService:
                 "hypotheses": asked,
                 "hypothesis_subjects": _asked_hypothesis_subjects(parameters, asked),
                 "iterations": (parameters or {}).get("iterations"),
-                "overrides": (
-                    {"budgets": {"max_cost_usd": ceiling}} if ceiling else None
-                ),
+                "overrides": overrides,
                 # True only: _omit_unset keeps None out, so an unset flag leaves the
                 # config's policy rather than pinning every run to this side's.
                 "approve_hypotheses": (parameters or {}).get("approve_hypotheses")
                 or None,
+                "zone": zoned,
             }
         )
         try:
@@ -820,12 +858,21 @@ class WorkflowsService:
                 "run_id": run_id,
             }
 
+        try:
+            operator = await asyncio.to_thread(
+                operator_request, workflow.metadata, workflow.run_kind
+            )
+        except SkillHeld as exc:
+            run_service.finalize_run(run_id, status="failed", error=str(exc))
+            note_terminal(run_id, "failed", "")
+            return {"success": False, "error": str(exc), "run_id": run_id}
+
         job = build_start_job(
             run_id=run_id,
             # The definition's run_kind, so both entry points queue the same loop.
             run_kind=workflow.run_kind,
             # A custom agent's manifest and skills ride the job, not the trail entry.
-            request={**spec, **operator_request(workflow.metadata)},
+            request={**spec, **operator},
             enqueued_by=actor or triggered_by or "api",
             principal=principal,
             actor=actor_principal,
@@ -881,14 +928,23 @@ class WorkflowsService:
                         )
                         or "None"
                     )
+                    # Title and description are the source's words: fenced, so
+                    # nothing they say reads as the brief's.
+                    text = "\n".join(
+                        str(finding.get(k))
+                        for k in ("title", "description")
+                        if finding.get(k)
+                    )
                     parts.append(f"""**Target Finding:**
 - Finding ID: {finding.get('finding_id')}
 - Severity: {finding.get('severity')}
 - Data Source: {finding.get('data_source')}
 - Timestamp: {finding.get('timestamp')}
 - Anomaly Score: {format_anomaly_score(finding.get('anomaly_score'))}
-- Description: {finding.get('description', 'N/A')}
-- MITRE ATT&CK Techniques: {technique_str}""")
+- MITRE ATT&CK Techniques: {technique_str}
+- Title and description: {FINDING_NOTE}
+
+{fenced(text or 'N/A')}""")
                 else:
                     parts.append(
                         f"**Target Finding ID:** {finding_id} (details will be retrieved during execution)"

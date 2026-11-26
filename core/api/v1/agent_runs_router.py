@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import uuid
 from typing import Any, Dict, Optional
@@ -28,6 +29,7 @@ from core.agents.directives import (
     enqueue_directive,
     refuse_unpermitted,
 )
+from core.agents.operator_manifest import added_request
 from core.agents.queue import (
     RUN_KINDS,
     build_start_job,
@@ -40,7 +42,8 @@ from core.auth.permissions import permission_gate
 from core.routing import Auth, RouterMeta, UnitOfWorkSession
 from core.storage.models import User
 from core.workflows.enablement import disabled_message, is_enabled
-from core.workflows.workflow_run_service import WorkflowRunService
+from core.workflows.redecision_hold import NOT_STARTED_HERE, WORKFLOW_ID
+from core.workflows.workflow_run_service import WorkflowRunService, run_hidden
 
 router = APIRouter()
 
@@ -74,7 +77,17 @@ class StartRunRequest(BaseModel):
         ..., description="Must be empty: the workflow reference carries its config."
     )
     prompt: str = Field(default="", description="What the run is being asked to do.")
-    overrides: Optional[Dict[str, Any]] = None
+    overrides: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description=(
+            "Per-run budgets and runtime limits. The dollar ceiling"
+            " (budgets.max_cost_usd) is checked before each model call, so a run can end above it by the cost of the call it was making"
+            " (which can include retries). Calls that couldn't be priced (up to 3),"
+            " calls whose usage had to be estimated, and requests a provider billed"
+            " but Vigil recorded as nothing aren't fully counted. The allowance "
+            "starts again when a run resumes."
+        ),
+    )
     tenant_id: Optional[str] = Field(
         default=None,
         deprecated=True,
@@ -111,6 +124,10 @@ class RunListItem(BaseModel):
 class RunListResponse(BaseModel):
     runs: list[RunListItem]
     count: int = Field(..., description="Number of runs in this page.")
+    hidden: int = Field(
+        default=0,
+        description="Runs that matched but are on a restricted case the caller can't read, left out.",
+    )
 
 
 # List agent runs newest-first from workflow_runs (filtered to source=agent);
@@ -125,11 +142,14 @@ def list_runs(
 
     limit = max(1, min(limit, 200))
     offset = max(0, offset)
+    hidden: list[int] = []
     rows = WorkflowRunService().list_runs(
         workflow_source="agent",
         status=status,
         limit=limit,
         offset=offset,
+        readable=True,
+        hidden=hidden,
     )
     items = [
         RunListItem(
@@ -142,7 +162,9 @@ def list_runs(
         )
         for r in rows
     ]
-    return RunListResponse(runs=items, count=len(items))
+    return RunListResponse(
+        runs=items, count=len(items), hidden=hidden[0] if hidden else 0
+    )
 
 
 # Mint a run id and enqueue it. The worker opens the ledger, not this call.
@@ -166,6 +188,9 @@ async def start_run(
         raise HTTPException(
             status_code=422, detail="playbook must be a workflow:<id> reference"
         )
+    # Re-decision is enqueued by its starter, not this surface.
+    if named == WORKFLOW_ID:
+        raise HTTPException(status_code=422, detail=NOT_STARTED_HERE)
     if request.arch or request.config:
         raise HTTPException(
             status_code=422,
@@ -217,7 +242,8 @@ async def start_run(
     job = build_start_job(
         run_id=run_id,
         run_kind=request.run_kind,
-        request=payload,
+        # The skills an operator added ride the job, not the trail entry.
+        request={**payload, **await asyncio.to_thread(added_request, request.run_kind)},
         enqueued_by=user.username,
         principal=tool_principal.mint(
             user.username,
@@ -269,7 +295,7 @@ def _begin_run_row(
         version = workflow.version
     WorkflowRunService().begin_run(
         workflow_id=workflow_id,
-        workflow_name=workflow_id,
+        workflow_name=workflow.name if workflow is not None else workflow_id,
         workflow_source="agent",
         workflow_version=version,
         trigger_context={
@@ -297,6 +323,8 @@ def get_run(run_id: str, session: UnitOfWorkSession) -> RunStatusResponse:
         run_id = str(uuid.UUID(run_id))
     except ValueError:
         raise HTTPException(status_code=404, detail=f"no such run: {run_id}") from None
+    if run_hidden(session, run_id):
+        raise HTTPException(status_code=404, detail=f"no such run: {run_id}")
 
     counted = session.execute(
         text(
@@ -387,6 +415,8 @@ def queue_directive(
         run_id = str(uuid.UUID(run_id))
     except ValueError:
         raise HTTPException(status_code=400, detail=f"not a run id: {run_id}") from None
+    if run_hidden(session, run_id):
+        raise HTTPException(status_code=404, detail=f"no such run: {run_id}")
     principal = getattr(current_user, "principal_id", None) or getattr(
         current_user, "user_id", None
     )

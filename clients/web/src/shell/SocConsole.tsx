@@ -5,7 +5,7 @@ import '../../../../docs/design/console/tokens/tokens.css'
 import '../styles.css'
 import './shell.css'
 import { useAuth } from '../contexts/AuthContext'
-import { approvalsApi, autonomyApi, casesApi, configApi, consoleApi, federationApi, mcpApi } from '../services/api'
+import { approvalsApi, autonomyApi, casesApi, configApi, consoleApi, integrationHealthApi, mcpApi } from '../services/api'
 import { Icon } from '../shared/icons'
 import { InfoTip } from '../shared/InfoTip'
 import { anyActs } from '../shared/autonomy'
@@ -33,7 +33,7 @@ import SignInWatch from './SignInWatch'
 import { useDesktopNotifications } from './useDesktopNotifications'
 import { useNavPrefs, writeNavPrefs } from './navPrefs'
 import { SCREEN_PERMS, splitNav, useConsoleNav, type NavItem } from './consoleNav'
-import type { ChatSeed, ConsoleScreenGoOptions, ConsoleScreenProps, SeedDocument, SettingsSectionKey } from '../shared/types'
+import type { ChatAgent, ChatSeed, ConsoleScreenGoOptions, ConsoleScreenProps, SeedDocument, SettingsSectionKey } from '../shared/types'
 import type { Schema } from '../services/apiTypes'
 import DashboardScreen from '../screens/dashboard/DashboardScreen'
 import DetectionsScreen from '../screens/detections/DetectionsScreen'
@@ -41,8 +41,11 @@ import CasesScreen from '../screens/cases/CasesScreen'
 import MetricsScreen from '../screens/metrics/MetricsScreen'
 import WorkflowsScreen from '../screens/workflows/WorkflowsScreen'
 import MedicScreen from '../screens/medic/MedicScreen'
+import SupervisoryScreen from '../screens/supervisory/SupervisoryScreen'
 import HealthScreen from '../screens/health/HealthScreen'
 import HomeScreen from '../screens/home/HomeScreen'
+import ReportScreen from '../screens/report/ReportScreen'
+import ReviewScreen from '../screens/review/ReviewScreen'
 import { HOME_SETUP_HREF, SETUP_HIDDEN_CHANGED, openSetupSteps, readSetupHidden } from '../screens/home/setupHidden'
 import SettingsScreen from '../screens/settings/SettingsScreen'
 import { AUTONOMY_CHANGED, DEMO_MODE_CHANGED } from '../screens/settings/useSettings'
@@ -54,8 +57,8 @@ import { VigilLogo } from '../shared/VigilLogo'
 import {
   authBypassed,
   foldStatus,
-  type FederationRead,
   type HealthRead,
+  type IntegrationHealthFold,
   type McpRead,
   type RoutabilityRead,
   type StatusFold,
@@ -79,6 +82,9 @@ const SCREENS: Record<ConsoleScreenKey, (props: ConsoleScreenProps) => JSX.Eleme
   workflows: WorkflowsScreen,
   health: HealthScreen,
   medic: MedicScreen,
+  supervisory: SupervisoryScreen,
+  report: ReportScreen,
+  review: ReviewScreen,
   settings: SettingsScreen,
 }
 
@@ -208,9 +214,10 @@ function SocConsoleInner() {
   const [needsYou, setNeedsYou] = useState(0)
   const [openCases, setOpenCases] = useState(0)
 
-  const openChat = useCallback((prompt?: string, document?: SeedDocument) => {
+  const openChat = useCallback((prompt?: string, options?: { document?: SeedDocument; agent?: ChatAgent }) => {
     setChatOpen(true)
-    if (prompt || document) setChatSeed({ text: prompt ?? '', document })
+    const { document, agent } = options ?? {}
+    if (prompt || document || agent) setChatSeed({ text: prompt ?? '', document, agent })
   }, [])
   const closeChat = useCallback(() => {
     setChatOpen(false)
@@ -222,9 +229,14 @@ function SocConsoleInner() {
   // with a case open the text goes to its own composer, not the dock
   const askVigil = useCallback((text?: string, document?: SeedDocument) => {
     if (openCaseId && text) setCaseSeed({ text, document })
-    else openChat(text, document)
+    else openChat(text, { document })
   }, [openCaseId, openChat])
   const clearCaseSeed = useCallback(() => setCaseSeed(null), [])
+  // a run the command bar started: the dock opens on its case
+  const followRun = useCallback((caseId: string, text: string) => {
+    setChatOpen(true)
+    setChatSeed({ text, caseId })
+  }, [])
 
   useEffect(() => {
     const onResize = () => setViewportWidth(window.innerWidth)
@@ -408,15 +420,23 @@ function SocConsoleInner() {
       inFlight = true
       Promise.all([
         settled(consoleApi.getHealth().then((res) => res.data as HealthRead)),
-        settled(federationApi.getHealth().then((res) => res.data as FederationRead)),
+        integrationHealthApi.get().then((res): IntegrationHealthFold => {
+          const sources = res.data?.sources
+          return Array.isArray(sources) ? { sources } : { failed: true }
+        }).catch((err: { response?: { status?: number } }): IntegrationHealthFold | null => {
+          const status = err.response?.status
+          // forbidden is left out of the fold; a 503 or a dropped connection is a failed read
+          if (status === 401 || status === 403) return null
+          return { failed: true }
+        }),
         settled(mcpApi.getStatuses().then((res) => res.data as McpRead)),
         settled(consoleApi.getRoutability().then((res) => res.data as RoutabilityRead)),
         settled(consoleApi.getProcesses().then((res) => res.data)),
         settled(configApi.getOrchestrator().then((res) => res.data as { enabled?: boolean })),
-      ]).then(([health, federation, mcp, routability, processes, autoOps]) => {
+      ]).then(([health, integrationHealth, mcp, routability, processes, autoOps]) => {
         inFlight = false
         if (!live) return
-        setStatus(foldStatus({ health, federation, mcp, routability, processes, autoOps }))
+        setStatus(foldStatus({ health, integrationHealth, mcp, routability, processes, autoOps }))
         if (health) setHealth(health)
         if (queued) {
           queued = false
@@ -608,6 +628,7 @@ function SocConsoleInner() {
       onOpenChat={askVigil}
       openCaseId={openCaseId}
       onOpenCase={setDrawerCase}
+      onRunStarted={followRun}
       onGo={(next, options) => {
         if (drawerCase) setDrawerCase(null)
         go(next, options)

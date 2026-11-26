@@ -70,7 +70,6 @@ _CATALOG_ONLY_SECRET_FIELDS: Mapping[str, tuple[str, ...]] = {
     "gcp-threat-intel": ("api_key",),
     "firecrawl": ("api_key",),
     "cribl-stream": ("password",),
-    "cloudforce_one": ("api_token",),
 }
 
 
@@ -186,6 +185,7 @@ SETTINGS_SECRET_NAMES: frozenset[str] = frozenset({"BIFROST_ADMIN_PASSWORD"})
 ENV_CREDENTIAL_NAMES: frozenset[str] = frozenset(
     {
         "AGENT_INTERNAL_TOKEN",
+        "AGENT_INTERNAL_TOKEN_PREVIOUS",
         "ALIENVAULT_OTX_API_KEY",
         "AWS_ACCESS_KEY_ID",
         "AWS_SECRET_ACCESS_KEY",
@@ -216,6 +216,7 @@ ENV_CREDENTIAL_NAMES: frozenset[str] = frozenset(
         # processes receive the value as POSTGRES_PASSWORD, so Python does not.
         "POSTGRES_APP_PASSWORD",
         "POSTGRES_PASSWORD",
+        "SHELL_TOKEN",
         "SHODAN_API_KEY",
         "SLACK_BOT_TOKEN",
         "SMTP_PASSWORD",
@@ -231,27 +232,69 @@ ENV_CREDENTIAL_NAMES: frozenset[str] = frozenset(
 )
 
 
-def _custom_secret_fields(integration_id: str) -> Dict[str, str]:
-    """Password-typed fields of a Custom Integration, from its saved metadata.
+# A Custom Integration's secret is stored under ``<ID>_<FIELD>``, so both are
+# caller-chosen. Only a ``custom-`` id with a plain field name may hold one: its
+# key then starts ``CUSTOM_`` and cannot name a platform secret (JWT_SECRET_KEY,
+# AGENT_INTERNAL_TOKEN, a built-in integration's credential, ...).
+CUSTOM_INTEGRATION_PREFIX = "custom-"
+_CUSTOM_FIELD_RE = re.compile(r"^[a-z0-9_]{1,64}$")
+
+
+def custom_secret_allowed(integration_id: str, field_name: object) -> bool:
+    """Whether a Custom Integration field may be stored as a secret."""
+    return (
+        integration_id.startswith(CUSTOM_INTEGRATION_PREFIX)
+        and integration_id not in INTEGRATION_SECRET_FIELDS
+        and isinstance(field_name, str)
+        and bool(_CUSTOM_FIELD_RE.match(field_name))
+    )
+
+
+def _custom_password_fields(integration_id: str) -> List[str]:
+    """Password-typed field names of a Custom Integration, from its saved metadata.
 
     Custom Integrations are defined at runtime, so they are read here rather than
-    built into the registry at import. An unreadable file reads as no secrets.
+    built into the registry at import. An unreadable file reads as no fields.
     """
+    if integration_id in INTEGRATION_SECRET_FIELDS:
+        return []
     try:
         metadata = json.loads(
             vigil_path("custom_integrations", "metadata.json").read_text()
         )
     except (OSError, ValueError):
-        return {}
+        return []
     entry = metadata.get(integration_id) if isinstance(metadata, dict) else None
     fields = entry.get("fields") if isinstance(entry, dict) else None
-    return {
-        field["name"]: env_var_for(integration_id, field["name"])
-        for field in fields or []
+    return [
+        field["name"]
+        for field in (fields if isinstance(fields, list) else [])
         if isinstance(field, dict)
         and field.get("type") == "password"
         and isinstance(field.get("name"), str)
+    ]
+
+
+def _custom_secret_fields(integration_id: str) -> Dict[str, str]:
+    """Password-typed fields of a Custom Integration that may be stored."""
+    return {
+        name: env_var_for(integration_id, name)
+        for name in _custom_password_fields(integration_id)
+        if custom_secret_allowed(integration_id, name)
     }
+
+
+def unstorable_secret_fields(integration_id: str) -> List[str]:
+    """Password-typed Custom Integration fields whose store key is refused.
+
+    Metadata saved before the ``custom-`` rule (or written by hand) can still
+    declare them; their values are neither stored as secrets nor kept in plaintext.
+    """
+    return [
+        name
+        for name in _custom_password_fields(integration_id)
+        if not custom_secret_allowed(integration_id, name)
+    ]
 
 
 def secret_fields_for(integration_id: str) -> Mapping[str, str]:
@@ -275,12 +318,15 @@ def split_secrets(
     removed — safe to persist to the DB / JSON.
     """
     mapping = secret_fields_for(integration_id)
-    if not mapping:
+    refused = set(unstorable_secret_fields(integration_id))
+    if not mapping and not refused:
         return {}, dict(config)
 
     secrets: Dict[str, str] = {}
     non_secrets: Dict[str, object] = {}
     for field, value in config.items():
+        if field in refused:
+            continue  # never persisted in plaintext; the save route refuses a value
         env_key = mapping.get(field)
         if env_key is None:
             non_secrets[field] = value
@@ -298,10 +344,11 @@ def redact_secrets(integration_id: str, config: Dict[str, object]) -> Dict[str, 
     credentials. The form will treat absent secret fields as "leave existing
     value untouched" on the next save.
     """
-    mapping = secret_fields_for(integration_id)
-    if not mapping:
-        return dict(config)
-    return {k: v for k, v in config.items() if k not in mapping}
+    hidden = {
+        *secret_fields_for(integration_id),
+        *unstorable_secret_fields(integration_id),
+    }
+    return {k: v for k, v in config.items() if k not in hidden}
 
 
 # Storage records integration changes but cannot import this module.
@@ -323,6 +370,42 @@ def _same_destination(old: object, new: object) -> bool:
     return norm(old) == norm(new)
 
 
+def _verifies(value: object) -> bool:
+    # Unset reads as "verify" in every integration; anything else not plainly
+    # true is treated as off, the way the clients would read it.
+    if value is None:
+        return True
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in ("1", "true", "yes", "on")
+
+
+def _trust_widened(
+    stored_config: Mapping[str, object], new_config: Mapping[str, object]
+) -> bool:
+    """Whether the save loosens which server the stored credential will trust.
+
+    Turning ``verify_ssl`` off, or any change to ``ca_cert_path`` (a blank one
+    trusts the whole default store) or ``proxy_type``, lets a different server
+    receive the credential. The save replaces the stored config, so an omitted
+    key is a cleared one.
+    """
+    if _verifies(stored_config.get("verify_ssl")) and not _verifies(
+        new_config.get("verify_ssl")
+    ):
+        return True
+    if not _same_destination(
+        stored_config.get("ca_cert_path"), new_config.get("ca_cert_path")
+    ):
+        return True
+
+    def proxy(config: Mapping[str, object]) -> str:
+        value = str(config.get("proxy_type") or "").strip().lower()
+        return "" if value == "none" else value  # the form's default
+
+    return proxy(stored_config) != proxy(new_config)
+
+
 def credentials_to_resupply(
     integration_id: str,
     stored_config: Mapping[str, object],
@@ -334,9 +417,10 @@ def credentials_to_resupply(
     changing where an integration connects must not carry the old credential
     to the new host. When a destination field differs from the stored one,
     every secret that is currently set has to be present and non-empty in
-    ``new_config``; the names of those that are not are returned.
+    ``new_config``; the names of those that are not are returned. Loosening
+    TLS trust (see ``_trust_widened``) counts as a move.
     """
-    moved = any(
+    moved = _trust_widened(stored_config, new_config) or any(
         _DESTINATION_KEY.search(key)
         and not _same_destination(stored_config.get(key), value)
         for key, value in new_config.items()

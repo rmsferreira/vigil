@@ -5,18 +5,20 @@ import { ConfirmDialog, EmptyState, Select, SettingsCard, TextInput } from '../.
 import {
   tokensApi,
   type ApiToken,
+  type ApiTokenLimits,
   type ApiTokenHolder,
   type ApiTokenStatus,
 } from '../../services/api'
 import type { SectionProps } from './types'
 
-// The server's rule: a person's token defaults to 90 days and lasts a year at most.
-const LIFETIMES = [
-  { value: '30', label: '30 days' },
-  { value: '90', label: '90 days (default)' },
-  { value: '180', label: '180 days' },
-  { value: '365', label: '1 year' },
-]
+// What a person may pick: these, up to the maximum the session policy sets, and the maximum itself.
+const LIFETIME_STEPS = [30, 90, 180, 365]
+const lifetimeLabel = (d: number) => (d === 365 ? '1 year' : `${d} day${d === 1 ? '' : 's'}`)
+function lifetimeOptions(limits: ApiTokenLimits | null) {
+  if (limits?.max_days == null) return []
+  const days = [...new Set([...LIFETIME_STEPS.filter((d) => d <= limits.max_days!), limits.max_days])].sort((a, b) => a - b)
+  return days.map((d) => ({ value: String(d), label: d === limits.default_days ? `${lifetimeLabel(d)} (default)` : lifetimeLabel(d) }))
+}
 
 const STATUSES = [
   { value: '', label: 'Any status' },
@@ -66,12 +68,26 @@ function Dates({ t }: { t: ApiToken }) {
   )
 }
 
+/** The token's label; an OAuth grant is marked as a connected app, with its client's name (#4789). */
+function Label({ t }: { t: ApiToken }) {
+  const name = t.connected_app ? t.client_name || t.label : t.label
+  return (
+    <td style={{ whiteSpace: 'normal' }}>
+      <div className="flex flex-col items-start gap-1">
+        <span className="line-clamp-2 break-words" title={name}>{name}</span>
+        {t.connected_app && <span className="text-xs text-tx-3">Connected app</span>}
+      </div>
+    </td>
+  )
+}
+
 /** The one place a new token is shown. The server keeps only a hash of it. */
-function Reveal({ token, onDone }: { token: string; onDone: () => void }) {
+function Reveal({ token, rule, onDone }: { token: string; rule: string | null; onDone: () => void }) {
   return (
     <div className="mcp-callout" role="alert">
       <strong>Copy this now. It is not stored and cannot be shown again.</strong>
       <pre className="mcp-token">{token}</pre>
+      {rule && <span className="text-xs text-tx-3">{rule}</span>}
       <button className="btn" onClick={onDone}>
         I have copied it
       </button>
@@ -80,18 +96,24 @@ function Reveal({ token, onDone }: { token: string; onDone: () => void }) {
 }
 
 /**
- * Your own API tokens, and for a `users.write` holder everyone's.
+ * Your own API tokens, and for a `users.write` holder everyone's. With `account`,
+ * one service account's instead: the holder mints and rotates them for it.
  *
  * A token calls the API and Vigil's MCP server as its holder, as a program and
  * never as a person: it cannot change an account or mint another token.
  */
-export default function TokensCard({ notify, canManage }: SectionProps & { canManage: boolean }) {
+export default function TokensCard({
+  notify,
+  canManage,
+  account,
+}: SectionProps & { canManage: boolean; account?: { user_id: string; username: string } }) {
   const [own, setOwn] = useState<ApiToken[] | null>(null)
   const [failed, setFailed] = useState(false)
   const [busy, setBusy] = useState(false)
   const [label, setLabel] = useState('')
-  const [days, setDays] = useState('90')
-  const [revealed, setRevealed] = useState<string | null>(null)
+  const [days, setDays] = useState('')
+  const [limits, setLimits] = useState<ApiTokenLimits | null>(null)
+  const [revealed, setRevealed] = useState<{ token: string; rule: string | null } | null>(null)
   const [rotating, setRotating] = useState<ApiToken | null>(null)
   const [compromise, setCompromise] = useState(false)
 
@@ -101,18 +123,19 @@ export default function TokensCard({ notify, canManage }: SectionProps & { canMa
   const [status, setStatus] = useState('')
   const [allFailed, setAllFailed] = useState(false)
 
+  const accountId = account?.user_id
   const loadOwn = useCallback(() => {
-    tokensApi
-      .listOwn()
+    ;(accountId ? tokensApi.listAll({ holder: accountId }) : tokensApi.listOwn())
       .then((r) => {
         setOwn(r.data.tokens)
+        setLimits(r.data.limits)
         setFailed(false)
       })
       .catch(() => setFailed(true))
-  }, [])
+  }, [accountId])
 
   const loadAll = useCallback(() => {
-    if (!canManage) return
+    if (!canManage || accountId) return
     tokensApi
       .listAll({ holder: holder || undefined, status: (status || undefined) as ApiTokenStatus | undefined })
       .then((r) => {
@@ -121,7 +144,7 @@ export default function TokensCard({ notify, canManage }: SectionProps & { canMa
         setAllFailed(false)
       })
       .catch(() => setAllFailed(true))
-  }, [canManage, holder, status])
+  }, [canManage, accountId, holder, status])
 
   useEffect(loadOwn, [loadOwn])
   useEffect(loadAll, [loadAll])
@@ -144,8 +167,9 @@ export default function TokensCard({ notify, canManage }: SectionProps & { canMa
 
   const mint = () =>
     act(async () => {
-      const r = await tokensApi.mint(label.trim(), Number(days))
-      setRevealed(r.data.token)
+      // A service account's token has no length to choose: the server gives it its maximum.
+      const r = await tokensApi.mint(label.trim(), limits?.fixed ? undefined : Number(chosen), accountId)
+      setRevealed({ token: r.data.token, rule: r.data.unused_rule })
       setLabel('')
     }, 'Could not mint a token')
 
@@ -153,7 +177,7 @@ export default function TokensCard({ notify, canManage }: SectionProps & { canMa
     rotating &&
     act(async () => {
       const r = await tokensApi.rotate(rotating.credential_id, compromise)
-      setRevealed(r.data.token)
+      setRevealed({ token: r.data.token, rule: r.data.unused_rule })
       setRotating(null)
       setCompromise(false)
     }, 'Could not rotate that token')
@@ -161,8 +185,19 @@ export default function TokensCard({ notify, canManage }: SectionProps & { canMa
   const revoke = (t: ApiToken) =>
     act(async () => {
       await tokensApi.revoke(t.credential_id)
-      notify('ok', 'Token revoked')
+      notify('ok', t.connected_app ? 'App disconnected' : 'Token revoked')
     }, 'Could not revoke that token')
+
+  const options = lifetimeOptions(limits)
+  const chosen = options.some((o) => o.value === days) ? days : String(limits?.default_days ?? '')
+  const maxText =
+    limits === null
+      ? null
+      : limits.max_days == null
+        ? 'The token policy can’t be read, so no token can be minted until Settings › Sessions is saved again.'
+        : limits.fixed
+          ? `A token here lasts ${limits.max_days} days, the maximum set for service-account tokens in Settings › Sessions.`
+          : `A token lasts at most ${limits.max_days} days, the maximum set in Settings › Sessions.`
 
   const holderOptions = [
     { value: '', label: 'Any holder' },
@@ -176,9 +211,13 @@ export default function TokensCard({ notify, canManage }: SectionProps & { canMa
     <>
       <SettingsCard
         wide
-        id="tokens"
-        title="API tokens"
-        desc="A token lets a program call Vigil’s API and MCP server as you. What it may do is what your account may do, and it is recorded against your name. A token can never change an account or mint another token."
+        id={account ? `tokens-${account.user_id}` : 'tokens'}
+        title={account ? `Tokens of ${account.username}` : 'API tokens'}
+        desc={
+          account
+            ? `A token lets the integration call Vigil’s API as this service account, with what its role allows. Each lasts ${limits?.max_days == null ? 'the maximum set for service-account tokens' : `${limits.max_days} days, the maximum set for service-account tokens`}; rotate before it ends. Minting and rotating is a person’s act: a token can never mint another token.`
+            : 'A token lets a program call Vigil’s API and MCP server as you. What it may do is what your account may do, and it is recorded against your name. A token can never change an account or mint another token. Apps you approve through OAuth show here as connected apps; revoke one to disconnect it.'
+        }
         actions={
           <button className="btn ghost" onClick={reload}>
             <Icon name="refresh" /> Refresh
@@ -186,7 +225,7 @@ export default function TokensCard({ notify, canManage }: SectionProps & { canMa
         }
       >
         <div className="flex flex-col gap-3.5">
-          {revealed && <Reveal token={revealed} onDone={() => setRevealed(null)} />}
+          {revealed && <Reveal token={revealed.token} rule={revealed.rule} onDone={() => setRevealed(null)} />}
 
           <div className="flex gap-2 flex-wrap items-center">
             <div className="flex-1" style={{ minWidth: 220 }}>
@@ -194,15 +233,18 @@ export default function TokensCard({ notify, canManage }: SectionProps & { canMa
                 value={label}
                 maxLength={200}
                 aria-label="Token label"
-                placeholder="What holds it — “the platform”, “my laptop”"
+                placeholder={
+                  account ? 'What holds it — “the audit forwarder”' : 'What holds it — “the platform”, “my laptop”'
+                }
                 onChange={(e) => setLabel(e.target.value)}
               />
             </div>
-            <Select value={days} options={LIFETIMES} onSelect={setDays} name="Lasts" />
-            <button className="btn primary" disabled={busy || !label.trim()} onClick={mint}>
+            {!limits?.fixed && options.length > 0 && <Select value={chosen} options={options} onSelect={setDays} name="Lasts" />}
+            <button className="btn primary" disabled={busy || !label.trim() || limits?.max_days == null} onClick={mint}>
               <Icon name="plus" /> Mint
             </button>
           </div>
+          {maxText && <span className="text-xs text-tx-3" style={{ marginTop: -6 }}>{maxText}</span>}
 
           {own === null ? (
             failed ? (
@@ -210,18 +252,18 @@ export default function TokensCard({ notify, canManage }: SectionProps & { canMa
                 compact
                 error
                 icon="alert"
-                title="Couldn’t load your tokens"
+                title={account ? 'Couldn’t load its tokens' : 'Couldn’t load your tokens'}
                 primary={{ label: 'Retry', onClick: loadOwn, icon: 'refresh' }}
               />
             ) : (
-              <EmptyState compact loading icon="link" title="Loading your tokens…" />
+              <EmptyState compact loading icon="link" title={account ? 'Loading its tokens…' : 'Loading your tokens…'} />
             )
           ) : own.length === 0 ? (
             <EmptyState
               compact
               icon="link"
               title="No tokens yet"
-              body="Mint one above to let a program call Vigil as you."
+              body={account ? 'Mint one above to give the integration access.' : 'Mint one above to let a program call Vigil as you.'}
             />
           ) : (
             <div className="table-wrap">
@@ -239,12 +281,11 @@ export default function TokensCard({ notify, canManage }: SectionProps & { canMa
                 <tbody>
                   {own.map((t) => (
                     <tr key={t.credential_id}>
-                      <td style={{ whiteSpace: 'normal' }}>
-                        <span className="line-clamp-2 break-words" title={t.label}>{t.label}</span>
-                      </td>
+                      <Label t={t} />
                       <Dates t={t} />
                       <td className="col-act" style={{ textAlign: 'right' }}>
-                        {t.status === 'active' && (
+                        {/* an app's connection rotates through its own refresh: revoke only */}
+                        {t.status === 'active' && !t.connected_app && (
                           <div className="inline-flex gap-1.5 items-center">
                             <button
                               className="btn ghost"
@@ -259,7 +300,7 @@ export default function TokensCard({ notify, canManage }: SectionProps & { canMa
                             <HoldButton label="Hold to revoke" name={`Revoke ${t.label}`} disabled={busy} onConfirm={() => revoke(t)} />
                           </div>
                         )}
-                        {t.status === 'rotated' && (
+                        {(t.status === 'rotated' || (t.status === 'active' && t.connected_app)) && (
                           <HoldButton label="Hold to revoke" name={`Revoke ${t.label}`} disabled={busy} onConfirm={() => revoke(t)} />
                         )}
                       </td>
@@ -302,12 +343,12 @@ export default function TokensCard({ notify, canManage }: SectionProps & { canMa
         />
       </SettingsCard>
 
-      {canManage && (
+      {canManage && !account && (
         <SettingsCard
           wide
           id="all-tokens"
           title="All API tokens"
-          desc="Every token on this install, whoever holds it. You can revoke any of them, including one held by someone with more access than you; the holder is told. Only a token’s holder can rotate it."
+          desc="Every token on this install, whoever holds it. You can revoke any of them, including one held by someone with more access than you; the holder is told. Only a token’s holder can rotate it, or for a service account, a holder of users.write (from its row under Service accounts)."
           actions={
             <>
               <Select value={holder} options={holderOptions} onSelect={setHolder} name="Holder" searchable />
@@ -352,9 +393,7 @@ export default function TokensCard({ notify, canManage }: SectionProps & { canMa
                           {t.holder.service_account && <span className="text-xs text-tx-3">Service account</span>}
                         </div>
                       </td>
-                      <td style={{ whiteSpace: 'normal' }}>
-                        <span className="line-clamp-2 break-words" title={t.label}>{t.label}</span>
-                      </td>
+                      <Label t={t} />
                       <Dates t={t} />
                       <td className="col-act" style={{ textAlign: 'right' }}>
                         {(t.status === 'active' || t.status === 'rotated') && (

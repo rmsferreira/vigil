@@ -16,7 +16,7 @@ from sqlalchemy import (
     Text,
     text,
 )
-from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.dialects.postgresql import ARRAY, JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
 from core.storage.models.base import Base
@@ -74,21 +74,29 @@ class SignIn(Base):
     expires_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     ended_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     end_reason: Mapped[Optional[str]] = mapped_column(String(30), nullable=True)
-    # When MFA was last passed: completing MFA at sign-in, a confirmation or a
-    # strong check. The privileged idle window counts from it (core/auth/step_up.py).
+    # When the person last confirmed: completing MFA at sign-in, a confirmation
+    # or a strong check, and, with Require MFA off, a password. Confirm it's you
+    # counts from it (core/auth/step_up.py): the privileged idle limit, up to
+    # 12 hours, or 10 minutes when that limit is 0.
     confirmed_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     # Failed confirmations in a row; the third ends the sign-in.
     confirm_failures: Mapped[int] = mapped_column(
         Integer, nullable=False, default=0, server_default=text("0")
     )
-    # The person's last own action: what the idle limit counts from.
+    # The person's last own action: what the idle limit counts from. An idle
+    # setting of 0 is no idle limit, so idleness does not end the sign-in.
     last_action_at: Mapped[datetime] = mapped_column(
         DateTime, nullable=False, default=utcnow, server_default=text("now()")
     )
-    # 'password', 'mfa', 'mfa_step_down' or 'recovery_step_down'
+    # 'password', 'mfa', 'mfa_step_down', 'recovery_step_down' or 'sso'
     auth_method: Mapped[str] = mapped_column(
         String(20), nullable=False, default="password", server_default="password"
     )
+    # An SSO sign-in's way of meeting MFA (core/auth/sign_ins.py, epic #4751).
+    mfa_met: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
+    # Set when the end comes before started_at plus the absolute length: an SSO
+    # sign-in whose MFA came from an earlier sign-in at the provider.
+    ends_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     # The browser's user agent: the sign-in's tokens are honoured only from it.
     user_agent: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     device: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
@@ -106,8 +114,14 @@ class SignIn(Base):
             "end_reason IN ('sign_out', 'expiry', 'revoked', 'idle', 'length_limit',"
             " 'token_reuse', 'upgrade', 'account_changed', 'deactivated', 'erased',"
             " 'ended_by_person', 'ended_by_admin', 'everyone_signed_out',"
-            " 'sign_in_limit', 'too_many_confirmations')",
+            " 'sign_in_limit', 'too_many_confirmations', 'restore',"
+            " 'recovery', 'mfa_reset', 'sso_required')",
             name="sign_ins_end_reason_check",
+        ),
+        CheckConstraint(
+            "mfa_met IN ('provider_mfa', 'provider_phr', 'vigil_factor',"
+            " 'step_down', 'none')",
+            name="sign_ins_mfa_met_check",
         ),
         Index("idx_sign_ins_principal", "principal_id"),
     )
@@ -151,6 +165,113 @@ class SecurityKey(Base):
     )
 
 
+class SsoLink(Base):
+    """An account's identity at the single sign-on provider (#4284): the
+    provider's issuer and subject. One subject names one account; the link is
+    made at the first sign-in through the provider. ``core/auth/sso.py`` owns it.
+    """
+
+    __tablename__ = "sso_links"
+
+    link_id: Mapped[str] = mapped_column(String(50), primary_key=True)
+    principal_id: Mapped[str] = mapped_column(
+        Text,
+        ForeignKey("principals.principal_id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    issuer: Mapped[str] = mapped_column(Text, nullable=False)
+    subject: Mapped[str] = mapped_column(Text, nullable=False)
+    # The provider's externalId. Nullable until a sign-in or a push records it.
+    # Unique per issuer when set. ``managed`` is set by a push, not by sign-in.
+    directory_id: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    managed: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=text("false")
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, default=utcnow, server_default=text("now()")
+    )
+
+    __table_args__ = (
+        Index("idx_sso_links_principal", "principal_id"),
+        Index("uq_sso_links_subject", "issuer", "subject", unique=True),
+        Index(
+            "uq_sso_links_directory",
+            "issuer",
+            "directory_id",
+            unique=True,
+            postgresql_where=text("directory_id IS NOT NULL"),
+        ),
+    )
+
+
+class AuthLink(Base):
+    """A single-use link that reaches a public screen: an invite (#4226), a
+    password reset, or a confirmation of an address the person changed. Only
+    the SHA-256 of the random value is kept; the value itself is shown once
+    and never stored. ``core/auth/invites.py`` owns it.
+    """
+
+    __tablename__ = "auth_links"
+
+    link_id: Mapped[str] = mapped_column(String(50), primary_key=True)
+    kind: Mapped[str] = mapped_column(String(10), nullable=False)
+    token_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    # The address an invite is for; a reset names its account instead.
+    email: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    principal_id: Mapped[Optional[str]] = mapped_column(
+        Text, ForeignKey("principals.principal_id", ondelete="RESTRICT"), nullable=True
+    )
+    # Not a foreign key: a role deleted since is refused at acceptance.
+    role_id: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+    invited_by: Mapped[Optional[str]] = mapped_column(
+        Text, ForeignKey("principals.principal_id", ondelete="RESTRICT"), nullable=True
+    )
+    channel: Mapped[Optional[str]] = mapped_column(String(10), nullable=True)
+    issued_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, default=utcnow, server_default=text("now()")
+    )
+    expires_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    used_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    revoked_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    # Set when the trail first recorded the link as expired.
+    expired_noted_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime, nullable=True
+    )
+    # Failed tries (a refused password or a taken username).
+    attempts: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default=text("0")
+    )
+    # Teams chosen for the account, kept until accept. Null joins the default team.
+    team_ids: Mapped[Optional[list[str]]] = mapped_column(
+        ARRAY(String(50)), nullable=True
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "kind IN ('invite', 'reset', 'email')", name="auth_links_kind_check"
+        ),
+        Index("uq_auth_links_token_hash", "token_hash", unique=True),
+        # One open invite per address, whatever its expiry: replacing closes it.
+        Index(
+            "uq_auth_links_open_invite",
+            text("lower(email)"),
+            unique=True,
+            postgresql_where=text(
+                "kind = 'invite' AND used_at IS NULL AND revoked_at IS NULL"
+            ),
+        ),
+        # One open email-confirmation link per account: a new one closes the last.
+        Index(
+            "uq_auth_links_open_email",
+            "principal_id",
+            unique=True,
+            postgresql_where=text(
+                "kind = 'email' AND used_at IS NULL AND revoked_at IS NULL"
+            ),
+        ),
+    )
+
+
 class User(Base):
     """
     User Model - System users with authentication and authorization.
@@ -173,7 +294,8 @@ class User(Base):
     # Authentication
     username: Mapped[str] = mapped_column(String(100), unique=True, nullable=False)
     email: Mapped[str] = mapped_column(String(200), unique=True, nullable=False)
-    password_hash: Mapped[str] = mapped_column(String(255), nullable=False)
+    # NULL for a service account: it signs in by token only (#4224).
+    password_hash: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
 
     # Profile
     full_name: Mapped[str] = mapped_column(String(200), nullable=False)
@@ -186,6 +308,14 @@ class User(Base):
     # Status
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     is_verified: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    # Why the account is inactive, written only by deactivate_account and cleared
+    # on reactivate. Null on rows deactivated before this existed, and that is
+    # not a sync deactivation. scim_version is the If-Match token for a push.
+    deactivation_route: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
+    deactivated_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    scim_version: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=1, server_default=text("1")
+    )
 
     # MFA
     mfa_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
@@ -223,6 +353,12 @@ class User(Base):
         DateTime, nullable=True
     )
 
+    # Break-glass (#4532): when the host marked this account. Set and cleared only
+    # by scripts/reset_password.py. A marked account signs in under Require SSO
+    # with its password, a code and a reason; its lock is always timed, and it is
+    # left out of dormancy and password expiry.
+    break_glass_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+
     # Password history — list of prior bcrypt hashes, newest first. Used
     # to reject reuse of the last N passwords. Capped in application code.
     password_history: Mapped[List[str]] = mapped_column(
@@ -231,18 +367,19 @@ class User(Base):
     password_changed_at: Mapped[Optional[datetime]] = mapped_column(
         DateTime, nullable=True
     )
-    # Tokens with an earlier ``iat`` are rejected. Same transaction as the
-    # change that ends sessions; NULL on existing rows, so the migration
-    # does not sign anyone out.
-    tokens_valid_after: Mapped[Optional[datetime]] = mapped_column(
-        DateTime, nullable=True
-    )
 
     # A machine login, not a person: today only Medic's gateway (D2-17). Exempt
     # from lockout and held to the Viewer role. Set only by
-    # core/auth/service_account.py, which the enable flow runs; no API writes it.
+    # core/auth/service_account.py, which the enable flow runs, or
+    # POST /api/users/service-accounts.
     service_account: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False, server_default=text("false")
+    )
+    # A created service account's purpose, and the person answerable for it, by
+    # principal id: an erasure rewrites names but keeps ids (#4224).
+    purpose: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    accountable_principal_id: Mapped[Optional[str]] = mapped_column(
+        Text, ForeignKey("principals.principal_id", ondelete="RESTRICT"), nullable=True
     )
 
     # Timestamps
@@ -337,6 +474,24 @@ class McpCredential(Base):
     # The credential that replaced this one when it was rotated. Set once: a
     # rotated credential is not rotated again.
     successor_id: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+    # When the unused-token reminder went out (core.auth.token_unused). Whether it
+    # still counts is judged against last use, the last restore and the period.
+    reminded_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    # An OAuth grant (#4787): the client it was issued to, the access token's
+    # end, and SHA-256s of the current and previous refresh tokens. All null on
+    # a personal API token.
+    oauth_client_id: Mapped[Optional[str]] = mapped_column(
+        String(50), ForeignKey("oauth_clients.client_id"), nullable=True
+    )
+    access_expires_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime, nullable=True
+    )
+    refresh_hash: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    previous_refresh_hash: Mapped[Optional[str]] = mapped_column(
+        String(64), nullable=True
+    )
+    # The resource (RFC 8707) a grant's tokens are for (#4788, revision 0099).
+    resource: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
     __table_args__ = (Index("idx_mcp_credentials_user", "user_id"),)
 
@@ -375,6 +530,65 @@ class McpCredential(Base):
         }
 
 
+class OAuthClient(Base):
+    """A client that registered itself with the authorization server (#4787).
+
+    Public only: no secret is issued or stored. ``source`` is how it came to
+    exist (``dynamic`` registration today). Built by
+    ``core/upgrade/versions/0098_oauth_clients.sql``.
+    """
+
+    __tablename__ = "oauth_clients"
+
+    client_id: Mapped[str] = mapped_column(String(50), primary_key=True)
+    name: Mapped[Optional[str]] = mapped_column(String(200), nullable=True)
+    redirect_uris: Mapped[list] = mapped_column(JSONB, nullable=False)
+    auth_method: Mapped[str] = mapped_column(String(40), nullable=False)
+    source: Mapped[str] = mapped_column(
+        String(20), nullable=False, default="dynamic", server_default="dynamic"
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, default=utcnow, server_default=text("now()")
+    )
+    last_used_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+
+
+class OAuthPending(Base):
+    """An authorization request waiting for consent, then its code (#4787).
+
+    Keyed by a SHA-256 of the request id; the code is stored the same way.
+    """
+
+    __tablename__ = "oauth_pending"
+
+    request_hash: Mapped[str] = mapped_column(String(64), primary_key=True)
+    client_id: Mapped[str] = mapped_column(
+        String(50),
+        ForeignKey("oauth_clients.client_id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    redirect_uri: Mapped[str] = mapped_column(Text, nullable=False)
+    redirect_uri_explicit: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    state: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    code_challenge: Mapped[str] = mapped_column(String(128), nullable=False)
+    scopes: Mapped[str] = mapped_column(Text, nullable=False)
+    resource: Mapped[str] = mapped_column(Text, nullable=False)
+    user_id: Mapped[Optional[str]] = mapped_column(
+        String(50), ForeignKey("users.user_id", ondelete="CASCADE"), nullable=True
+    )
+    code_hash: Mapped[Optional[str]] = mapped_column(
+        String(64), unique=True, nullable=True
+    )
+    # The sign-in that approved it (#4788): the code is good only while it is open.
+    sign_in_id: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, default=utcnow, server_default=text("now()")
+    )
+    expires_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+
+    __table_args__ = (Index("idx_oauth_pending_expires", "expires_at"),)
+
+
 class BreachedPassword(Base):
     """A breached-list entry an administrator imported, lowercased (#4175).
 
@@ -385,4 +599,24 @@ class BreachedPassword(Base):
     entry: Mapped[str] = mapped_column(Text, primary_key=True)
     added_at: Mapped[datetime] = mapped_column(
         DateTime, nullable=False, default=utcnow, server_default=text("now()")
+    )
+
+
+class IdentifierReservation(Base):
+    """An erased person's username or email, kept as a keyed hash of its folded
+    form so nobody else can take it. Never the value, its kind or the person.
+    ``key_version`` is the key-ring ``identifier`` key that made the hash.
+    ``core/auth/identity.py`` reads it and ``core/audit/retention.py`` writes it.
+    """
+
+    __tablename__ = "identifier_reservations"
+
+    hash: Mapped[str] = mapped_column(Text, primary_key=True)
+    key_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    # Naive UTC, as everywhere else (core/time.py).
+    reserved_at: Mapped[datetime] = mapped_column(
+        DateTime,
+        nullable=False,
+        default=utcnow,
+        server_default=text("(now() AT TIME ZONE 'utc')"),
     )

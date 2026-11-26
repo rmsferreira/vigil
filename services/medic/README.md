@@ -2,7 +2,8 @@
 
 Medic is the ops-health watcher for a Vigil install (program name: System
 Watcher). It watches the install's own health, not security alerts. Phase 0 is
-observe-only: no fixes, and nothing leaves the site.
+observe-only: no fixes. Email goes only where the site has set up mail, and
+Medic itself never calls out.
 
 It is **off by default**. `VIGIL_MEDIC_ENABLED=true` turns it on; anything else
 and `run` logs why and exits 0.
@@ -11,7 +12,16 @@ and `run` logs why and exits 0.
 python -m services.medic run     # the service (below)
 python -m services.medic check   # exit 0 only if the heartbeat is fresh (< 120 s) and says running (or degraded)
 python -m services.medic check --ready  # exit 0 only if the API answers the status op (Helm readiness)
+python -m services.medic section [--since-days N]  # public-safe prepare_support_bundle incidents (default 7)
 ```
+
+`section` reads `medic.db` through the read-only reader and writes one JSON
+document to stdout: incidents in the window whose stored `would_have` action is
+`prepare_support_bundle`, projected onto one field list. It writes nothing, reads
+no API key, and does not open a moved-aside `medic.db.corrupt-*` file. Exit 0
+when the document is whole, including zero incidents. Exit 1 with an empty
+stdout and one stderr line (`out of time`, `store unreadable`, or `malformed`)
+when the document is not. Bad arguments exit 2.
 
 `run` works in 15 s cycles: the sensors that are due read the agent worker's
 `/readyz` (one address on Compose and host-native, each pod on Helm) and
@@ -38,6 +48,7 @@ with its own reason (`stopped`, `stalled`, `crash-looping`, unknown).
 | `VIGIL_MEDIC_DATA_DIR` | `/var/lib/vigil-medic` (macOS: `/Library/Application Support/vigil-medic`) |
 | `VIGIL_MEDIC_STORE_MAX_MB` | `1024`. The decision store's size cap in MiB (whole number, ≥ 1). At the cap, or below the free-space floor, Medic stops recording and says so on `/v1/status` and the heartbeat |
 | `VIGIL_MEDIC_TRACE` | Unset: trace capture off. A trace-id (`^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`) writes every redacted observation the engine receives to `<data dir>/traces/<trace-id>/` (trace format v1, `contracts/trace_check.py`). An invalid id or an existing directory means no capture and one error log. Capture stops for the run at 256 MiB or when the store's free-space floor trips (`/v1/status` `trace.state` = `stopped_at_cap`); detection continues. A killed capture is finalised as `interrupted` at the next start. Replay one with `python -m services.medic.replay <trace-dir> --store <empty dir>` (validates, then runs the engine on the trace's own clock into a fresh store; prints the replay store's head) |
+| `VIGIL_MEDIC_PERSISTENCE` | Unset: on. Whether Medic's data directory survives a restart (the Helm chart sets it). A fix type's level and its counts live in `<data dir>/packs/levels.json`, so with anything but a clear "on" Medic refuses to raise a fix type to L2 (`POST /v1/fix-level`: 409 `fix_refused`, reason `persistence_off`). Lowering still works |
 | `VIGIL_MEDIC_INSTALL_SHAPE` | `compose` (`start_sh`, `compose` or `helm`) |
 | `VIGIL_MEDIC_AGENT_WORKER_ADDR` | Compose: `agent-worker:6990`; host-native: `127.0.0.1:6990`. Helm ignores it and reads each agent-worker pod. `host:port` only |
 | `VIGIL_MEDIC_AGENT_SERVE_ADDR` | Compose: `agent-serve:6989`. Helm and host-native set it (the chart, `medic-loop`); unset registers no sensor. `host:port` only |

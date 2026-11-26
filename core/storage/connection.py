@@ -86,6 +86,7 @@ _PLATFORM_DB_PROXY_KEYS = {
     "proxy_password": "PLATFORM_DB_PROXY_PASSWORD",
     "ssh_private_key_path": "PLATFORM_DB_SSH_PRIVATE_KEY_PATH",
     "ssh_key_passphrase": "PLATFORM_DB_SSH_KEY_PASSPHRASE",
+    "ssh_host_key": "PLATFORM_DB_SSH_HOST_KEY",
     "verify_proxy_tls": "PLATFORM_DB_VERIFY_PROXY_TLS",
 }
 
@@ -249,6 +250,27 @@ def _engine_connect_args(config: "DatabaseConfig", url: str) -> Dict[str, Any]:
     # Bounded so validating an unreachable host fails in seconds rather than
     # hanging a worker thread for the OS TCP timeout (~75s).
     args: Dict[str, Any] = {"connect_timeout": 5}
+    proxy = getattr(config, "proxy", None)
+    if proxy is not None and proxy.enabled and proxy.proxy_type == "pgbouncer":
+        if proxy.verify_proxy_tls:
+            # "Verify proxy TLS" means a verified certificate for the pooler's
+            # name, failing closed. The CA is PGSSLROOTCERT, else the system store.
+            args["sslmode"] = "verify-full"
+            if not os.environ.get("PGSSLROOTCERT"):  # noqa: ENV001 - libpq var
+                args["sslrootcert"] = "system"
+    if proxy is not None and proxy.enabled and proxy.proxy_type == "ssh_tunnel":
+        # Through a tunnel the URL host is loopback, so no certificate names
+        # the database; never send its password in cleartext (libpq >= 16).
+        # md5 and SCRAM servers still work.
+        try:
+            import psycopg2
+
+            if psycopg2.__libpq_version__ >= 160000 and not os.environ.get(
+                "PGREQUIREAUTH"  # noqa: ENV001 - libpq var
+            ):
+                args["require_auth"] = "!password"
+        except ImportError:
+            pass
     options = _session_timeout_options(config)
     if options:
         # An explicit ``options`` replaces libpq's PGOPTIONS fallback. Carry it
@@ -265,6 +287,7 @@ _SHIPPED_DEFAULT_PASSWORDS = frozenset(
     {
         "deeptempo_secure_password_change_me",
         "vigil_app_password_change_me",
+        "vigil_agent_password_change_me",
         "change-me-before-production",
     }
 )
@@ -276,23 +299,29 @@ class MissingPostgresPasswordError(RuntimeError):
     """No Postgres password resolved and DEV_MODE is off. Fatal at startup."""
 
 
-def _flag_shipped_default(password: str) -> None:
-    """ERROR once per process when the password in use is a published default.
+class PublishedPostgresPasswordError(MissingPostgresPasswordError):
+    """The Postgres password is a published default and DEV_MODE is off."""
 
-    Logged, not refused: existing Compose installs initialised their volume
-    with it, and refusing would lock them out of their own database.
+
+def _refuse_shipped_default(password: str) -> None:
+    """Refuse a published default outside DEV_MODE; in DEV_MODE, log it once.
+
+    ./start.sh replaces a published value in .env and sets the database to
+    match, so one still in use means that step was skipped.
     """
     global _shipped_default_logged
-    if (
-        password in _SHIPPED_DEFAULT_PASSWORDS
-        and not _shipped_default_logged
-        and not get_settings().dev_mode
-    ):
+    if password not in _SHIPPED_DEFAULT_PASSWORDS:
+        return
+    if not get_settings().dev_mode:
+        raise PublishedPostgresPasswordError(
+            "The Postgres password is a published default; run ./start.sh once "
+            "to replace it (or set DEV_MODE=true)."
+        )
+    if not _shipped_default_logged:
         _shipped_default_logged = True
         logger.error(
             "The Postgres password in use is a published default shipped with "
-            "Vigil. Set POSTGRES_PASSWORD to a unique value (and change it in "
-            "the database) before exposing this deployment."
+            "Vigil. Accepted because DEV_MODE is on."
         )
 
 
@@ -300,7 +329,7 @@ def resolve_postgres_password() -> str:
     """The POSTGRES_PASSWORD to connect with; fails closed outside DEV_MODE."""
     value = get_secret("POSTGRES_PASSWORD")
     if value:
-        _flag_shipped_default(value)
+        _refuse_shipped_default(value)
         return value
     if get_settings().dev_mode:
         logger.warning(
@@ -375,7 +404,7 @@ class DatabaseConfig:
         self.database = parsed.database
         self.user = parsed.user
         self.password = parsed.password
-        _flag_shipped_default(parsed.password)
+        _refuse_shipped_default(parsed.password)
         self.ssl_mode = parsed.query.get("sslmode") or get_settings().postgres_ssl_mode
         self.extra_query = {k: v for k, v in parsed.query.items() if k != "sslmode"}
 

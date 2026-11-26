@@ -10,13 +10,15 @@ import { poolConfig } from "./core/db.js";
 import { errorFields, logger } from "./core/log.js";
 import { failed, initTracing, shutdownTracing, traced } from "./core/tracing.js";
 import type { ToolPrincipal } from "./contracts/tool.js";
+import { spendOf } from "./contracts/budget.js";
 import { FRESH } from "./core/budget.js";
 import { nullMemory, recalling } from "./core/memory.js";
 import type { Memory, State } from "./core/seams.js";
 import { assembleSpec, loadArch, parseConfig, parsePlaybook, SpecError, type Playbook, type RunSpec } from "./core/spec.js";
 import { chatEvents, sse } from "./plugins/chat/sse.js";
 import { runChat, type Turn } from "./plugins/chat/workflow.js";
-import { harnessFor, internalToken, type HarnessFactory } from "./harness.js";
+import { harnessFor, internalToken, previousInternalToken, type HarnessFactory } from "./harness.js";
+import { replayRecordedRun, replayRequest } from "./replay-investigation.js";
 import { operatorPlugin } from "./plugins/registry.js";
 import type { ProjectionOptions } from "./plugins/hunt/projection.js";
 import { narrateRun } from "./plugins/hunt/workflow.js";
@@ -39,6 +41,8 @@ const CHAT = "/chat/stream";
 const CHECK = "/plugins/check";
 // GET /runs/<id>/projection -- what a supervisor outside this process reads.
 const PROJECTION = /^\/runs\/([0-9a-fA-F-]{36})\/projection$/;
+// GET /runs/<id>/spend -- priced and unpriced model calls, and token totals, on that run.
+const SPEND = /^\/runs\/([0-9a-fA-F-]{36})\/spend$/;
 // GET /runs/<id>/distil -- what episodic memory reads once the run has ended.
 const DISTIL = /^\/runs\/([0-9a-fA-F-]{36})\/distil$/;
 const NARRATE = /^\/runs\/([0-9a-fA-F-]{36})\/narrate$/;
@@ -202,11 +206,63 @@ export async function streamChat(state: State, request: ChatRequest, res: Server
 // Over a digest rather than ===, which returns on the first differing byte.
 // Hashed because timingSafeEqual throws on a length mismatch, and the throw would
 // leak the length.
+type RefusalKind = "unset" | "missing" | "wrong";
+
+// None until the first call. One warning when a refusal kind starts, debug while
+// it repeats, one info when a call succeeds and this process was not already
+// succeeding. Checked before routing, so the sentences name no route.
+let authKind: RefusalKind | "ok" | "none" = "none";
+
+function noteRefusal(kind: RefusalKind): void {
+  const repeat = authKind === kind;
+  authKind = kind;
+  const write = repeat ? log.debug.bind(log) : log.warn.bind(log);
+  switch (kind) {
+    case "unset":
+      write("AGENT_INTERNAL_TOKEN is not configured");
+      return;
+    case "missing":
+      write("no credential sent");
+      return;
+    case "wrong":
+      write("wrong credential");
+      return;
+    default: {
+      const unreachable: never = kind;
+      return unreachable;
+    }
+  }
+}
+
+function noteAccepted(): void {
+  if (authKind !== "ok") log.info("internal token accepted");
+  authKind = "ok";
+}
+
 function authorised(req: IncomingMessage): boolean {
   const expected = internalToken();
-  if (expected === "") return false;
+  // Previous is ignored until current is set: an empty current stays not configured.
+  if (expected === "") {
+    noteRefusal("unset");
+    return false;
+  }
+  let previous = previousInternalToken();
+  // Empty, or the same value current already has, is unset. No trimming.
+  if (previous === "" || previous === expected) previous = "";
+  const presented = req.headers.authorization ?? "";
   const digest = (value: string): Buffer => createHash("sha256").update(value).digest();
-  return timingSafeEqual(digest(req.headers.authorization ?? ""), digest(`Bearer ${expected}`));
+  const presentedDigest = digest(presented);
+  // Both comparisons run when previous is set, including after the first matches,
+  // so the time taken does not say which value was presented.
+  const currentOk = timingSafeEqual(presentedDigest, digest(`Bearer ${expected}`));
+  const previousOk = previous === "" ? false : timingSafeEqual(presentedDigest, digest(`Bearer ${previous}`));
+  if (currentOk || previousOk) {
+    noteAccepted();
+    return true;
+  }
+  if (presented === "") noteRefusal("missing");
+  else noteRefusal("wrong");
+  return false;
 }
 
 async function body(req: IncomingMessage): Promise<string> {
@@ -337,6 +393,18 @@ async function readReplay(state: State, runId: string, decisionId: string | null
   res.end(JSON.stringify(report));
 }
 
+async function readSpend(state: State, runId: string, res: ServerResponse): Promise<void> {
+  let account: ReturnType<typeof spendOf>;
+  try {
+    account = spendOf(await state.read(runId));
+  } catch (error) {
+    return fail(res, 502, "spend", runId, error);
+  }
+  if (account === null) return refuse(res, 404, `no spend on ${runId}`);
+  res.writeHead(200, { "content-type": "application/json" });
+  res.end(JSON.stringify(account));
+}
+
 async function readEvents(state: State, runId: string, snapshots: boolean, res: ServerResponse): Promise<void> {
   const events = await state.read(runId, snapshots ? { snapshots: true } : {});
   res.writeHead(200, { "content-type": "application/json" });
@@ -410,7 +478,12 @@ export function chatServer(state: State, ready: Ready, build: HarnessFactory = h
 
       // Before the route, not per route: an unauthorised caller learns nothing
       // about which routes exist.
-      if (!authorised(req)) return refuse(res, 401, "a valid internal token");
+      // Not refuse(): that also logs a debug line, and these three already latched one.
+      if (!authorised(req)) {
+        res.writeHead(401, { "content-type": "application/json" });
+        res.end(JSON.stringify({ detail: "a valid internal token" }));
+        return;
+      }
 
       const url = req.url ?? "";
       if (req.method === "POST" && url === CHAT) return openChat(state, req, res, build);
@@ -440,6 +513,22 @@ export function chatServer(state: State, ready: Ready, build: HarnessFactory = h
       if (run !== null) {
         const limit = Number(parsed.searchParams.get("evidence_limit"));
         return readFold(state, run[1] as string, "projection", res, Number.isInteger(limit) && limit > 0 ? { evidence_limit: limit } : undefined);
+      }
+
+      const spent = req.method === "GET" ? SPEND.exec(parsed.pathname) : null;
+      if (spent !== null) return readSpend(state, spent[1] as string, res);
+
+      // One recorded investigate run on a candidate model. Not GET /runs/<id>/replay.
+      if (req.method === "POST" && parsed.pathname === "/investigation-replay") {
+        try {
+          const result = await replayRecordedRun(state, replayRequest(JSON.parse(await body(req))));
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end(JSON.stringify(result));
+        } catch (error) {
+          if (error instanceof SpecError || error instanceof SyntaxError) return refuse(res, 422, error.message);
+          throw error;
+        }
+        return;
       }
 
       const replayed = req.method === "GET" ? REPLAY.exec(parsed.pathname) : null;

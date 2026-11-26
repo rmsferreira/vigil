@@ -12,6 +12,7 @@ from typing import Dict, List, Optional
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from sqlalchemy import or_
+from starlette.concurrency import run_in_threadpool
 
 from core.auth.permissions import permission_gate
 from core.deps import provide_mcp_client, provide_mcp_registry
@@ -179,6 +180,19 @@ async def set_server_enabled(
     """
     _validate_known_server(server_name)
 
+    # On the trail before the switch: a refused entry leaves the switch as it was.
+    if server_name in mcp_service.servers:
+        from core.storage.config_service import get_config_service
+
+        await run_in_threadpool(
+            get_config_service(user_id=str(current_user.user_id)).record_audit,
+            config_type="mcp",
+            config_key=f"mcp.server:{server_name}",
+            action="update",
+            old_value={"enabled": mcp_service.is_server_enabled(server_name)},
+            new_value={"enabled": request.enabled},
+        )
+
     success = mcp_service.set_server_enabled(server_name, request.enabled)
     if not success:
         raise HTTPException(status_code=404, detail="Server not found")
@@ -265,9 +279,10 @@ def _spawn_changed(old, new) -> bool:
     """Whether ``new`` would start differently from ``old``.
 
     Env counts only as mcp-config.json declares it (substituted), plus the
-    credentials it names: the rest is this process's own environment. A runner
-    launches from its own catalog with only that env (``runner_env``), so there
-    command, args and cwd do not count.
+    credentials it names: the rest is resolved from saved integration settings
+    at each connect (``runner_env``), stdio child or runner alike. A runner
+    launches from its own catalog with only that env, so there command, args
+    and cwd do not count.
     """
     from core.integrations.mcp.runner import runner_url
 
@@ -402,7 +417,12 @@ class SurfaceToggle(BaseModel):
 @router.get("/surface")
 async def get_surface(current_user: User = Depends(get_current_active_user)):
     """Whether Vigil's own tools are reachable, and whether any token can open them."""
-    from core.integrations.mcp.surface import is_enabled
+    from core.integrations.mcp.surface import (
+        is_enabled,
+        oauth_refusal,
+        oauth_requested,
+        oauth_urls,
+    )
     from core.storage.models import McpCredential
     from core.storage.unit_of_work import unit_of_work
     from core.time import utcnow
@@ -424,6 +444,17 @@ async def get_surface(current_user: User = Depends(get_current_active_user)):
         "enabled": is_enabled(),
         "path": surface_address(),
         "has_token": usable is not None,
+        "oauth": _oauth_state(oauth_requested(), oauth_refusal(), oauth_urls()),
+    }
+
+
+def _oauth_state(requested: bool, refusal: Optional[str], urls: dict) -> dict:
+    # ``enabled`` is the effective answer; ``requested`` is the switch itself.
+    return {
+        "enabled": requested and refusal is None,
+        "requested": requested,
+        "refusal": refusal,
+        **urls,
     }
 
 
@@ -446,3 +477,138 @@ async def set_surface(
         current_user.username,
     )
     return {"enabled": body.enabled}
+
+
+@router.put("/surface/oauth")
+async def set_surface_oauth(
+    body: SurfaceToggle,
+    current_user: User = Depends(get_current_active_user),
+):
+    """Turn OAuth on the surface on or off. On is refused, with the reason,
+    unless the surface is open and the public base URL is https or loopback."""
+    require_integrations_admin(current_user)
+
+    from core.integrations.mcp.surface import (
+        oauth_refusal,
+        oauth_urls,
+        set_oauth_enabled,
+    )
+
+    refusal = oauth_refusal()
+    if body.enabled and refusal:
+        raise HTTPException(status_code=409, detail=refusal)
+    if not set_oauth_enabled(body.enabled, updated_by=str(current_user.user_id)):
+        raise HTTPException(status_code=500, detail="Could not save the setting")
+
+    logger.warning(
+        "MCP OAuth %s by %s",
+        "enabled" if body.enabled else "disabled",
+        current_user.username,
+    )
+    return _oauth_state(body.enabled, refusal, oauth_urls())
+
+
+# --- The redirect allowlist (#4789) -----------------------------------------
+#
+# Registration accepts loopback redirect URIs and the ones named here, matched
+# exactly. A refused one is on the trail (oauth.client_registration_refused);
+# the panel offers recent ones so an operator can allow one in a click.
+
+_REFUSED_EVENT = "oauth.client_registration_refused"
+_REFUSED_WINDOW_DAYS = 30
+_MAX_ALLOWED = 50
+
+
+class RedirectAllowlist(BaseModel):
+    uris: List[str]
+
+
+def _recently_refused(allowed: list[str]) -> list[dict]:
+    """Refused redirect URIs from the trail, newest first, one per URI, not yet allowed."""
+    from datetime import timedelta
+
+    from core.audit import trail
+    from core.storage.unit_of_work import unit_of_work
+    from core.time import utcnow
+
+    query = trail.make_query(
+        area="oauth", since=utcnow() - timedelta(days=_REFUSED_WINDOW_DAYS)
+    )
+    try:
+        with unit_of_work() as session:
+            entries = trail.read_all(session, query)
+    except Exception:  # noqa: BLE001 - the list still edits without the trail
+        logger.warning("Could not read refused redirect URIs from the trail")
+        return []
+    seen: dict[str, str] = {}
+    for e in reversed(entries):
+        p = e["payload"] if isinstance(e["payload"], dict) else {}
+        uri = p.get("redirect_uri")
+        if p.get("action") == _REFUSED_EVENT and isinstance(uri, str):
+            if uri not in allowed and uri not in seen:
+                seen[uri] = e["occurred_at"]
+    return [{"uri": u, "at": at} for u, at in list(seen.items())[:10]]
+
+
+def _allowlist_state() -> dict:
+    from core.integrations.mcp.surface import oauth_redirect_allowlist
+
+    uris = oauth_redirect_allowlist()
+    return {"uris": uris, "refused": _recently_refused(uris)}
+
+
+@router.get("/surface/oauth/redirects")
+async def get_redirect_allowlist(
+    current_user: User = Depends(get_current_active_user),
+):
+    """The redirect URIs registration allows beyond loopback, and recent refusals."""
+    require_integrations_admin(current_user)
+    return await run_in_threadpool(_allowlist_state)
+
+
+@router.put("/surface/oauth/redirects")
+async def set_redirect_allowlist(
+    body: RedirectAllowlist,
+    current_user: User = Depends(get_current_active_user),
+):
+    """Replace the allowlist. Each entry is an absolute https URI without a
+    fragment (loopback needs no entry), stored as registration will compare it."""
+    require_integrations_admin(current_user)
+    from urllib.parse import urlsplit
+
+    from mcp.shared.auth import OAuthClientMetadata
+    from pydantic import ValidationError
+
+    from core.auth.oauth_server import MAX_URI
+    from core.integrations.mcp.surface import set_oauth_redirect_allowlist
+
+    uris: list[str] = []
+    for raw in (u.strip() for u in body.uris if u.strip()):
+        bad = HTTPException(
+            status_code=422,
+            detail=f"{raw[:200]} is not an absolute https URI without a fragment",
+        )
+        if len(raw) > MAX_URI or "#" in raw or urlsplit(raw).scheme != "https":
+            raise bad
+        try:
+            # Registration matches the URI as the SDK's model parses it (host
+            # lowercased, for one). Store that form, or it never matches.
+            uri = str(OAuthClientMetadata(redirect_uris=[raw]).redirect_uris[0])
+        except ValidationError:
+            raise bad from None
+        if not urlsplit(uri).hostname:
+            raise bad
+        if uri not in uris:
+            uris.append(uri)
+    if len(uris) > _MAX_ALLOWED:
+        raise HTTPException(
+            status_code=422, detail=f"At most {_MAX_ALLOWED} redirect URIs"
+        )
+    if not set_oauth_redirect_allowlist(uris, updated_by=str(current_user.user_id)):
+        raise HTTPException(status_code=500, detail="Could not save the setting")
+    logger.warning(
+        "MCP OAuth redirect allowlist set to %d URI(s) by %s",
+        len(uris),
+        current_user.username,
+    )
+    return await run_in_threadpool(_allowlist_state)

@@ -6,35 +6,45 @@ and task automation.
 """
 
 import logging
+import secrets
 from typing import Dict, List, Optional
 
 from sqlalchemy.orm import Session
 
-from core.audit import trail
-from core.cases import case_trail
+from core.auth.permissions import may_read_case
+from core.cases import case_readers, case_trail
 from core.cases.agent_closure import (
     activity_actor,
     actor_identity,
     close_channel,
+    closing_person,
     current_credential_id,
     record_close,
+)
+from core.cases.case_collaboration_service import remove_watchers_who_cannot_read
+from core.cases.case_handoff import (
+    move_reopened_archived_team,
+    note_owner,
+    owner_on_team,
+    require_merge_source,
 )
 from core.cases.closure import (
     CHANNEL_AGENT,
     ClosureCategory,
     closed_by_person,
+    false_positive_cause_value,
     trust_word,
 )
 from core.exceptions import NotFoundError, default_on_error
-from core.storage.models import (
-    Case,
-    CaseAuditLog,
-    CaseEscalation,
-    CaseTask,
-    CaseTemplate,
-)
+from core.storage.case_insert import insert_case
+from core.storage.models import Case, CaseTask, CaseTemplate, User
+from core.storage.shared_ioc_repository import reconcile_case_safely
 from core.storage.unit_of_work import unit_of_work
 from core.time import utcnow
+
+# A close that did not mention the cause. Distinct from an explicit null,
+# which clears one a false-positive close had stored.
+_CAUSE_OMITTED = object()
 
 logger = logging.getLogger(__name__)
 
@@ -213,8 +223,8 @@ class CaseWorkflowService:
             timestamp = utcnow().strftime("%Y%m%d%H%M%S")
             case_id = f"case-{timestamp}"
 
-            # Create case
-            case = Case(
+            case = insert_case(
+                session,
                 case_id=case_id,
                 title=title,
                 description=description or template.description or "",
@@ -237,9 +247,6 @@ class CaseWorkflowService:
                 activities=[],
                 resolution_steps=[],
             )
-
-            session.add(case)
-            session.flush()  # Flush to get case_id
 
             # Create tasks from template
             if template.task_templates:
@@ -303,113 +310,11 @@ class CaseWorkflowService:
                         if finding in case.findings:
                             session.flush()
                         case.findings.append(finding)
+                reconcile_case_safely(session, case.case_id)
 
+            note_owner(session, case_id=case.case_id, previous=None, new=assignee)
             logger.info(f"Created case {case_id} from template {template_id}")
             return case
-
-    def escalate_case(
-        self,
-        case_id: str,
-        escalated_from: str,
-        escalated_to: str,
-        reason: str,
-        urgency_level: str = "high",
-        session: Optional[Session] = None,
-    ) -> bool:
-        """
-        Escalate a case.
-
-        Args:
-            case_id: Case ID
-            escalated_from: Who escalated the case
-            escalated_to: Who to escalate to
-            reason: Escalation reason
-            urgency_level: Urgency level
-            session: Database session (optional)
-
-        Returns:
-            True if successful
-
-        An owned session rolls back and this returns False, as
-        ``default_on_error`` did. A joined session does not roll back — the
-        caller commits — so a trail failure propagates and that commit does
-        not happen.
-        """
-        joined = session is not None
-        try:
-            with unit_of_work(session) as session:
-                case = session.query(Case).filter(Case.case_id == case_id).first()
-                if not case:
-                    logger.info(f"Case {case_id} not found")
-                    return False
-
-                # Create escalation record
-                escalation = CaseEscalation(
-                    case_id=case_id,
-                    escalated_from=escalated_from,
-                    escalated_to=escalated_to,
-                    reason=reason,
-                    urgency_level=urgency_level,
-                    status="pending",
-                )
-                session.add(escalation)
-                # The owner change rides on this entry, both holders (#4264).
-                previous = case.assignee
-                moved = previous != escalated_to
-                # The case record only shows case-audit rows, so the name has to
-                # land here as well as on the escalation until the trail is in use.
-                # The reason and the holders' text are beside the hash, not in it.
-                texts = [
-                    reason,
-                    *(case_trail.holder_text(previous, escalated_to) if moved else []),
-                ]
-                case_trail.append_or_legacy(
-                    session,
-                    action=case_trail.ESCALATE,
-                    signed_in=escalated_from,
-                    case_id=case_id,
-                    operator_text="\n".join(t for t in texts if t) or None,
-                    legacy=CaseAuditLog(
-                        entity_type="case",
-                        entity_id=case_id,
-                        action="update",
-                        field_name="escalation",
-                        change_summary=(
-                            f"{escalated_from} escalated this case to "
-                            f"{escalated_to}: {reason}"
-                        ),
-                        changed_by=escalated_from,
-                    ),
-                    ids=lambda: {
-                        "escalation_id": escalation.escalation_id,
-                        **(
-                            case_trail.holders(session, previous, escalated_to)
-                            if moved
-                            else {}
-                        ),
-                    },
-                )
-
-                # Update case
-                case.assignee = escalated_to
-                case.timeline.append(
-                    {
-                        "timestamp": utcnow().isoformat(),
-                        "event": (
-                            f"{escalated_from} escalated to {escalated_to}: {reason}"
-                        ),
-                    }
-                )
-
-                logger.info(f"Escalated case {case_id} to {escalated_to}")
-                return True
-        except Exception as exc:
-            if isinstance(exc, trail.Paused) or (
-                joined and isinstance(exc, case_trail.TrailWriteError)
-            ):
-                raise
-            logger.exception("CaseWorkflowService.escalate_case failed")
-            return False
 
     @default_on_error(False)
     def update_template(
@@ -502,7 +407,11 @@ class CaseWorkflowService:
         executive_summary: Optional[str] = None,
         false_positive_reason: Optional[str] = None,
         closure_notes: Optional[str] = None,
+        evidence_opened: Optional[bool] = None,
+        false_positive_cause: object = _CAUSE_OMITTED,
         on_trail: bool = True,
+        by_model: bool = False,
+        take_ownership: bool = True,
     ):
         """Mark a case closed and record its closure metadata.
 
@@ -540,10 +449,34 @@ class CaseWorkflowService:
         *previous* closer: an agent's status edit after an analyst's reopened
         close would inherit Trust ``analyst``, and memory would carry a
         determination no person made.
+
+        An agent ``false_positive`` close with no ``sampled_at`` is drawn one
+        in twenty (``secrets.randbelow(20) == 0``). A hit sets ``sampled_at``.
+        A later close does not draw again. ``evidence_opened`` is stored only
+        on a person's close that writes the determination; an agent close and
+        an absent field store null. A status edit that leaves a standing
+        determination draws nothing and changes neither column.
+
+        ``false_positive_cause`` is touched only on the determining branch.
+        Any category other than ``false_positive`` clears it. A false-positive
+        close that states the field, including null, stores that. One that
+        omits the field leaves a standing cause. A value outside the set raises
+        ``ValueError`` before anything is written.
+
+        **A person's determining close takes the case** (#4983), unless the
+        same save named an owner (``take_ownership=False``). A closer who does
+        not resolve, cannot read the case, or is off its team leaves the owner
+        alone and the close still lands.
         """
+        if false_positive_cause is _CAUSE_OMITTED:
+            stated_cause: object = _CAUSE_OMITTED
+        elif false_positive_cause is None or isinstance(false_positive_cause, str):
+            stated_cause = false_positive_cause_value(false_positive_cause)
+        else:
+            raise ValueError(f"{false_positive_cause!r} is not a false-positive cause")
+
         from core.cases.case_sla_service import CaseSLAService
         from core.storage.models import CaseClosureInfo
-        from core.storage.shared_ioc_repository import index_case_iocs_on_close
 
         case = session.query(Case).filter(Case.case_id == case_id).first()
         if not case:
@@ -565,6 +498,12 @@ class CaseWorkflowService:
         # every field this call did not state, so a re-close would erase the
         # root cause and lessons learned of the close before it.
         closure = session.get(CaseClosureInfo, case_id)
+        # The branch that writes the category and the channel. An unspecified
+        # status edit over a standing determination is not it.
+        determining = closure is None or (
+            category is not ClosureCategory.UNSPECIFIED
+            or closure.closure_category == ClosureCategory.UNSPECIFIED.value
+        )
         if closure is None:
             closure = CaseClosureInfo(
                 case_id=case_id,
@@ -574,10 +513,7 @@ class CaseWorkflowService:
                 close_channel=channel,
             )
             session.add(closure)
-        elif (
-            category is not ClosureCategory.UNSPECIFIED
-            or closure.closure_category == ClosureCategory.UNSPECIFIED.value
-        ):
+        elif determining:
             if (
                 trust_word(closure.close_channel) == "analyst"
                 and channel == CHANNEL_AGENT
@@ -592,6 +528,22 @@ class CaseWorkflowService:
             closure.closed_by = stored_by
             closure.closed_by_text = actor_text
             closure.close_channel = channel
+
+        if determining:
+            if (
+                channel == CHANNEL_AGENT
+                and category is ClosureCategory.FALSE_POSITIVE
+                and closure.sampled_at is None
+            ):
+                if secrets.randbelow(20) == 0:
+                    closure.sampled_at = utcnow()
+            closure.evidence_opened = (
+                evidence_opened if closed_by_person(channel) else None
+            )
+            if category is not ClosureCategory.FALSE_POSITIVE:
+                closure.false_positive_cause = None
+            elif stated_cause is not _CAUSE_OMITTED:
+                closure.false_positive_cause = stated_cause
 
         closure.closed_at = utcnow()
         # Stated fields only. None means this call had nothing to say about the
@@ -609,7 +561,7 @@ class CaseWorkflowService:
 
         CaseSLAService().mark_resolution_complete(case_id, session)
         session.flush()
-        index_case_iocs_on_close(session, case_id)
+        reconcile_case_safely(session, case_id)
         # A merge's close is part of the merge's one entry.
         if on_trail:
             record_close(
@@ -617,9 +569,57 @@ class CaseWorkflowService:
                 principal_id=principal,
                 case_id=case_id,
                 actor_text=actor_text,
+                category=category.value,
+                by_model=by_model,
                 credential_id=current_credential_id(),
+                sampled=closure.sampled_at is not None,
+                evidence_opened=closure.evidence_opened,
             )
+            if determining and take_ownership:
+                self._take_on_close(session, case)
+        from core.response.approval_service import settle_for_close
+
+        # Its unanswered asks end with it, in this transaction (#5107).
+        settle_for_close(session, case_id)
         return closure
+
+    @staticmethod
+    def _take_on_close(session: Session, case: Case) -> None:
+        """Give the case to the person who closed it, appended after the close.
+
+        Every skip is silent: the close stands. A trail failure is not a skip.
+        """
+        from core.cases.assignee import (
+            AssigneeRefused,
+            owner_reads_case,
+            resolve_assignee,
+        )
+
+        closer = closing_person()
+        if not closer:
+            return
+        try:
+            new = resolve_assignee(session, closer, current=case.assignee)
+        except AssigneeRefused:
+            logger.info(
+                "Case %s closed by %r, who resolves to no account; owner left",
+                case.case_id,
+                closer,
+            )
+            return
+        previous = (case.assignee or "").strip() or None
+        new = (new or "").strip() or None
+        if new is None or new == previous:
+            return
+        if not owner_reads_case(session, case, new):
+            return
+        if case.team_id and not owner_on_team(session, new, case.team_id):
+            return
+        case.assignee = new
+        case.updated_at = utcnow()
+        case_trail.append_update(
+            session, case.case_id, {"assignee": previous}, {"assignee": new}
+        )
 
     def reopen_case(self, session: Session, case_id: str) -> None:
         """Retract what closing the Case determined, keeping what it wrote.
@@ -629,26 +629,44 @@ class CaseWorkflowService:
         lessons learned and the executive summary are work, not a verdict, and
         deleting them is a data loss nobody asked for.
 
-        What must not survive is the category. Left standing, the next status
-        edit -- which states no category of its own -- would close the Case back
-        into the determination the reopen retracted, and episodic memory would
-        re-derive the Verdict the analyst reopened the Case to overturn.
+        What must not survive is the category, or the sample drawn from it.
+        Left standing, the next status edit -- which states no category of its
+        own -- would close the Case back into the determination the reopen
+        retracted, and episodic memory would re-derive the Verdict the analyst
+        reopened the Case to overturn. ``sampled_at`` is cleared so a later
+        agent dismissal can be drawn again. The cause is cleared with the
+        category. ``evidence_opened`` stays.
         """
         from core.storage.models import CaseClosureInfo
 
         closure = session.get(CaseClosureInfo, case_id)
         if closure is not None:
             closure.closure_category = ClosureCategory.UNSPECIFIED.value
+            # The draw does not outlive the determination it was taken from.
+            closure.sampled_at = None
+            closure.false_positive_cause = None
+        move_reopened_archived_team(session, case_id)
+        from core.response.approval_service import reopen_settled
+
+        # What the close settled is asked again (#5107).
+        reopen_settled(session, case_id)
 
     def merge_cases(
-        self, target_case_id: str, source_case_id: str, merged_by: str = "system"
+        self,
+        target_case_id: str,
+        source_case_id: str,
+        merged_by: str = "system",
+        merger: Optional[User] = None,
     ) -> Optional[int]:
         """Absorb ``source_case_id`` into ``target_case_id``.
 
         Moves findings, timeline, activities, IOCs, evidence, tasks, and
         comments across; closes the source and links it with a 'merged_into'
         relationship. Returns the number of findings moved, and raises
-        ``NotFoundError`` naming whichever case is missing.
+        ``NotFoundError`` naming whichever case is missing, or that the merger
+        can't read. ``merger`` is the signed-in user, for the reader rules
+        (``case_readers.merge_readers``); without one, a merge that widens a
+        restricted case's readers is refused.
 
         Runs in its own transaction — the whole merge must land or none of it,
         its trail entry included.
@@ -663,18 +681,35 @@ class CaseWorkflowService:
 
         with unit_of_work() as session:
             target = session.query(Case).filter_by(case_id=target_case_id).first()
-            source = session.query(Case).filter_by(case_id=source_case_id).first()
-            if not target:
+            source = (
+                session.query(Case)
+                .filter_by(case_id=source_case_id)
+                .with_for_update()
+                .first()
+            )
+            # A case the merger can't read is not there (#4354).
+            if not target or not may_read_case(target):
                 raise NotFoundError(f"Target case {target_case_id} not found")
-            if not source:
+            if not source or not may_read_case(source):
                 raise NotFoundError(f"Source case {source_case_id} not found")
+            if source.team_id != target.team_id:
+                require_merge_source(session, merged_by, source.team_id)
+            case_readers.merge_readers(
+                session,
+                target,
+                source,
+                case_readers.http_restricter(session, merger) if merger else None,
+            )
+            remove_watchers_who_cannot_read(session, target)
 
             target_finding_ids = {f.finding_id for f in target.findings}
             moved_findings = 0
+            moved_finding_ids: List[str] = []
             for finding in list(source.findings):
                 if finding.finding_id not in target_finding_ids:
                     target.findings.append(finding)
                     moved_findings += 1
+                    moved_finding_ids.append(finding.finding_id)
                 source.findings.remove(finding)
 
             target.timeline = (target.timeline or []) + (source.timeline or [])
@@ -696,7 +731,9 @@ class CaseWorkflowService:
                     "details": {
                         "source_case_id": source_case_id,
                         "source_title": source.title,
+                        "target_case_id": target_case_id,
                         "findings_moved": moved_findings,
+                        "finding_ids": moved_finding_ids,
                         "merged_by": merged_by,
                     },
                     **activity_actor(merged_by, session),
@@ -741,6 +778,13 @@ class CaseWorkflowService:
             # analyst's `false_positive` -- and being the category that writes
             # no Verdict, it would withdraw the one already written. A merge
             # relates two records; it does not overturn what one of them found.
+            from core.response.approval_service import (
+                reparent_for_merge,
+                settle_for_close,
+            )
+
+            # The source's asks follow its evidence rather than settle (#5107).
+            reparent_for_merge(session, source_case_id, target_case_id)
             standing = session.get(CaseClosureInfo, source_case_id)
             stated = (standing.closure_category or "").strip() if standing else ""
             if stated not in ("", ClosureCategory.UNSPECIFIED.value):
@@ -760,6 +804,12 @@ class CaseWorkflowService:
                     closure_notes=f"Merged into {target_case_id}",
                     on_trail=False,
                 )
+
+            # A closed target answers what it now holds.
+            settle_for_close(session, target_case_id)
+            # Both Cases changed what they hold, whether or not the close ran.
+            reconcile_case_safely(session, source_case_id)
+            reconcile_case_safely(session, target_case_id)
 
             source.description = (source.description or "") + (
                 f"\n\n[MERGED] This case was merged into {target_case_id} "

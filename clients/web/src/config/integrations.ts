@@ -156,7 +156,7 @@ const INTEGRATIONS: IntegrationMetadata[] = [
     id: 'opencti',
     name: 'OpenCTI',
     category: 'Threat Intelligence',
-    description: 'Read-only lookups in OpenCTI: observables and their indicators, threat actors, intrusion sets, malware, attack patterns and the relationships between them.',
+    description: 'Read-only lookups in OpenCTI: observables and their indicators, threat actors, intrusion sets, malware, attack patterns and the relationships between them. Optionally pulls TAXII collections into Vigil\'s indicator feed.',
     functionality_type: 'Data Enrichment',
     proxy_supported: true,
     fields: [
@@ -174,7 +174,7 @@ const INTEGRATIONS: IntegrationMetadata[] = [
         type: 'password',
         required: true,
         placeholder: 'Your OpenCTI API token',
-        helpText: 'From your OpenCTI profile. A user with read access (Knowledge and Observables) is enough; Vigil never writes.',
+        helpText: 'From your OpenCTI profile. The user\'s role needs Access knowledge (KNOWLEDGE) and Allow token usage (APIACCESS_USETOKEN); add Access connectors (MODULES) to show the ingest backlog. Vigil never writes.',
       },
       {
         name: 'verify_ssl',
@@ -189,6 +189,14 @@ const INTEGRATIONS: IntegrationMetadata[] = [
         required: false,
         placeholder: '/etc/vigil/certs/root-ca.pem',
         helpText: 'PEM trusted for this integration only, in place of the default store: the private CA that signed the server certificate. A path on the Vigil backend host; mount it into the container. Leave blank for the default store. Ignored when SSL verification is off.',
+      },
+      {
+        name: 'collection_ids',
+        label: 'TAXII Collection IDs',
+        type: 'text',
+        required: false,
+        placeholder: 'collection-uuid-1,collection-uuid-2',
+        helpText: 'Comma-separated TAXII 2.1 collection IDs to pull from /taxii2/ on the platform URL into Vigil\'s indicator table, with the token, SSL and proxy settings above. Leave blank for lookups only.',
       },
     ],
     docs_url: 'https://docs.opencti.io/latest/reference/api/',
@@ -773,6 +781,47 @@ const INTEGRATIONS: IntegrationMetadata[] = [
     docs_url: 'https://opensearch.org/docs/latest/security-analytics/',
   },
   {
+    id: 'amazon-security-lake',
+    name: 'Amazon Security Lake',
+    category: 'SIEM',
+    description: 'Search the OCSF sources Amazon Security Lake keeps in each region with read-only Athena SQL, where the data sits. Regions, sources and OCSF versions are discovered from the Glue catalogue shared to the query access.',
+    functionality_type: 'Log Analysis & SIEM',
+    fields: [
+      {
+        name: 'role_arn',
+        label: 'Role ARN',
+        type: 'text',
+        required: false,
+        placeholder: 'arn:aws:iam::123456789012:role/vigil-security-lake-query',
+        helpText: 'Optional. A role to assume for querying, from the default AWS credentials of the host the server runs on (instance role, IRSA or Pod Identity, or a mounted shared config). There is no access-key field. The Vigil backend and the MCP runner must share that credential source: the connection test runs on the backend, queries run in the runner.',
+      },
+      {
+        name: 'external_id',
+        label: 'External ID',
+        type: 'text',
+        required: false,
+        helpText: 'Optional. Sent when assuming the role above, if its trust policy requires one.',
+      },
+      {
+        name: 'workgroup',
+        label: 'Athena Workgroup',
+        type: 'text',
+        required: false,
+        default: 'primary',
+        helpText: 'The workgroup each query runs in, by the same name in every region, with a query result output location set. Athena writes every query\'s results there. That location, its lifecycle and the workgroup\'s data-scan limit are yours, and the scan limit is the only cap on Athena spend.',
+      },
+      {
+        name: 'allowed_regions',
+        label: 'Regions Returning Rows',
+        type: 'text',
+        required: false,
+        placeholder: 'us-east-1, eu-west-1',
+        helpText: 'Comma-separated region codes whose result rows Vigil receives. Empty means none. This controls what Vigil receives: a region not listed still runs each query and answers with its query id, row count and bytes scanned, and no rows.',
+      },
+    ],
+    docs_url: 'https://docs.aws.amazon.com/security-lake/latest/userguide/subscriber-query-access.html',
+  },
+  {
     id: 'wazuh',
     name: 'Wazuh',
     category: 'SIEM',
@@ -793,8 +842,8 @@ const INTEGRATIONS: IntegrationMetadata[] = [
         label: 'Username',
         type: 'text',
         required: true,
-        placeholder: 'wazuh-wui',
-        helpText: 'A Wazuh API user with read access to rules, agents and logtest.',
+        placeholder: 'vigil-reader',
+        helpText: 'A dedicated Wazuh server API user for Vigil, with a custom role holding only agent:read on agent:id:*, rules:read on rule:file:*, and logtest:run on *:*:*. Do not use wazuh or wazuh-wui. Wazuh\'s built-in readonly role has no logtest permission. Steps: docs/wazuh-api-user.md.',
       },
       {
         name: 'password',
@@ -989,12 +1038,13 @@ const INTEGRATIONS: IntegrationMetadata[] = [
     name: 'Palo Alto Networks',
     logo: paloaltoLogo,
     category: 'Network Security',
-    description: 'Integrate with Palo Alto Networks firewalls and Panorama for policy management and threat prevention.',
+    description:
+      "One PAN-OS firewall, vsys1: reads threat logs and blocks or unblocks single IPv4/IPv6 addresses by registering them under the User-ID tag 'vigil-block' (no commit, no expiry). One-time setup on the firewall: a dynamic address group filtered on 'vigil-block', used by an enabled deny or drop security rule, and an API key with User-ID and configuration read rights. Test fails until that group and rule exist.",
     functionality_type: 'Network Protection',
     fields: [
       {
         name: 'hostname',
-        label: 'Firewall/Panorama Hostname',
+        label: 'Firewall Hostname',
         type: 'text',
         required: true,
         placeholder: 'firewall.example.com',
@@ -1321,7 +1371,7 @@ const INTEGRATIONS: IntegrationMetadata[] = [
     id: 'atomic-red-team',
     name: 'Atomic Red Team',
     category: 'Forensics & Analysis',
-    description: 'Invoke one Atomic Red Team technique against a named range or staging replica. Operator installs the runner; Vigil does not vendor the atomics repo.',
+    description: 'Invoke one Atomic Red Team technique on a host listed under Settings → Limits & autonomy; any other host is refused. Operator installs the runner; Vigil does not vendor the atomics repo.',
     functionality_type: 'Adversary Emulation',
     fields: [
       {
@@ -1330,7 +1380,7 @@ const INTEGRATIONS: IntegrationMetadata[] = [
         type: 'text',
         required: true,
         placeholder: '/usr/local/bin/art-runner',
-        helpText: 'Operator-installed executable. Invoked as `<runner> --technique <id>` with optional `--atomics-path`.',
+        helpText: 'Operator-installed executable. Invoked as `<runner> --technique <id> --hostname <host>` with optional `--atomics-path`.',
       },
       {
         name: 'atomics_path',

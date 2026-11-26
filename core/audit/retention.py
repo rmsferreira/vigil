@@ -5,22 +5,35 @@ The period and a pending erasure of an ``audit.manage`` holder live in
 used: its audit helper would append a second ``config.change``. Each is
 announced with one trail entry and takes effect seven days later. The ids
 that have actually been blanked are one per line in
-``$VIGIL_UPGRADE_DIR/erased-principals.txt``, and the same list is copied
-into each backup. They are not stored in the database.
+``$VIGIL_ERASURE_DIR/erased-principals.txt`` (``$VIGIL_UPGRADE_DIR`` when that
+is unset), and the same list is copied into each backup. They are not stored in
+the database. Replicas share the list on one volume, so each write takes a
+Postgres advisory lock and is fsynced before the lock is released.
 """
 
 from __future__ import annotations
 
 import json
+import os
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, NamedTuple, Optional
 
 from sqlalchemy import bindparam, event, text
 
 from core.audit import trail
-from core.auth import mcp_credential_service, principals, sign_ins
+from core.auth import (
+    identity,
+    key_ring,
+    mcp_credential_service,
+    principals,
+    sign_ins,
+    trail_events,
+)
 from core.config import get_settings
+from core.storage.connection import get_db_manager
+from core.time import utcnow
 
 MIN_DAYS = 365
 MAX_DAYS = 36500
@@ -30,16 +43,29 @@ CONFIG_DESCRIPTION = (
     "Audit retention period, and erasures of an audit manager waiting out seven days."
 )
 LIST_NAME = "erased-principals.txt"
+# Replicas take turns writing the list. Distinct from the trail's, the feed's,
+# the upgrade's and the rule sync's keys.
+_LIST_LOCK = 0x7669_6769_6C45_5253  # "vigilERS"
+# One refusal wherever the list has nowhere to live; restore prefixes it.
+UNSET_MESSAGE = (
+    "the erasure list has no directory: set VIGIL_ERASURE_DIR (or VIGIL_UPGRADE_DIR), "
+    "and on Helm give stateDirectory.volume shared storage such as a ReadWriteMany claim"
+)
 # An erased account's username and email, derived from its principal id so the
 # originals are free again. The username is how an account reads as Erased.
 ERASED_PREFIX = "erased-"
 ERASED_DOMAIN = "erased.invalid"
 ERASED_NAME = "Erased account"
+# What an erased account's token labels become: a free-text label can name a person.
+ERASED_LABEL = "Erased account's token"
 # Queued on the session until the transaction commits. A rollback must not
 # leave an id in the file: restore would blank that principal anyway.
 _QUEUED = "erasure_file_ids"
 _REWRITE = "erasure_file_rewrite"
 _ARMED = "erasure_file_armed"
+# Open invite rows locked before the trail lock, by the leader's tick.
+# Absent: this erasure has not locked them yet. An empty tuple: it looked.
+_INVITE_ROWS = "erasure_invite_rows"
 
 # A row names a principal when its hashed payload carries that id. The columns
 # beside the hash are what erasure clears; the payload stays so the chain does.
@@ -53,6 +79,16 @@ _NAMES = """
     OR payload->>'assignee' = :id
     OR payload->>'previous_assignee' = :id
 """
+# Invite entries are written before the account exists, so they carry the link
+# id, not the principal. Erasure still has to clear them.
+_INVITE_ACTIONS = (
+    "invite.sent",
+    "invite.failed",
+    "invite.expired",
+    "invite.revoked",
+)
+_ACCEPTED_NOTICE = "{} accepted your invite and now has an account."
+_CANCELLED_SUFFIX = " now has an account."
 
 
 class RetentionError(ValueError):
@@ -69,9 +105,10 @@ def is_erased(username: Optional[str], principal_id: Optional[str]) -> bool:
 
 def free_identifiers(session, principal_id: str) -> None:
     """Rewrite the account's username, email and full name to opaque values, so
-    nothing readable stays and the username and email can be used again. Cases
-    and tasks assigned by username follow, so a new account of that name does
-    not inherit them. Plain SQL: an upgrade step runs it on its own connection too."""
+    nothing readable stays and the username and email can be used again. Every
+    record that keeps the username as text follows (``_USERNAME_COLUMNS``), so
+    neither the name stays readable nor does a new account of that name inherit
+    them. Plain SQL: an upgrade step runs it on its own connection too."""
     if not _table(session, "users"):
         return
     params = {
@@ -80,16 +117,13 @@ def free_identifiers(session, principal_id: str) -> None:
         "domain": ERASED_DOMAIN,
         "name": ERASED_NAME,
     }
-    for table in ("cases", "case_tasks"):
-        if _table(session, table):
-            session.execute(
-                text(f"""
-                    UPDATE public.{table} t SET assignee = :prefix || u.principal_id
-                    FROM public.users u
-                    WHERE u.principal_id = :id AND t.assignee = u.username
-                    """),
-                params,
-            )
+    username = session.execute(
+        text("SELECT username FROM public.users WHERE principal_id = :id"),
+        {"id": principal_id},
+    ).scalar()
+    # Vigil's own rows name it "system": a person of that name cannot be told apart.
+    if username and username != trail.SYSTEM and not is_erased(username, principal_id):
+        _rename_records(session, username, erased_username(principal_id))
     session.execute(
         text("""
             UPDATE public.users SET
@@ -102,9 +136,29 @@ def free_identifiers(session, principal_id: str) -> None:
     )
 
 
+def drop_personal_rows(session, user_id: str) -> None:
+    """Delete the account's preferences row and blank the label of each token it
+    owns, revoked or not: a label is free text and may name the person. Plain
+    SQL: an upgrade step runs it on its own connection too."""
+    params = {"user_id": user_id, "label": ERASED_LABEL}
+    if _table(session, "user_preferences"):
+        session.execute(
+            text("DELETE FROM public.user_preferences WHERE user_id = :user_id"),
+            params,
+        )
+    if _table(session, "mcp_credentials"):
+        session.execute(
+            text(
+                "UPDATE public.mcp_credentials SET label = :label WHERE user_id = :user_id"
+            ),
+            params,
+        )
+
+
 def outside_path() -> Optional[Path]:
-    """The erasure list. None when ``VIGIL_UPGRADE_DIR`` is unset."""
-    raw = (get_settings().vigil_upgrade_dir or "").strip()
+    """The erasure list: in ``VIGIL_ERASURE_DIR``, else ``VIGIL_UPGRADE_DIR``. None when both are unset."""
+    settings = get_settings()
+    raw = (settings.vigil_erasure_dir or settings.vigil_upgrade_dir or "").strip()
     if not raw:
         return None
     return Path(raw) / LIST_NAME
@@ -163,8 +217,9 @@ def erase(
 ) -> dict:
     """Blank ``principal_id``, or announce it when that principal can manage the trail.
 
-    Refuses, before any blanking, when the upgrade directory is unset, when
-    ``actor`` is erasing their own principal, or when the target is the last
+    Refuses, before any blanking, when the erasure list has no directory or
+    can't be written, when the key that hashes the username and email can't be
+    read, when ``actor`` is erasing their own principal, or when the target is the last
     active principal holding ``audit.manage``.
     """
     now = _aware(now)
@@ -172,8 +227,8 @@ def erase(
     reason = (reason or "").strip()
     if not principal_id:
         raise RetentionError("a principal is required")
-    if outside_path() is None:
-        raise RetentionError("VIGIL_UPGRADE_DIR is unset")
+    _check_writable()
+    _check_key()
     if not _exists(session, principal_id):
         raise RetentionError("unknown principal")
     # Holding the permission is the role grant on a principal that still exists.
@@ -188,6 +243,8 @@ def erase(
         if not reason:
             raise RetentionError("erasing an audit manager needs a reason")
         return _defer(session, actor, principal_id, reason, now, updated_by)
+    # The feed row first, as every other path takes it, before the trail lock.
+    _lock_feed(session)
     _perform(session, principal_id)
     # Immediate. The trail entry is the record of the action, not a seven-day
     # announcement, so it is not tracked as unconfirmed.
@@ -212,6 +269,106 @@ def apply_due(session, now: datetime) -> None:
     now = _aware(now)
     _apply_period(session, now)
     _apply_erasures(session, now)
+
+
+# How long an erased person's username and email stay reserved.
+RESERVATION_TTL = timedelta(days=730)
+ACTION_RESERVATIONS_DROPPED = "auth.identifier_reservations_dropped"
+
+
+def sweep_reservations(session, now: datetime) -> list[int]:
+    """Drop reservations older than two years, and those whose key can't be
+    read, with one system entry. Returns the ids of notices to email once the
+    caller commits: a lost key tells each ``users.write`` holder.
+
+    Then retires an ``identifier`` key no remaining row names; rotation never
+    does. With no reservations and no old key this reads two small queries and
+    writes nothing. The entry holds a count and a reason, never an identifier.
+    """
+    if not _table(session, "identifier_reservations"):
+        return []
+    # Naive UTC, as the column is.
+    cutoff = _aware(now).replace(tzinfo=None) - RESERVATION_TTL
+    expired = session.execute(
+        text("DELETE FROM public.identifier_reservations WHERE reserved_at < :c"),
+        {"c": cutoff},
+    ).rowcount
+    lost = 0
+    named = set(
+        session.execute(
+            text("SELECT DISTINCT key_version FROM public.identifier_reservations")
+        )
+        .scalars()
+        .all()
+    )
+    for version in sorted(named):
+        try:
+            usable = key_ring.find("identifier", version) is not None
+        except key_ring.KeyRingError:
+            usable = False
+        if not usable:
+            lost += session.execute(
+                text(
+                    "DELETE FROM public.identifier_reservations"
+                    " WHERE key_version = :v"
+                ),
+                {"v": version},
+            ).rowcount
+            named.discard(version)
+    # Only an old version: erasure and identity.reserve need the current key.
+    for version in session.execute(
+        text(
+            "SELECT version FROM public.auth_keys WHERE purpose = 'identifier'"
+            " AND state IN ('verify_only', 'decrypt_only')"
+        )
+    ).scalars():
+        if version not in named:
+            key_ring._retire(session, "identifier", version, reason="unreferenced")
+            key_ring.forget()
+    if not (expired or lost):
+        return []
+    reason = (
+        "expired_and_key_lost"
+        if expired and lost
+        else ("expired" if expired else "key_lost")
+    )
+    trail.append(
+        session,
+        {
+            trail.ACTION: ACTION_RESERVATIONS_DROPPED,
+            trail.ACTOR: trail.SYSTEM,
+            "count": expired + lost,
+            "reason": reason,
+        },
+        gated=False,
+    )
+    return _tell_key_lost(session, lost) if lost else []
+
+
+def _tell_key_lost(session, lost: int) -> list[int]:
+    # Imported here: auth_service pulls auth, and auth imports this module.
+    from core.auth.auth_service import _manager_rows
+    from core.platform.notices import notify
+
+    message = (
+        f"{lost} reserved sign-in name{'s' if lost != 1 else ''} could not be "
+        "kept, because the key that protected them is gone. Someone else may now "
+        "register a username or email an erased person used."
+    )
+    ids = []
+    for principal, _, _ in _manager_rows("", session):
+        notice = notify(
+            principal,
+            "identifier_reservations_lost",
+            "Reserved sign-in names were dropped",
+            message,
+            link="/settings?section=users",
+            priority="high",
+            session=session,
+        )
+        if notice is not None:
+            ids.append(notice)
+    return ids
 
 
 def carried(session, seqs: list[int]) -> None:
@@ -247,7 +404,7 @@ def lock_due_accounts(session, now: datetime) -> None:
     """
     now = _aware(now)
     stored = _load(session, lock=True)
-    if outside_path() is None:
+    if _blocked() is not None:
         return
     ids = sorted(
         {
@@ -272,6 +429,10 @@ def lock_due_accounts(session, now: datetime) -> None:
         ).bindparams(bindparam("ids", expanding=True)),
         {"ids": ids},
     )
+    # Invites too, before the tick takes the trail lock. Issuing one locks the
+    # open row and then appends; locking the row afterwards deadlocks with it.
+    traces = [_invite_trace(session, principal_id) for principal_id in ids]
+    session.info[_INVITE_ROWS] = _open_invites(session, traces, lock=True)
 
 
 def cover_through(session, seq: int) -> None:
@@ -281,10 +442,11 @@ def cover_through(session, seq: int) -> None:
     )
 
 
-def reapply(session, snapshot_ids: list[str]) -> None:
+def reapply(session, snapshot_ids: list[str], *, reserve: bool = True) -> None:
     """Blank the union of ``snapshot_ids`` and the outside file, then write that union back.
 
-    Used after a restore, once the restored database is the live one. An id that
+    Used after a restore, once the restored database is live and its key ring
+    is settled, so each person's username and email are reserved. An id that
     exists only in the outside file is blanked again, because the snapshot was
     taken before that erasure.
     """
@@ -299,10 +461,25 @@ def reapply(session, snapshot_ids: list[str]) -> None:
         return
     path = outside_path()
     if path is None:
-        raise RetentionError("VIGIL_UPGRADE_DIR is unset")
+        raise RetentionError(UNSET_MESSAGE)
+    # A backup from before the table existed is reserved by no one: its upgrade
+    # creates the table empty, and the names can't be hashed afterwards.
+    reserve = reserve and _table(session, "identifier_reservations")
+    # Before anything is blanked: an unreadable ring would roll the whole
+    # re-apply back at the first reservation, so refuse with nothing touched.
+    try:
+        if reserve:
+            key_ring.current("identifier")
+    except key_ring.KeyRingError as exc:
+        raise RetentionError(f"the identifier key can't be read: {exc}") from exc
     for pid in union:
         _blank_label(session, pid)
-        _revoke(session, pid)
+    # Before _revoke rewrites the addresses the scrub has to read. One pass,
+    # so every open invite is locked before the first trail append.
+    scrub_invites(session, union, notices=True)
+    for pid in union:
+        # Dated now, the re-apply time. _revoke skips service and erased accounts.
+        _revoke_and_drop(session, pid, reserve=reserve)
     trail._lock(session)
     for pid in union:
         _blank_beside(session, pid)
@@ -342,7 +519,10 @@ def _apply_period(session, now: datetime) -> None:
 
 
 def _apply_erasures(session, now: datetime) -> None:
-    if outside_path() is None:
+    # An id that can't reach the list would be undone by a restore, and a
+    # username that can't be hashed is lost, so a due erasure stays pending until
+    # the list is writable and the identifier key reads.
+    if _blocked() is not None:
         return
     stored = _load(session, lock=True)
     due = [item for item in stored["erasures"] if _stamp(item) + WAIT <= now]
@@ -351,13 +531,19 @@ def _apply_erasures(session, now: datetime) -> None:
     # The request-time guard is not enough: the others may have been disabled
     # during the wait. Blanking the one who is now last is still refused.
     active = _managers(session, active_only=True)
+    # Nor may it take the last active role manager: the request checked that,
+    # and the wait may have changed it.
+    roles = _managers(session, active_only=True, permission="roles.manage")
     gone = set()
     for item in due:
         principal_id = item["principal_id"]
         if principal_id in active and len(active) == 1:
             continue
+        if roles == {principal_id}:
+            continue
         _perform(session, principal_id)
         active.discard(principal_id)
+        roles.discard(principal_id)
         gone.add((principal_id, item["set_at"]))
     stored["erasures"] = [
         item
@@ -398,17 +584,497 @@ def _announce(session, actor: str, principal_id: str, reason: str):
     return trail.append(session, payload)
 
 
+class _InviteTrace(NamedTuple):
+    emails: tuple[str, ...]
+    folded: tuple[str, ...]
+    usernames: tuple[str, ...]
+    link_ids: tuple[str, ...]
+
+
+def _invite_trace(session, principal_id: str) -> _InviteTrace:
+    """Addresses and usernames still stored for this person, and invite links
+    whose row names them. Read before the account is rewritten and before the
+    beside-columns are cleared. The rewritten ``erased-…`` address is skipped."""
+    emails: set[str] = set()
+    usernames: set[str] = set()
+    skipped = identity.fold(f"{ERASED_PREFIX}{principal_id}@{ERASED_DOMAIN}")
+    erased_user = erased_username(principal_id)
+
+    def add_email(value: Optional[str]) -> None:
+        if value and identity.fold(value) != skipped:
+            emails.add(value)
+
+    def add_username(value: Optional[str]) -> None:
+        if value and value != erased_user:
+            usernames.add(value)
+
+    if _table(session, "users"):
+        row = session.execute(
+            text("SELECT username, email FROM public.users WHERE principal_id = :id"),
+            {"id": principal_id},
+        ).first()
+        if row is not None:
+            add_username(row.username)
+            add_email(row.email)
+    link_ids: list[str] = []
+    if _table(session, "auth_links"):
+        link_ids = list(
+            session.execute(
+                text(
+                    "SELECT link_id FROM public.auth_links"
+                    " WHERE principal_id = :id AND kind = 'invite'"
+                ),
+                {"id": principal_id},
+            ).scalars()
+        )
+    _collect_personal(
+        session,
+        "audit_trail",
+        "personal",
+        principal_id,
+        link_ids,
+        add_email,
+        add_username,
+    )
+    _collect_personal(
+        session,
+        "audit_trail_held",
+        "beside->'personal'",
+        principal_id,
+        link_ids,
+        add_email,
+        add_username,
+    )
+    folded = tuple(sorted({identity.fold(email) for email in emails}))
+    return _InviteTrace(
+        tuple(sorted(emails)), folded, tuple(sorted(usernames)), tuple(link_ids)
+    )
+
+
+def _collect_personal(
+    session, table, personal, principal_id, link_ids, add_email, add_username
+) -> None:
+    """Emails and usernames from ``personal`` on rows that name the principal,
+    plus emails still on the invite entries of the person's links."""
+    if not _table(session, table):
+        return
+    # The principal, not the actor. An invite they sent, and an account they
+    # created, store the other person's address beside their own actor id.
+    for email, username in session.execute(
+        text(
+            f"SELECT {personal}->>'email', {personal}->>'username'"
+            f" FROM public.{table} WHERE payload->>'principal' = :id"
+        ),
+        {"id": principal_id},
+    ):
+        add_email(email)
+        add_username(username)
+    if not link_ids:
+        return
+    for email in session.execute(
+        text(
+            f"SELECT {personal}->>'email' FROM public.{table}"
+            " WHERE payload->>'action' = ANY(CAST(:actions AS text[]))"
+            " AND payload->>'link_id' = ANY(CAST(:links AS text[]))"
+        ),
+        {"actions": list(_INVITE_ACTIONS), "links": list(link_ids)},
+    ).scalars():
+        add_email(email)
+
+
+def _invite_match(
+    email_sql: str, link_ids: tuple[str, ...], folded: tuple[str, ...]
+) -> tuple[str, dict]:
+    """WHERE fragment for invite entries of these links or these addresses.
+    Address comparison is ``sql_fold``: ``lower(normalize(..., NFKC))``."""
+    parts: list[str] = []
+    params: dict[str, Any] = {"actions": list(_INVITE_ACTIONS)}
+    if link_ids:
+        parts.append("payload->>'link_id' = ANY(CAST(:links AS text[]))")
+        params["links"] = list(link_ids)
+    if folded:
+        parts.append(
+            f"lower(normalize({email_sql}, NFKC)) = ANY(CAST(:folded AS text[]))"
+        )
+        params["folded"] = list(folded)
+    if not parts:
+        return "", params
+    clause = (
+        "payload->>'action' = ANY(CAST(:actions AS text[])) AND ("
+        + " OR ".join(parts)
+        + ")"
+    )
+    return clause, params
+
+
+def _drop_invite_notices(session, trace: _InviteTrace) -> None:
+    """Delete the inviter's invite notices that name this person. Other kinds stay."""
+    if not _table(session, "case_notifications"):
+        return
+    parts: list[str] = []
+    params: dict[str, Any] = {}
+    accepted = [_ACCEPTED_NOTICE.format(name) for name in trace.usernames]
+    if accepted:
+        parts.append(
+            "notification_type = 'invite_accepted'"
+            " AND message = ANY(CAST(:accepted AS text[]))"
+        )
+        params["accepted"] = accepted
+    if trace.emails:
+        parts.append(
+            "notification_type = 'invite_cancelled'"
+            " AND message = ANY(CAST(:cancelled AS text[]))"
+        )
+        params["cancelled"] = [f"{email}{_CANCELLED_SUFFIX}" for email in trace.emails]
+    if trace.folded:
+        # The same address in another spelling: the message is the address
+        # plus this suffix, compared the way identifiers compare.
+        parts.append(
+            "notification_type = 'invite_cancelled'"
+            " AND length(message) > length(:suffix)"
+            " AND right(message, length(:suffix)) = :suffix"
+            " AND lower(normalize(left(message, length(message) - length(:suffix)),"
+            " NFKC)) = ANY(CAST(:folded AS text[]))"
+        )
+        params["suffix"] = _CANCELLED_SUFFIX
+        params["folded"] = list(trace.folded)
+    if not parts:
+        return
+    session.execute(
+        text(f"DELETE FROM public.case_notifications WHERE {' OR '.join(parts)}"),
+        params,
+    )
+
+
+def _open_invites(session, traces: list[_InviteTrace], *, lock: bool):
+    """Open invites for these addresses, expired ones included.
+
+    ``lock`` takes them in link-id order before any trail append. Issuing an
+    invite locks the open row and then appends, and the other order deadlocks.
+    Times are naive UTC, the same clock ``note_expired`` and ``revoke`` use.
+    """
+    folded = tuple(sorted({email for trace in traces for email in trace.folded}))
+    if not folded or not _table(session, "auth_links"):
+        return ()
+    locking = " FOR UPDATE" if lock else ""
+    return session.execute(
+        text(f"""
+            SELECT link_id, email, role_id,
+                   (expired_noted_at IS NULL AND expires_at <= :now) AS due
+            FROM public.auth_links
+            WHERE kind = 'invite' AND used_at IS NULL AND revoked_at IS NULL
+              AND email IS NOT NULL
+              AND lower(normalize(email, NFKC)) = ANY(CAST(:folded AS text[]))
+            ORDER BY link_id{locking}
+            """),
+        {"folded": list(folded), "now": utcnow()},
+    ).all()
+
+
+def _lock_and_close(session, traces: list[_InviteTrace]) -> tuple[str, ...]:
+    """Revoke open invites for these addresses, expired ones included.
+
+    The leader's tick locks the rows before it takes the trail lock and leaves
+    them on the session; locking again here would wait on an invite that is
+    itself waiting for that lock. The new entries still carry the address, as
+    ``note_expired`` and ``revoke`` write it; the caller blanks them once it
+    holds the trail lock. Returns the closed link ids.
+    """
+    info = getattr(session, "info", None)
+    if info is not None and _INVITE_ROWS in info:
+        rows = info[_INVITE_ROWS]
+    else:
+        rows = _open_invites(session, traces, lock=True)
+    closed: list[str] = []
+    now = utcnow()
+    for row in rows:
+        if row.due:
+            marked = session.execute(
+                text("""
+                    UPDATE public.auth_links SET expired_noted_at = :now
+                    WHERE link_id = :id AND expired_noted_at IS NULL
+                    RETURNING link_id
+                    """),
+                {"id": row.link_id, "now": now},
+            ).first()
+            if marked:
+                trail_events.record(
+                    session,
+                    "invite.expired",
+                    {"personal": {"email": row.email}},
+                    actor=trail.SYSTEM,
+                    link_id=row.link_id,
+                    role_id=row.role_id,
+                )
+        updated = session.execute(
+            text("""
+                UPDATE public.auth_links
+                SET revoked_at = :now, email = NULL
+                WHERE link_id = :id AND revoked_at IS NULL
+                RETURNING link_id
+                """),
+            {"id": row.link_id, "now": now},
+        ).first()
+        if updated:
+            trail_events.record(
+                session,
+                "invite.revoked",
+                {"personal": {"email": row.email}},
+                actor=trail.SYSTEM,
+                link_id=row.link_id,
+                reason="erased",
+            )
+            closed.append(row.link_id)
+    return tuple(closed)
+
+
+def _blank_invite_rows(session, trace: _InviteTrace) -> None:
+    """Null the address and source address on the invite entries of these links
+    and addresses. The payload is untouched, so the chain still verifies."""
+    clause, params = _invite_match("personal->>'email'", trace.link_ids, trace.folded)
+    if not clause:
+        return
+    if _table(session, "audit_trail"):
+        session.execute(
+            text(f"""
+                UPDATE public.audit_trail SET personal = NULL, source_ip = NULL
+                WHERE {clause}
+                  AND (personal IS NOT NULL OR source_ip IS NOT NULL)
+                """),
+            params,
+        )
+    held, held_params = _invite_match(
+        "beside->'personal'->>'email'", trace.link_ids, trace.folded
+    )
+    if held and _table(session, "audit_trail_held"):
+        session.execute(
+            text(f"""
+                UPDATE public.audit_trail_held
+                SET beside = beside - 'personal' - 'source_ip'
+                WHERE {held}
+                  AND (beside ? 'personal' OR beside ? 'source_ip')
+                """),
+            held_params,
+        )
+
+
+def _invite_dirty(session, trace: _InviteTrace) -> bool:
+    clause, params = _invite_match("personal->>'email'", trace.link_ids, trace.folded)
+    if clause and _table(session, "audit_trail"):
+        if session.execute(
+            text(
+                "SELECT 1 FROM public.audit_trail"
+                f" WHERE {clause} AND (personal IS NOT NULL OR source_ip IS NOT NULL)"
+                " LIMIT 1"
+            ),
+            params,
+        ).first():
+            return True
+    held, held_params = _invite_match(
+        "beside->'personal'->>'email'", trace.link_ids, trace.folded
+    )
+    if held and _table(session, "audit_trail_held"):
+        if session.execute(
+            text(
+                "SELECT 1 FROM public.audit_trail_held WHERE "
+                f"{held} AND (beside ? 'personal' OR beside ? 'source_ip') LIMIT 1"
+            ),
+            held_params,
+        ).first():
+            return True
+    return False
+
+
+def scrub_invites(session, principal_ids: list[str], *, notices: bool) -> None:
+    """Clear invite traces for these principals.
+
+    Closes an invite still open for an address they hold, then nulls the
+    address and source address on ``invite.sent``, ``invite.failed``,
+    ``invite.expired`` and ``invite.revoked``. ``notices`` deletes the
+    inviter's invite notices; an upgrade leaves them, because nothing left in
+    the database ties those rows to the person. Plain SQL on the caller's
+    connection: the upgrade runs it too. Running it again changes nothing.
+    """
+    traces = [_invite_trace(session, principal_id) for principal_id in principal_ids]
+    if notices:
+        for trace in traces:
+            _drop_invite_notices(session, trace)
+    closed = _lock_and_close(session, traces)
+    merged = _InviteTrace(
+        emails=tuple(sorted({email for trace in traces for email in trace.emails})),
+        folded=tuple(sorted({email for trace in traces for email in trace.folded})),
+        usernames=(),
+        link_ids=tuple(
+            sorted({*closed, *(link for trace in traces for link in trace.link_ids)})
+        ),
+    )
+    # Close writes the address into the new entries. Blank after that, and
+    # only once this transaction holds the trail lock: the leader takes the
+    # lock and then locks window rows.
+    if closed or _invite_dirty(session, merged):
+        trail._lock(session)
+        _blank_invite_rows(session, merged)
+
+
 def _perform(session, principal_id: str) -> None:
-    # The label and the account come first on an immediate erasure. The
-    # beside-columns wait until this transaction holds the trail lock: the
-    # leader takes that lock and then locks window rows, so updating those
-    # rows first deadlocks with the tick.
+    # Lock order, everywhere: the feed row, then the trail lock, then window or
+    # retention rows. The caller holds the feed row. The beside-columns wait
+    # until this transaction holds the trail lock: the leader takes that lock
+    # and then locks window rows, so updating those rows first deadlocks.
+    # Invite rows are locked before that, inside the scrub: issuing an invite
+    # locks the open invite and then appends.
     _blank_label(session, principal_id)
-    _revoke(session, principal_id)
-    _drop_notices(session, principal_id)
+    # Before _revoke rewrites the username and email, and before the
+    # beside-columns that still hold an address are cleared.
+    scrub_invites(session, [principal_id], notices=True)
+    _revoke_and_drop(session, principal_id)
     trail._lock(session)
     _blank_beside(session, principal_id)
     _queue_append(session, [principal_id])
+
+
+# Columns that keep a person's username as text, rewritten with the account.
+_USERNAME_COLUMNS = (
+    ("cases", "assignee"),
+    ("case_tasks", "assignee"),
+    ("case_comments", "author"),
+    ("case_evidence", "collected_by"),
+    ("case_relationships", "created_by"),
+    ("case_closure_info", "closed_by"),
+    ("case_closure_info", "closed_by_text"),
+    ("case_attachments", "uploaded_by"),
+    ("case_escalations", "escalated_from"),
+    ("case_escalations", "escalated_to"),
+    ("case_audit_logs", "changed_by"),
+    ("ip_exclusions", "created_by"),
+    ("ip_exclusions", "removed_by"),
+    ("findings", "noise_marked_by"),
+    ("detection_proposals", "created_by"),
+    ("detection_proposal_events", "actor"),
+    ("detection_rules", "linked_by"),
+    ("detection_rule_stages", "actor"),
+    ("detection_rule_exceptions", "created_by"),
+    ("detection_rule_exceptions", "removed_by"),
+    ("approval_actions", "created_by"),
+    ("approval_actions", "approved_by"),
+    ("workflow_runs", "triggered_by"),
+    ("custom_workflows", "created_by"),
+    ("custom_agents", "created_by"),
+    ("episodic_notes", "written_by"),
+    ("agent_directives", "actor"),
+    ("investigation_replay", "started_by"),
+    ("skill_scans", "approved_by"),
+    ("skill_installs", "installed_by"),
+    ("tool_effect_classes", "classified_by"),
+    ("system_config", "updated_by"),
+    ("integration_configs", "updated_by"),
+    ("ai_model_configs", "updated_by"),
+    ("config_audit_log", "changed_by"),
+)
+
+
+def _columns(session, table: str) -> set[str]:
+    return set(
+        session.execute(
+            text(
+                "SELECT column_name FROM information_schema.columns"
+                " WHERE table_schema = 'public' AND table_name = :table"
+            ),
+            {"table": table},
+        ).scalars()
+    )
+
+
+# Rendered into the case shell's view; raw UPDATEs skip ORM onupdate.
+_CASE_VIEW_NAMES = (
+    ("cases", "assignee"),
+    ("case_tasks", "assignee"),
+    ("case_evidence", "collected_by"),
+    ("case_escalations", "escalated_from"),
+    ("case_escalations", "escalated_to"),
+)
+
+
+def _touch_named_cases(session, params: dict, have: dict[str, set[str]]) -> None:
+    """Bump updated_at on every case whose view shows the name, before it is
+    rewritten, so a held render of it is not served (#5243)."""
+    for table, _ in _CASE_VIEW_NAMES:
+        if table not in have:
+            have[table] = _columns(session, table)
+    if "updated_at" not in have["cases"]:
+        return
+    # {table} and {column} are fixed names from the list above.
+    named = [
+        f"SELECT case_id FROM public.{table} WHERE {column} = :old"
+        for table, column in _CASE_VIEW_NAMES
+        if column in have[table] and "case_id" in have[table]
+    ]
+    if named:
+        session.execute(
+            text(
+                "UPDATE public.cases SET updated_at = now() AT TIME ZONE 'UTC'"
+                f" WHERE case_id IN ({' UNION '.join(named)})"
+            ),
+            params,
+        )
+
+
+def _rename_records(session, username: str, erased: str) -> None:
+    """Rewrite ``username`` to ``erased`` wherever a record keeps it as text.
+    An upgrade step runs this on an older schema, so a missing column is skipped."""
+    params = {"old": username, "new": erased}
+    have: dict[str, set[str]] = {}
+    _touch_named_cases(session, params, have)
+    for table, column in _USERNAME_COLUMNS:
+        if table not in have:
+            have[table] = _columns(session, table)
+        if column in have[table]:
+            # {table} and {column} are fixed names from the list above.
+            session.execute(
+                text(
+                    f"UPDATE public.{table} SET {column} = :new WHERE {column} = :old"
+                ),
+                params,
+            )
+    if "mentions" in _columns(session, "case_comments"):
+        session.execute(
+            text("""
+                UPDATE public.case_comments
+                SET mentions = array_replace(mentions, CAST(:old AS varchar), CAST(:new AS varchar))
+                WHERE CAST(:old AS varchar) = ANY(mentions)
+                """),
+            params,
+        )
+    if "chain_of_custody" in _columns(session, "case_evidence"):
+        session.execute(
+            text("""
+                UPDATE public.case_evidence SET chain_of_custody = (
+                    SELECT jsonb_agg(CASE WHEN e->>'user' = :old
+                        THEN jsonb_set(e, '{user}', to_jsonb(CAST(:new AS text)))
+                        ELSE e END ORDER BY n)
+                    FROM jsonb_array_elements(chain_of_custody) WITH ORDINALITY AS c(e, n)
+                )
+                WHERE jsonb_typeof(chain_of_custody) = 'array'
+                  AND chain_of_custody @> jsonb_build_array(jsonb_build_object('user', CAST(:old AS text)))
+                """),
+            params,
+        )
+    if "value" in _columns(session, "system_config"):
+        # The setup wizard names who finished it.
+        session.execute(
+            text("""
+                UPDATE public.system_config
+                SET value = jsonb_set(value, '{finished_by}', to_jsonb(CAST(:new AS text)))
+                WHERE jsonb_typeof(value) = 'object' AND value->>'finished_by' = :old
+                """),
+            params,
+        )
+    # Watching and notices addressed by username serve nobody once the account goes.
+    for table in ("case_watchers", "case_notifications"):
+        if "user_id" in _columns(session, table):
+            session.execute(
+                text(f"DELETE FROM public.{table} WHERE user_id = :old"), params
+            )
 
 
 def _blank_label(session, principal_id: str) -> None:
@@ -437,6 +1103,31 @@ def _blank_beside(session, principal_id: str) -> None:
             ),
             {"id": principal_id},
         )
+    if _table(session, "sign_ins"):
+        # The rows and their ids stay; only the device details go.
+        session.execute(
+            text(
+                "UPDATE public.sign_ins SET user_agent = NULL, device = NULL,"
+                " address = NULL WHERE principal_id = :id"
+            ),
+            {"id": principal_id},
+        )
+
+
+def _revoke_and_drop(session, principal_id: str, *, reserve: bool = True) -> None:
+    """Revoke the account, then delete the notices erasure removes.
+
+    The username is read before ``_revoke`` rewrites it. Erasure and the
+    restore re-apply both call this, so a notice step added here runs on both.
+    Only the current name: an earlier one the invite scrub collected is not
+    dated, so those notices stay. The user row stays locked by the update
+    through the end of this transaction. A notice inserted after that lock
+    sees the placeholder.
+    """
+    username = _current_username(session, principal_id)
+    _revoke(session, principal_id, reserve=reserve)
+    _drop_notices(session, principal_id)
+    _drop_subject_notices(session, principal_id, username)
 
 
 def _drop_notices(session, principal_id: str) -> None:
@@ -448,15 +1139,184 @@ def _drop_notices(session, principal_id: str) -> None:
         )
 
 
-def _revoke(session, principal_id: str) -> None:
-    """Deactivate the account, free its username and email, revoke MCP credentials
-    and end sign-ins, and keep those rows.
+def _current_username(session, principal_id: str) -> Optional[str]:
+    if not _table(session, "users"):
+        return None
+    return session.execute(
+        text("SELECT username FROM public.users WHERE principal_id = :id"),
+        {"id": principal_id},
+    ).scalar()
+
+
+def _user_created_has(session, username: str, principal_id: str, *, own: bool) -> bool:
+    """True when a ``user.created`` entry records ``username``.
+
+    ``own`` is this principal. Otherwise any other principal. A held entry
+    counts: it is still the creation record. The directory-sync account's
+    entry carries no username, so it never matches.
+    """
+    principal = (
+        "payload->>'principal' = :id"
+        if own
+        else "payload->>'principal' IS NOT NULL AND payload->>'principal' <> :id"
+    )
+    params = {"id": principal_id, "username": username, "action": "user.created"}
+    if (
+        _table(session, "audit_trail")
+        and session.execute(
+            text(f"""
+            SELECT 1 FROM public.audit_trail
+            WHERE payload->>'action' = :action
+              AND personal->>'username' = :username
+              AND {principal}
+            LIMIT 1
+            """),
+            params,
+        ).first()
+    ):
+        return True
+    if (
+        _table(session, "audit_trail_held")
+        and session.execute(
+            text(f"""
+            SELECT 1 FROM public.audit_trail_held
+            WHERE payload->>'action' = :action
+              AND beside->'personal'->>'username' = :username
+              AND {principal}
+            LIMIT 1
+            """),
+            params,
+        ).first()
+    ):
+        return True
+    return False
+
+
+def _subject_clause(username: str) -> tuple[str, dict]:
+    # The slots live with the bell. Importing them here, not from notices into
+    # a domain, keeps the platform from reaching everything this module imports.
+    from core.platform.notices import (
+        RUNS_STOPPED_OPENING,
+        SUBJECT_TITLES,
+        fill_subject,
+    )
+
+    parts: list[str] = []
+    params: dict[str, Any] = {}
+    for kind, templates in SUBJECT_TITLES.items():
+        filled = [fill_subject(item, username) for item in templates]
+        params[f"kind_{kind}"] = kind
+        if len(filled) == 1:
+            params[f"title_{kind}"] = filled[0]
+            parts.append(
+                f"(n.notification_type = :kind_{kind} AND n.title = :title_{kind})"
+            )
+        else:
+            params[f"titles_{kind}"] = filled
+            parts.append(
+                f"(n.notification_type = :kind_{kind}"
+                f" AND n.title = ANY(CAST(:titles_{kind} AS text[])))"
+            )
+    params["runs_prefix"] = fill_subject(RUNS_STOPPED_OPENING, username)
+    parts.append(
+        "(n.notification_type = 'runs_stopped'"
+        " AND left(n.message, char_length(:runs_prefix)) = :runs_prefix)"
+    )
+    return " OR ".join(parts), params
+
+
+def _drop_subject_notices(session, principal_id: str, username: Optional[str]) -> None:
+    """Delete bell notices about this person under their current username.
+
+    Rows written before the account existed stay. When this account's
+    ``user.created`` entry still has the name, it is dated from the account.
+    When a directory gave them the name, the notices stay if another account's
+    creation entry has it: the rename is not on the trail, so the scrub cannot
+    tell whose notice it is. Nothing here is an upgrade, and nothing calls the
+    key ring.
+    """
+    if (
+        not username
+        or is_erased(username, principal_id)
+        or not _table(session, "case_notifications")
+        or not _table(session, "users")
+    ):
+        return
+    if not _user_created_has(session, username, principal_id, own=True):
+        if _user_created_has(session, username, principal_id, own=False):
+            return
+    clause, params = _subject_clause(username)
+    params["id"] = principal_id
+    session.execute(
+        text(f"""
+            DELETE FROM public.case_notifications AS n
+            USING public.users AS u
+            WHERE u.principal_id = :id
+              AND n.case_id IS NULL
+              AND n.created_at >= u.created_at
+              AND ({clause})
+            """),
+        params,
+    )
+
+
+def _leave_mapped_teams(session, principal_id: str, user_id: str) -> None:
+    """Drop synced-team membership. A hand remove of that team is refused."""
+    if not _table(session, "team_memberships"):
+        return
+    # Imported here: teams pulls auth, and auth imports this module.
+    from core import teams
+
+    mapped = teams.mapped_team_ids(session)
+    if not mapped:
+        return
+    held = session.execute(
+        text("SELECT team_id FROM public.team_memberships WHERE principal_id = :id"),
+        {"id": principal_id},
+    ).scalars()
+    for team_id in list(held):
+        if team_id in mapped:
+            teams.remove_member(
+                session, team_id, user_id, actor=trail.SYSTEM, by_mapping=True
+            )
+
+
+def _revoke(session, principal_id: str, *, reserve: bool = True) -> None:
+    """Deactivate the account, keep its username and email as keyed hashes
+    (``reserve``), free them, revoke MCP credentials
+    and blank their labels, drop its preferences, and end sign-ins, and keep the
+    other rows.
 
     The user row stays, and the principal is not marked deleted. Deactivating
     is what stops the password signing in again and the role being honoured.
     """
     if not _table(session, "users"):
         return
+    # Pushes waiting for a link to this account carry its names: read them first.
+    names = session.execute(
+        text(
+            "SELECT username, email, service_account FROM public.users"
+            " WHERE principal_id = :id"
+        ),
+        {"id": principal_id},
+    ).first()
+    # A service account's names are made up, and an erased one is already placeholders.
+    if (
+        names
+        and reserve
+        and not names.service_account
+        and not is_erased(names.username, principal_id)
+    ):
+        identity.reserve(session, names.username, names.email)
+    if names and _table(session, "directory_pending"):
+        session.execute(
+            text("""
+                DELETE FROM public.directory_pending
+                WHERE lower(username) IN (lower(:u), lower(:e))
+                   OR lower(email) IN (lower(:u), lower(:e))
+                """),
+            {"u": names.username, "e": names.email},
+        )
     free_identifiers(session, principal_id)
     user_id = session.execute(
         text(
@@ -469,12 +1329,18 @@ def _revoke(session, principal_id: str) -> None:
         return
     for credential in mcp_credential_service.list_for_user(user_id, session=session):
         mcp_credential_service.revoke(credential.credential_id, session=session)
+    drop_personal_rows(session, user_id)
     sign_ins.end_all_for_user(user_id, sign_ins.ERASED, session=session)
-    if _table(session, "security_keys"):
-        session.execute(
-            text("DELETE FROM public.security_keys WHERE principal_id = :id"),
-            {"id": principal_id},
-        )
+    # A synced team refuses a hand remove. Leave it here, while the user row
+    # still answers remove_member, before the group rows that named them are gone.
+    _leave_mapped_teams(session, principal_id, user_id)
+    for table in ("security_keys", "sso_links", "directory_group_members"):
+        if _table(session, table):
+            # {table} is one of the fixed names above.
+            session.execute(
+                text(f"DELETE FROM public.{table} WHERE principal_id = :id"),
+                {"id": principal_id},
+            )
 
 
 def _queue_append(session, ids: list[str]) -> None:
@@ -513,26 +1379,88 @@ def _arm_file(session) -> None:
     event.listen(session, "after_rollback", _rolled_back, once=True)
 
 
+def _check_writable() -> None:
+    """Refuse before blanking when the list can't be written after the commit.
+
+    A blanking whose id never reaches the list is undone by a restore.
+    """
+    path = outside_path()
+    if path is None:
+        raise RetentionError(UNSET_MESSAGE)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8"):
+            pass
+    except OSError as exc:
+        raise RetentionError(f"the erasure list is not writable: {path}") from exc
+
+
+def _check_key() -> None:
+    """Refuse before blanking when the username and email can't be hashed: the
+    originals are overwritten, so nothing could be hashed later."""
+    try:
+        key_ring.current("identifier")
+    except key_ring.KeyRingError as exc:
+        raise RetentionError(f"the identifier key can't be read: {exc}") from exc
+
+
+def _blocked() -> Optional[str]:
+    """Why an erasure can't be recorded now, or None."""
+    try:
+        _check_writable()
+        _check_key()
+    except RetentionError as exc:
+        return str(exc)
+    return None
+
+
+@contextmanager
+def _list_lock():
+    """Serialize list writes across replicas, even on different nodes.
+
+    The writes run in ``after_commit``, where the session can't emit SQL, so
+    the lock is session-level on its own connection.
+    """
+    manager = get_db_manager()
+    manager.initialize()  # a no-op once the process has its engine
+    with manager.engine.connect().execution_options(
+        isolation_level="AUTOCOMMIT"
+    ) as conn:
+        conn.execute(text("SELECT pg_advisory_lock(:k)"), {"k": _LIST_LOCK})
+        try:
+            yield
+        finally:
+            conn.execute(text("SELECT pg_advisory_unlock(:k)"), {"k": _LIST_LOCK})
+
+
 def _write_exact(body: str) -> None:
     path = outside_path()
     if path is None:
-        raise RetentionError("VIGIL_UPGRADE_DIR is unset")
+        raise RetentionError(UNSET_MESSAGE)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(body, encoding="utf-8")
+    with _list_lock(), path.open("w", encoding="utf-8") as handle:
+        handle.write(body)
+        handle.flush()
+        os.fsync(handle.fileno())
 
 
 def _append_file(ids: list[str]) -> None:
     path = outside_path()
     if path is None:
-        raise RetentionError("VIGIL_UPGRADE_DIR is unset")
-    existing = set(read_ids(path))
-    fresh = [pid for pid in ids if pid not in existing]
-    if not fresh:
-        return
+        raise RetentionError(UNSET_MESSAGE)
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a", encoding="utf-8") as handle:
-        for pid in fresh:
-            handle.write(pid + "\n")
+    # Read, check and append under one lock: another replica's append lands
+    # before the read or after the fsync, never between.
+    with _list_lock():
+        existing = set(read_ids(path))
+        fresh = [pid for pid in dict.fromkeys(ids) if pid not in existing]
+        if not fresh:
+            return
+        with path.open("a", encoding="utf-8") as handle:
+            for pid in fresh:
+                handle.write(pid + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
 
 
 def _exists(session, principal_id: str) -> bool:
@@ -547,8 +1475,10 @@ def _exists(session, principal_id: str) -> bool:
     )
 
 
-def _managers(session, *, active_only: bool) -> set[str]:
-    """Principals whose role holds ``audit.manage``.
+def _managers(
+    session, *, active_only: bool, permission: str = "audit.manage"
+) -> set[str]:
+    """Principals whose role holds ``permission`` (``audit.manage``).
 
     ``active_only`` is the last-manager guard. A disabled account still holds
     the permission, so erasing it waits seven days like any other holder. A
@@ -567,9 +1497,9 @@ def _managers(session, *, active_only: bool) -> set[str]:
             WHERE p.deleted_at IS NULL
               AND p.kind = :person
               {active}
-              AND (r.permissions -> 'audit.manage') = 'true'::jsonb
+              AND (r.permissions -> :permission) = 'true'::jsonb
             """),
-        {"person": principals.PERSON},
+        {"person": principals.PERSON, "permission": permission},
     ).scalars()
     found = set(rows)
     if active_only:
@@ -663,6 +1593,8 @@ def _view(session, now: datetime) -> dict:
         "pending_on": (_stamp(pending) + WAIT).isoformat() if pending else None,
         "unconfirmed": any(waiting(item) for item in periods),
         "erasure_unconfirmed": any(seq not in period_seqs for seq in announced),
+        # Live, not stored: why a due erasure would wait.
+        "blocked": _blocked(),
         "erasures": [
             {
                 "principal_id": item.get("principal_id"),
@@ -696,11 +1628,12 @@ def _remember(session, seq: int) -> None:
 
 
 def _lock_feed(session) -> None:
-    """The feed row, before the retention row and before the trail lock.
+    """The feed row, before the trail lock and before window or retention rows.
 
-    ``maintenance_and_send`` holds this row, then the trail lock, then the
-    retention row. A save that takes the retention row first and appends
-    (the insert takes the trail lock) deadlocks with that tick.
+    The one lock order: feed row, then the trail lock, then window or retention
+    rows. ``maintenance_and_send`` takes them so, and so must every save, export
+    and erasure that appends (the insert takes the trail lock); taking the trail
+    lock first deadlocks with that tick or with another holder of the feed row.
     """
     _announcements(session)
 

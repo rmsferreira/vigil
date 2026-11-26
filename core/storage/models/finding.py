@@ -63,6 +63,10 @@ class Finding(Base):
 
     # Metadata
     timestamp: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    # Set once, when triage first records a verdict. A later triage leaves it.
+    first_verdict_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime, nullable=True
+    )
     data_source: Mapped[str] = mapped_column(String(50), nullable=False)
     # Source-native ID. Combined with data_source it forms the dedup key
     # for federated ingest (see uniq_findings_source_extid).
@@ -78,6 +82,9 @@ class Finding(Base):
         String(20), nullable=True
     )
     noise_reason: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    # Which kind of fix the dismissal is (FalsePositiveCause), or null when
+    # none was chosen. Cleared with the mark.
+    noise_cause: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
     # AI-generated enrichment (cached analysis)
     ai_enrichment: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)

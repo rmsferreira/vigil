@@ -15,12 +15,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from core.config import validate_settings_or_exit
 
 if TYPE_CHECKING:
-    from services.daemon.config import DaemonConfig
+    from core.daemon_config import DaemonConfig
 
 logger = logging.getLogger(__name__)
 
 # Under the daemon StatefulSet's terminationGracePeriodSeconds (60), leaving
 # room for the telemetry flush after the components stop.
+# Compose stop_grace_period is at least this, so a restart drains before SIGKILL.
 SHUTDOWN_GRACE_SECONDS = 45
 
 
@@ -31,9 +32,10 @@ class SOCDaemon:
         self.config = config
         self.config.setup_logging()
 
-        # Observe mode (#915): log declared-vs-effective intent, enforce nothing.
+        # Log declared-vs-effective intent (#915). Enforcement, when a
+        # directory is declared, is the applier task started in run().
         try:
-            from services.daemon.intent import report_intent
+            from core.intent_report import report_intent
 
             report_intent(self.config)
         except Exception as _intent_err:
@@ -53,7 +55,6 @@ class SOCDaemon:
         self._poller = None
         self._kafka_ingestor = None
         self._processor = None
-        self._executor = None
         self._scheduler = None
         self._orchestrator = None
         self._metrics_server = None
@@ -93,10 +94,7 @@ class SOCDaemon:
             build_mcp_client,
             set_process_mcp_client,
         )
-        from core.response.approval_service import ApprovalService
-        from core.response.autonomous_response_service import AutonomousResponseService
         from core.storage.connection import get_db_manager
-        from services.daemon.executor import ApprovedActionExecutor
         from services.daemon.kafka_ingestor import KafkaIngestor
         from services.daemon.metrics import MetricsServer
         from services.daemon.orchestrator import Orchestrator
@@ -110,22 +108,13 @@ class SOCDaemon:
 
         self._poller = DataPoller(self.config.polling)
         self._kafka_ingestor = KafkaIngestor(self.config.kafka)
-        self._processor = FindingProcessor(
-            self.config.processing, response_config=self.config.response
-        )
+        self._processor = FindingProcessor(self.config.processing)
         # The daemon owns its own copies: it is a separate process from the API, so
         # nothing on the API's app.state is reachable from here.
         set_process_mcp_client(build_mcp_client())
-        approvals = ApprovalService(config=self.config.response)
 
-        self._executor = ApprovedActionExecutor(
-            AutonomousResponseService(approvals=approvals, config=self.config.response)
-        )
         self._scheduler = TaskScheduler(self.config.scheduler)
-        self._orchestrator = Orchestrator(
-            self.config.orchestrator,
-            approvals=approvals,
-        )
+        self._orchestrator = Orchestrator(self.config.orchestrator)
 
         self._metrics_server = MetricsServer(self.config.metrics)
 
@@ -138,7 +127,6 @@ class SOCDaemon:
         self._metrics_server.poller = self._poller
         self._metrics_server.kafka_ingestor = self._kafka_ingestor
         self._metrics_server.processor = self._processor
-        self._metrics_server.executor = self._executor
         self._metrics_server.scheduler = self._scheduler
         self._metrics_server.orchestrator = self._orchestrator
 
@@ -148,6 +136,12 @@ class SOCDaemon:
         self._orchestrator.watch_loop = self._metrics_server.loop_watcher(
             "orchestrator"
         )
+
+        tick = self._metrics_server.pass_ticker
+        self._poller.set_pass_ticker(tick("poller"))
+        self._processor.note_pass = tick("processor")
+        self._scheduler.note_pass = tick("scheduler")
+        self._orchestrator.note_pass = tick("orchestrator")
 
         logger.info("All components initialized")
 
@@ -183,9 +177,6 @@ class SOCDaemon:
         if self._processor:
             start("processor", self._processor, "Finding processor")
 
-        if self._executor:
-            start("executor", self._executor, "Approved-action executor")
-
         if self._scheduler:
             start("scheduler", self._scheduler, "Task scheduler")
 
@@ -195,6 +186,22 @@ class SOCDaemon:
                 logger.info("Autonomous orchestrator is disabled")
 
         start("metrics", self._metrics_server, "Metrics server")
+
+        # A declared directory (VIGIL_INTENT_DIR): this daemon is its only applier.
+        from services.daemon.intent_apply import clear_site, intent_dir, run_applier
+
+        directory = intent_dir()
+        if directory is None:
+            try:  # unset: the declared site goes; intent.applied stays
+                await asyncio.to_thread(clear_site)
+            except Exception:  # noqa: BLE001 - never stops the daemon
+                logger.exception("site: clearing the declared site failed")
+        else:
+            task = asyncio.create_task(
+                run_applier(directory, self._shutdown_event), name="intent"
+            )
+            task.add_done_callback(lambda t: self._on_task_done("intent", t))
+            tasks.append(task)
 
         logger.info("SOC Daemon fully operational")
 
@@ -227,7 +234,7 @@ class SOCDaemon:
 def main():
     """Entry point for the daemon."""
     validate_settings_or_exit()
-    from services.daemon.config import DaemonConfig
+    from core.daemon_config import DaemonConfig
 
     config = DaemonConfig.from_env()
     daemon = SOCDaemon(config)

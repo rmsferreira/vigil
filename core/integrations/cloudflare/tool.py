@@ -114,6 +114,20 @@ async def handle_list_tools():
             },
         ),
         types.Tool(
+            name="cf_gateway_unblock_domain",
+            description=(
+                "Delete a Zero Trust Gateway rule by rule_id "
+                "(returned from cf_gateway_block_domain)."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "rule_id": {"type": "string"},
+                },
+                "required": ["rule_id"],
+            },
+        ),
+        types.Tool(
             name="cf_access_revoke_session",
             description=(
                 "Revoke all active Cloudflare Zero Trust (Access) sessions for a user. "
@@ -208,6 +222,15 @@ async def handle_call_tool(name: str, arguments: dict | None):
                     rule_name=args.get("rule_name"),
                 )
             )
+        if name == "cf_gateway_unblock_domain":
+            return _result(
+                await asyncio.to_thread(
+                    _gateway_unblock_domain,
+                    api_token=api_token,
+                    account_id=account_id,
+                    rule_id=args.get("rule_id"),
+                )
+            )
         if name == "cf_access_revoke_session":
             return _result(
                 await asyncio.to_thread(
@@ -244,9 +267,7 @@ async def handle_call_tool(name: str, arguments: dict | None):
 
 
 # ---------------------------------------------------------------------------
-# REST helpers — kept module-level so they can be imported by the response
-# service for the approved-action executor (single source of truth for the
-# Cloudflare API surface).
+# REST helpers — the Cloudflare API surface the tools above call.
 # ---------------------------------------------------------------------------
 
 
@@ -341,6 +362,27 @@ def _gateway_block_domain(
     }
 
 
+def _gateway_unblock_domain(
+    api_token: str, account_id: Optional[str], rule_id: Optional[str]
+) -> Dict[str, Any]:
+    if not rule_id:
+        return {"error": "rule_id required"}
+    if not account_id:
+        return {"error": "account_id required"}
+    resp = httpx.delete(
+        f"{CF_API_BASE}/accounts/{account_id}/gateway/rules/{rule_id}",
+        headers=_headers(api_token),
+        timeout=DEFAULT_TIMEOUT,
+    )
+    data = resp.json() if resp.content else {}
+    return {
+        "success": resp.status_code in (200, 204) and data.get("success", True),
+        "status_code": resp.status_code,
+        "rule_id": rule_id,
+        "errors": data.get("errors"),
+    }
+
+
 def _access_revoke_session(
     api_token: str,
     account_id: Optional[str],
@@ -389,8 +431,9 @@ def _lookup_ip_threat(
     )
     data = resp.json() if resp.content else {}
     rules = data.get("result") or []
-    return {
-        "success": resp.status_code == 200 and data.get("success", False),
+    ok = resp.status_code == 200 and data.get("success", False)
+    looked_up = {
+        "success": ok,
         "ip": ip,
         "matching_rules": [
             {
@@ -405,6 +448,9 @@ def _lookup_ip_threat(
         "rule_count": len(rules),
         "zone_id": zone_id,
     }
+    if not ok:
+        looked_up["error"] = f"Cloudflare answered HTTP {resp.status_code}"
+    return looked_up
 
 
 def _lookup_domain_threat(

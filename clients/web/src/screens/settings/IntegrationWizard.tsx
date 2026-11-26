@@ -2,10 +2,10 @@ import { useEffect, useMemo, useState } from 'react'
 import { Link } from 'react-router-dom'
 import { Icon } from '../../shared/icons'
 import { LevelBadge, type Level } from '../../shared/LevelBadge'
-import { configApi, type IntegrationTestResult } from '../../services/api'
+import { configApi, federationApi, type IntegrationTestResult } from '../../services/api'
 import { Field, NumberInput, OverlayPortal, PasswordInput, Select, TextInput, ToggleRow } from '../../shared/ui'
 import { Banner, extractApiError } from '../../shared/formKit'
-import { relativeTime, type LastTest } from './integrationHealth'
+import { healthId, relativeTime, type LastTest } from './integrationHealth'
 import {
   SECTION_LABELS,
   fieldsWithProxy,
@@ -30,6 +30,9 @@ interface Props {
 }
 
 const STEPS = ['Add connection', 'Verify a read', 'Collect alerts', 'Automatic investigations'] as const
+// Collect alerts and Automatic investigations only mean something for a tool Alert
+// collection can pull alerts from; every other integration stops at Verify a read.
+const READ_ONLY_STEPS = STEPS.slice(0, 2)
 
 type Probe =
   | { state: 'idle' }
@@ -57,6 +60,21 @@ export default function IntegrationWizard({
   const [saved, setSaved] = useState<Record<string, unknown>>(existingConfig)
   const [probe, setProbe] = useState<Probe>({ state: 'idle' })
   const [tested, setTested] = useState<LastTest | undefined>(lastTest)
+  // Whether Alert collection lists this integration as a source; until it answers
+  // the drawer shows the first two steps, and a failed read keeps all four.
+  const [collectable, setCollectable] = useState(false)
+  useEffect(() => {
+    let live = true
+    federationApi.listSources().then(
+      (r) => live && setCollectable((r.data.sources || []).some((s) => healthId(s.source_id) === integration.id)),
+      () => live && setCollectable(true),
+    )
+    return () => {
+      live = false
+    }
+  }, [integration.id])
+  const steps = collectable ? STEPS : READ_ONLY_STEPS
+
   // a test run here is stored; once the parent has re-read it, show what it read
   useEffect(() => {
     if (lastTest) setTested(lastTest)
@@ -137,8 +155,9 @@ export default function IntegrationWizard({
     try {
       const { data } = await configApi.testIntegration(integration.id)
       setProbe({ state: 'done', result: data })
-      // not_testable has no probe to record; every other answer was stored
-      if (data.reason !== 'not_testable') {
+      // not_testable has no probe to record. not_checked did not run the read,
+      // so it is not stored as a pass or a failure.
+      if (data.reason !== 'not_testable' && data.reason !== 'not_checked') {
         setTested({ at: new Date().toISOString(), success: data.success, error: data.success ? null : data.message ?? null })
         onTested?.()
       }
@@ -199,7 +218,7 @@ export default function IntegrationWizard({
           </div>
 
           <div className="int-steps" role="tablist" aria-label="Setup steps">
-            {STEPS.map((label, i) => (
+            {steps.map((label, i) => (
               <button
                 key={label}
                 role="tab"
@@ -316,12 +335,16 @@ function VerifyStep({ probe, onRun }: { probe: Probe; onRun: () => void }) {
   }
   const { result } = probe
   if (result.reason === 'not_testable') return note('This integration has no server Vigil can test.')
+  if (result.reason === 'not_checked') return note(result.message || 'not checked: no read-only call exists')
   const servers = result.servers ?? []
+  const cred = result.credentials
+  const credState = cred?.success === true ? 'pass' : cred?.success === false ? 'fail' : 'skip'
   // A connector integration has no servers; its message says what was checked.
   return (
     <>
       {servers.length > 0 && note('Vigil connects to each server behind this integration with the saved settings, then reads from the service with the saved URL and credentials.')}
-      {servers.length === 0 && <Banner kind={result.success ? 'ok' : 'err'}>{result.message || 'Nothing was tested.'}</Banner>}
+      {servers.length === 0 && !cred && result.reason !== 'not_checked' && <Banner kind={result.success ? 'ok' : 'err'}>{result.message || 'Nothing was tested.'}</Banner>}
+      {servers.length === 0 && !cred && result.reason === 'not_checked' && note(result.message || 'Not checked.')}
       {servers.map((sv) => (
         <div key={sv.name} className={`int-probe ${sv.success ? 'pass' : 'fail'}`}>
           <span className="int-probe-ic"><Icon name={sv.success ? 'check2' : 'close'} size={15} /></span>
@@ -331,12 +354,13 @@ function VerifyStep({ probe, onRun }: { probe: Probe; onRun: () => void }) {
           </span>
         </div>
       ))}
-      {result.credentials && (
-        <div className={`int-probe ${result.credentials.success ? 'pass' : 'fail'}`}>
-          <span className="int-probe-ic"><Icon name={result.credentials.success ? 'check2' : 'close'} size={15} /></span>
+      {cred && (
+        <div className={`int-probe ${credState}`}>
+          <span className="int-probe-ic"><Icon name={cred.success === true ? 'check2' : cred.success === false ? 'close' : 'info'} size={15} /></span>
           <span className="int-probe-name">Saved URL and credentials</span>
-          <span className="int-probe-detail" style={result.credentials.success ? { color: 'var(--tx2)' } : undefined}>
-            {result.credentials.success ? 'Accepted' : result.credentials.message}
+          <span className="int-probe-detail" style={cred.success === false ? undefined : { color: 'var(--tx2)' }}>
+            {/* A pass says what was read (Security Lake's regions, a workspace), so show it too. */}
+            {cred.message || (cred.success === true ? 'Accepted' : cred.success === false ? 'Failed' : 'Not checked')}
           </span>
         </div>
       )}

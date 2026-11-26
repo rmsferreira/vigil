@@ -20,6 +20,7 @@ from core.federation import store as fed_store
 from core.federation.contract import FederationAdapter
 from core.federation.lag import source_collection_lag
 from core.federation.runner import request_poll_now
+from core.integrations import health as source_health
 from core.routing import Auth, RouterMeta
 from core.storage.models import User
 from services.api.middleware.auth import get_current_active_user
@@ -124,7 +125,10 @@ async def list_sources() -> Dict[str, Any]:
 
     Includes adapters that don't yet have a row (so the UI can show "configure
     me" entries without the daemon being up). Adapters whose integration is
-    not configured are still listed but flagged ``is_configured=false``. Each
+    not configured are still listed but flagged ``is_configured=false``. The
+    health fields (``last_poll_at`` .. ``dropped_total``, plus ``filtered_total``)
+    are read from each
+    source's Integration Health record. Each
     row carries ``lag_seconds`` (null until a poll has succeeded) and ``quiet``
     from :func:`core.federation.lag.source_collection_lag`. Any failed store
     read answers 503 rather than a list that looks like a fresh install.
@@ -133,6 +137,7 @@ async def list_sources() -> Dict[str, Any]:
         rows = fed_store.read_sources()
         lag_rows = source_collection_lag()
         global_settings = fed_store.read_global_settings()
+        records = source_health.read_all()
     except Exception as exc:
         raise _read_failed(exc) from exc
     rows_by_id = {row["source_id"]: row for row in rows}
@@ -152,12 +157,10 @@ async def list_sources() -> Dict[str, Any]:
                 "max_items": 100,
                 "min_severity": None,
                 "cursor": {},
-                "last_poll_at": None,
-                "last_success_at": None,
-                "last_error": None,
-                "last_error_kind": None,
-                "consecutive_errors": 0,
-                "dropped_total": 0,
+                # Health is kept per source whether or not it is seeded.
+                **fed_store.health_fields(
+                    records.get(source_health.health_id(adapter.name))
+                ),
             }
         # Rows the lag read doesn't cover (unseeded) have never collected.
         lag = lag_by_id.get(adapter.name, {})
@@ -171,7 +174,9 @@ async def list_sources() -> Dict[str, Any]:
 
 @router.patch("/sources/{source_id}", dependencies=_INTEGRATIONS_WRITE)
 async def patch_source(
-    source_id: str, payload: FederationSourcePatch
+    source_id: str,
+    payload: FederationSourcePatch,
+    current_user: User = Depends(get_current_active_user),
 ) -> Dict[str, Any]:
     adapter = fed_registry.get_adapter(source_id)
     if adapter is None:
@@ -184,8 +189,12 @@ async def patch_source(
         fields["interval_seconds"] = payload.interval_seconds
     if payload.max_items is not None:
         fields["max_items"] = payload.max_items
-    if payload.min_severity is not None:
-        sev = payload.min_severity.lower() if payload.min_severity else None
+    # Optional[str] = None cannot tell a missing field from an explicit null.
+    # model_fields_set can: a sent null or "" clears the floor, an omitted
+    # field leaves it unchanged.
+    if "min_severity" in payload.model_fields_set:
+        raw = payload.min_severity
+        sev = raw.lower() if raw else None
         if sev and sev not in _VALID_SEVERITIES:
             raise HTTPException(
                 status_code=400,
@@ -198,12 +207,16 @@ async def patch_source(
 
     # Auto-create the row on first PATCH so the UI doesn't need a separate
     # "register" endpoint — same shape we'd seed on daemon boot.
+    # The trail names who changed the source, in the write's own transaction.
+    actor = str(current_user.user_id)
     if fed_store.get_source(source_id) is None:
         row = fed_store.upsert_source(
-            source_id, {"interval_seconds": adapter.default_interval(), **fields}
+            source_id,
+            {"interval_seconds": adapter.default_interval(), **fields},
+            actor=actor,
         )
     else:
-        row = fed_store.update_source(source_id, fields)
+        row = fed_store.update_source(source_id, fields, actor=actor)
 
     if row is None:
         raise HTTPException(status_code=500, detail="Failed to persist source")

@@ -9,15 +9,43 @@ import logging
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 
-from sqlalchemy import and_
+from sqlalchemy import and_, select
 from sqlalchemy.orm import Session
 
 from core.cases import case_trail
-from core.storage.models import CaseIOC
+from core.cases.case_records_service import readable_case
+from core.cases.linked_entities import LINKED_SOURCE
+from core.exceptions import NotFoundError
+from core.storage.case_indicators import context_indicators, intake_use
+from core.storage.models import (
+    CaseIOC,
+    Finding,
+    SharedIOC,
+    case_findings,
+)
+from core.storage.schemas import CaseIOCSchema
+from core.storage.shared_ioc_repository import (
+    fold_key,
+    make_key,
+    mark_key,
+    marked_keys,
+    reconcile_case_safely,
+    split_key,
+)
 from core.storage.unit_of_work import unit_of_work
 from core.time import utcnow
 
 logger = logging.getLogger(__name__)
+
+
+def is_marked(session: Session, case_id: str, ioc_type: str, value: str) -> bool:
+    """Whether the Case holds a false-positive mark on this value, under any spelling or IP role."""
+    key = mark_key(ioc_type, value)
+    return key is not None and key in marked_keys(session, [case_id]).get(case_id, ())
+
+
+# The entity list names these, not the IOC list.
+_ENTITY_TYPES = ("user", "process")
 
 
 class CaseIOCService:
@@ -69,6 +97,7 @@ class CaseIOCService:
         joined = session is not None
         try:
             with unit_of_work(session) as session:
+                readable_case(session, case_id)
                 ioc, created = self._add(
                     session,
                     case_id,
@@ -83,6 +112,7 @@ class CaseIOCService:
                     context=context,
                 )
                 if created:
+                    reconcile_case_safely(session, case_id, [ioc_type])
                     # The type is hashed; the value sits beside it, erasable.
                     case_trail.append_or_legacy(
                         session,
@@ -94,10 +124,75 @@ class CaseIOCService:
                     )
                 return ioc
         except Exception as exc:
-            if case_trail.propagates(exc, joined):
+            if isinstance(exc, NotFoundError) or case_trail.propagates(exc, joined):
                 raise
             logger.error("Error adding IOC: %s", exc)
             return None
+
+    def set_false_positive(
+        self,
+        case_id: str,
+        ioc_type: str,
+        value: str,
+        marked: bool,
+        session: Optional[Session] = None,
+        added_by: Optional[str] = None,
+    ) -> Tuple[List[CaseIOC], bool]:
+        """Mark or clear a value as a false positive on this Case.
+
+        The mark is by folded value (``mark_key``), so it covers every row the
+        Case holds for it, whatever the spelling or IP role (``src_ip``,
+        ``dst_ip`` and ``ip`` are one value). Marking a value no row holds
+        (one a linked alert names) writes the row, flagged. The trail entry is
+        written only when something changed. Returns the rows and whether they
+        changed. A value that cannot be keyed is a ``ValueError``.
+        """
+        key = mark_key(ioc_type, value)
+        if key is None:
+            raise ValueError("ioc_type and value must be set and not oversized")
+        with unit_of_work(session) as session:
+            readable_case(session, case_id)
+            rows = [
+                r
+                for r in session.query(CaseIOC).filter(CaseIOC.case_id == case_id)
+                if mark_key(r.ioc_type, r.value) == key
+            ]
+            stale = [r for r in rows if bool(r.is_false_positive) != marked]
+            for r in stale:
+                r.is_false_positive = marked
+            if marked and not rows:
+                now = utcnow()
+                row = CaseIOC(
+                    case_id=case_id,
+                    ioc_type=ioc_type,
+                    value=value,
+                    source=LINKED_SOURCE,
+                    first_seen=now,
+                    last_seen=now,
+                    tags=[],
+                    is_active=True,
+                    is_false_positive=True,
+                )
+                session.add(row)
+                rows, stale = [row], [row]
+            if stale:
+                reconcile_case_safely(session, case_id, [ioc_type])
+                case_trail.append_or_legacy(
+                    session,
+                    action=(
+                        case_trail.IOC_FALSE_POSITIVE
+                        if marked
+                        else case_trail.IOC_FALSE_POSITIVE_CLEAR
+                    ),
+                    signed_in=added_by,
+                    case_id=case_id,
+                    operator_text=value,
+                    ids=lambda: {
+                        "ioc_ids": [r.ioc_id for r in stale],
+                        "ioc_type": ioc_type,
+                    },
+                )
+            return rows, bool(stale)
 
     def add_iocs(
         self,
@@ -108,6 +203,7 @@ class CaseIOCService:
     ) -> List[CaseIOC]:
         """Add a batch in the caller's transaction: one ``case.ioc.bulk``
         entry with the count of new IOCs, not one per IOC. Raises on failure."""
+        readable_case(session, case_id)
         added: List[CaseIOC] = []
         created: List[CaseIOC] = []
         for ioc_data in iocs:
@@ -128,6 +224,7 @@ class CaseIOCService:
             if new:
                 created.append(ioc)
         if created:
+            reconcile_case_safely(session, case_id, [i.ioc_type for i in created])
             case_trail.append_or_legacy(
                 session,
                 action=case_trail.IOC_BULK,
@@ -166,7 +263,7 @@ class CaseIOCService:
             with unit_of_work(session) as session:
                 return len(self.add_iocs(case_id, iocs, session, added_by))
         except Exception as exc:
-            if case_trail.propagates(exc, joined):
+            if isinstance(exc, NotFoundError) or case_trail.propagates(exc, joined):
                 raise
             logger.error("Error adding IOCs: %s", exc)
             return None
@@ -218,7 +315,8 @@ class CaseIOCService:
             tags=tags or [],
             context=context,
             is_active=True,
-            is_false_positive=False,
+            # A value a person marked stays marked when it is recorded again.
+            is_false_positive=is_marked(session, case_id, ioc_type, value),
         )
 
         session.add(ioc)
@@ -246,6 +344,7 @@ class CaseIOCService:
             List of CaseIOC objects
         """
         with unit_of_work(session) as session:
+            readable_case(session, case_id)
             query = session.query(CaseIOC).filter(CaseIOC.case_id == case_id)
 
             if ioc_type:
@@ -255,6 +354,79 @@ class CaseIOCService:
                 query = query.filter(CaseIOC.is_active.is_(True))
 
             return query.order_by(CaseIOC.threat_level.desc()).all()
+
+    def list_iocs(
+        self,
+        case_id: str,
+        ioc_type: Optional[str] = None,
+        session: Optional[Session] = None,
+    ) -> List[dict]:
+        """The Case's indicators as the API and MCP list them: recorded, then derived.
+
+        Derived rows are what its findings name, from the one extractor, and carry
+        no ``ioc_id``. Each row says what intake does with it (``intake``) and,
+        when intake can use it, whether the index holds it yet (``linked``);
+        a marked one is never "not linked". Computed on read; nothing is stored.
+        """
+        with unit_of_work(session) as session:
+            readable_case(session, case_id)  # 404 unless the caller may read it
+            recorded = self.get_case_iocs(case_id, session=session)
+            rows = [(CaseIOCSchema.dump(i), i.ioc_type, i.value) for i in recorded]
+
+            seen = {make_key(t, v) or f"{t}:{v}" for _, t, v in rows}
+            findings = session.execute(
+                select(Finding.entity_context, Finding.data_source, Finding.title)
+                .join(case_findings, case_findings.c.finding_id == Finding.finding_id)
+                .where(case_findings.c.case_id == case_id)
+                .order_by(Finding.finding_id)
+            ).all()
+            for context, _, _ in findings:
+                for t, v in context_indicators(context):
+                    v = v.strip()
+                    key = make_key(t, v) or f"{t}:{v}"
+                    if t in _ENTITY_TYPES or not v or key in seen:
+                        continue
+                    seen.add(key)
+                    row = {
+                        "case_id": case_id,
+                        "ioc_type": t,
+                        "value": v,
+                        "source": LINKED_SOURCE,
+                    }
+                    rows.append((CaseIOCSchema.dump(row), t, v))
+
+            # matching_cases reads a hostname only against a finding with both.
+            has_title = any(src and (title or "").strip() for _, src, title in findings)
+            indexed = self._indexed_keys(session, case_id)
+            marked = marked_keys(session, [case_id]).get(case_id, set())
+
+            out = []
+            for row, t, v in rows:
+                if ioc_type and (t or "").lower() != ioc_type.lower():
+                    continue
+                key = make_key(t, v)
+                pair = split_key(key) if key else None
+                use = intake_use(pair[0]) if pair else None
+                if use == "same_title" and not has_title:
+                    use = None
+                fk = fold_key(key)
+                is_marked = fk in marked
+                if is_marked:
+                    row["is_false_positive"] = True
+                row["intake"] = use or "none"
+                row["linked"] = (key in indexed) if use and not is_marked else None
+                out.append(row)
+            return out
+
+    @staticmethod
+    def _indexed_keys(session: Session, case_id: str) -> set:
+        """The keys intake reads for a Case: its rows in the shared index."""
+        rows = session.execute(
+            select(SharedIOC.ioc_type, SharedIOC.value).where(
+                SharedIOC.case_id == case_id
+            )
+        )
+        return {f"{t}:{v}" for t, v in rows}
 
     def export_iocs_json(self, case_id: str, session: Optional[Session] = None) -> str:
         """

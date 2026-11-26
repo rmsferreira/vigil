@@ -19,6 +19,7 @@ from core.agents.prompts import _skills_section
 from core.auth import tool_principal
 from core.auth.permissions import deny_unless, permission_gate
 from core.auth.principals import CHAT_PLUGIN_ID, agent_principal_id
+from core.cases.case_access import READ, WITHHELD, case_access
 from core.cases.case_brief import RULES, case_brief
 from core.chat import conversation_service
 from core.deps import provide_agent_http, provide_mcp_registry, provide_workflows
@@ -33,6 +34,7 @@ from core.llm.chat_layers import (
 )
 from core.llm.defaults import DEFAULT_MODEL
 from core.llm.providers.registry import get_registry
+from core.llm.system_prompt import operator_instructions
 from core.llm.target import (
     component_fallback,
     model_for,
@@ -49,6 +51,7 @@ from core.workflows.playbook_resolver import (
     _bound_capabilities,
     _tool_catalogue,
 )
+from core.workflows.workflow_run_service import run_unreadable
 from core.workflows.workflows_service import WorkflowsService
 from services.api.errors import INTERNAL_ERROR_DETAIL
 from services.api.middleware.auth import get_current_user
@@ -307,6 +310,31 @@ def _turn_context(
     return "\n".join(line for line in lines if line)
 
 
+def _case_access(case_id: str) -> str:
+    """case_access, never failing the turn: the brief applies the rule again."""
+    try:
+        return case_access(case_id)
+    except Exception as exc:  # noqa: BLE001 - a brief is never worth the turn
+        logger.warning("case access for %s not read: %s", case_id, exc)
+        return READ
+
+
+def _withheld_line(
+    case_id: str, access: str, session_id: Optional[str], user_id: Optional[str]
+) -> str:
+    """Why the brief is gone, said only in a conversation already on that case, so
+    a case id sent from elsewhere learns nothing. What it holds stays the owner's."""
+    if access != WITHHELD or not session_id:
+        return ""
+    if conversation_service.attached_case(session_id, user_id) != case_id:
+        return ""
+    return (
+        f"Case {case_id} is now restricted and the analyst is not one of its "
+        "readers, so nothing from the case is included any more. Tell them so "
+        "if they ask about it; a person on its reader list can add them back."
+    )
+
+
 def _context_window(provider_id: Optional[str], provider_type: str, model: str) -> int:
     """The resolved model's window in tokens; 0 when unknown or the lookup fails."""
     try:
@@ -412,9 +440,17 @@ async def chat_stream(
     if not turns:
         raise HTTPException(status_code=400, detail="No messages provided")
     question = turns[-1]["content"]
+    # A case the person can't read is neither briefed nor attached (#4358).
+    access = await asyncio.to_thread(_case_access, case_id) if case_id else READ
     if turns[-1]["role"] == "user":
         # Rebuilt every turn, so a live run's new evidence is in the next answer.
-        case_data = await case_brief(case_id, workflows) if case_id else ""
+        case_data = (
+            await case_brief(case_id, workflows)
+            if case_id and access == READ
+            else await asyncio.to_thread(
+                _withheld_line, case_id, access, request.session_id, user_id
+            )
+        )
         context = _turn_context(
             request.page_context,
             case_id,
@@ -450,6 +486,8 @@ async def chat_stream(
             provider=provider_type,
             effort=resolve_effort("chat_default"),
             context_window=context_window,
+            # Per turn, so a saved change reaches the next message.
+            instructions=await asyncio.to_thread(operator_instructions),
         ),
         # So the tools this turn calls record the person driving it, the same
         # name the /mcp door binds. Signed here; the agent layer only carries it.
@@ -465,7 +503,11 @@ async def chat_stream(
         "actor": agent_principal_id(CHAT_PLUGIN_ID),
         "origin": "person",
     }
-    if request.parent_run_id:
+    # agent-serve recalls any run id it is handed, so a run on a case this
+    # person can't read (#4359) is not passed on.
+    if request.parent_run_id and not await asyncio.to_thread(
+        run_unreadable, request.parent_run_id
+    ):
         payload["parent_run_id"] = request.parent_run_id
     # So a skill this conversation reads is credited to its agent (#1560).
     # A chat with no agent behind it sends nothing, and the read is recorded
@@ -482,6 +524,8 @@ async def chat_stream(
             user_id,
             question,
             agent_http,
+            # Left as stored when the case can't be read.
+            request.case_id if access == READ else None,
         ),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
@@ -516,6 +560,7 @@ async def _relay(
     user_id: Optional[str],
     question: Optional[str],
     client: httpx.AsyncClient,
+    case_id: Optional[str] = None,
 ):
     said: List[str] = []
     finished = False
@@ -564,7 +609,7 @@ async def _relay(
                 assistant_thinking=None,
                 tool_calls=[],
                 complete=finished and failure is None,
-                case_id=request.case_id,
+                case_id=case_id,
                 page_context=request.page_context,
             )
         except Exception as exc:  # noqa: BLE001 — history never breaks the chat

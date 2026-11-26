@@ -6,12 +6,12 @@ under ``services/api/routers/`` because every module there must export a
 ``router``.
 """
 
-from datetime import datetime
 from typing import Any, List, Literal, Optional
 
 from pydantic import BaseModel
 
-from core.storage.schemas.case import CaseSchema
+from core.storage.schemas.base import OptDateTime
+from core.storage.schemas.case import CaseSchema, CaseTeam
 from core.storage.schemas.case_entities import (
     CaseClosureInfoSchema,
     CaseCommentSchema,
@@ -22,6 +22,10 @@ from core.storage.schemas.case_entities import (
     CaseTaskSchema,
     CaseWatcherSchema,
 )
+
+# Whether a case's or task's stored owner is a current person (core/cases/assignee.py);
+# null when unassigned. Required, so a read that forgets to fill it fails loudly.
+OwnerStateField = Optional[Literal["current", "not_current"]]
 
 
 class CaseSuccessResponse(BaseModel):
@@ -64,13 +68,25 @@ class CaseQueueItem(BaseModel):
     max_cost_usd: Optional[float] = None
     budget_health: Optional[str] = None
     comment_count: int = 0
-    last_activity: Optional[datetime] = None
+    last_activity: OptDateTime = None
     age_seconds: float
     sla_seconds_left: Optional[float] = None
     health_status: Optional[str] = None
     needs_you: bool = False
     description: Optional[str] = None
     sla_paused: bool = False
+    owner_state: OwnerStateField
+    # True when the owner is on the case's team, false when they are not,
+    # null when the case has no owner.
+    owner_on_team: Optional[bool] = None
+    # Restricted and owned: true when the owner can't read the case ("owner
+    # can't see this case"), worked out at read. Null otherwise.
+    owner_cannot_read: Optional[bool] = None
+    team: Optional[CaseTeam] = None
+    # Restricted cases (#4354): shown only to readers, with the reader list.
+    restricted: bool = False
+    readers: list[str] = []
+    reader_teams: list[str] = []
 
 
 class CaseQueueStrip(BaseModel):
@@ -81,6 +97,9 @@ class CaseQueueStrip(BaseModel):
     closed_today: int
     agent_closure_share: float
     needs_you: int
+    # Unowned cases with no assigned or executing run, plus cases whose live
+    # run is waiting on a person. Open cases only.
+    waiting: int
 
 
 class CaseListResponse(BaseModel):
@@ -89,7 +108,25 @@ class CaseListResponse(BaseModel):
     limit: int
     offset: int
     has_more: bool
+    # Restricted cases the caller may not read, never filtered (#4356).
+    restricted_not_counted: int = 0
     strip: CaseQueueStrip
+    # Restricted cases the caller may not read, left out. Never filtered, so it
+    # says nothing about what those cases hold.
+    restricted_not_counted: int = 0
+
+
+class CaseOwner(BaseModel):
+    """One stored owner on a readable case: the value as stored, and its state."""
+
+    owner: str
+    owner_state: Literal["current", "not_current"]
+
+
+class CaseOwnersResponse(BaseModel):
+    """Distinct non-blank owners on cases the reader can list, closed included."""
+
+    owners: list[CaseOwner]
 
 
 class CaseInvestigationRef(BaseModel):
@@ -110,12 +147,18 @@ class CaseInvestigationRef(BaseModel):
     created_at: Optional[str] = None
     # The case's run: the one the page reads, not a follow-up a handoff started.
     primary: bool = False
+    # What the run's report stands on, from its terminal; absent where unsaid (#4962).
+    outcome: Optional[str] = None
+    capped: Optional[bool] = None
+    citation_count: Optional[int] = None
+    grounded: Optional[bool] = None
 
 
 class CaseClosureView(BaseModel):
     """What the closed summary shows. ``verdict`` is the stated reason."""
 
     closure_category: str
+    false_positive_cause: Optional[str] = None
     closed_by: str
     closed_by_kind: str
     closed_at: Optional[str] = None
@@ -134,15 +177,34 @@ class CaseLinkedFinding(BaseModel):
     entity_keys: list[str] = []
 
 
+class RecheckMarkView(BaseModel):
+    """The one mark on a Case opened from a re-check."""
+
+    source: str
+    closed_at: str
+    run_id: str
+
+
 class CaseDetailResponse(CaseSchema):
     """``GET /cases/{id}`` — the case, its combined state, and the runs on it."""
 
     combined_state: str
     investigations: list[CaseInvestigationRef] = []
+    # What picked the primary run (``case_state.PRIMARY_BASIS``); null with no run.
+    primary_basis: Optional[str] = None
     closure: Optional[CaseClosureView] = None
     linked_findings: list[CaseLinkedFinding] = []
+    # The finding the case was opened from: the first one linked to it.
+    opened_from: Optional[str] = None
+    # Opened from a re-check (#5095). Names the source, the close, and the run.
+    recheck: Optional[RecheckMarkView] = None
+    # A later review disagreed with the first. Names nobody.
+    reviewers_differ: bool = False
     # Merged after the case's newest run started, so that run did not read them.
     alerts_since_last_run: int = 0
+    owner_state: OwnerStateField
+    owner_on_team: Optional[bool] = None
+    owner_cannot_read: Optional[bool] = None
 
 
 class CaseRuleCard(BaseModel):
@@ -198,6 +260,8 @@ class CaseRecordResponse(BaseModel):
 
     run_id: Optional[str] = None
     investigation_id: Optional[str] = None
+    # What picked ``run_id`` (``case_state.PRIMARY_BASIS``); absent with no run.
+    primary_basis: Optional[str] = None
     rows: list[CaseRecordRow] = []
 
 
@@ -205,6 +269,8 @@ class CasePurgeResponse(BaseModel):
     success: bool
     deleted: int
     killed_investigations: int = 0
+    # Restricted cases the caller may not read, left in place (#4354).
+    restricted_kept: int = 0
     message: str
 
 
@@ -212,6 +278,8 @@ class CaseSummaryResponse(BaseModel):
     total: int
     by_status: dict[str, int]
     by_priority: dict[str, int]
+    # Restricted cases the caller may not read, left out of every count above.
+    restricted_not_counted: int = 0
 
 
 class CaseCommentsResponse(BaseModel):
@@ -239,8 +307,12 @@ class CaseIOCExportResponse(BaseModel):
     content: Any
 
 
+class CaseTaskRead(CaseTaskSchema):
+    owner_state: OwnerStateField
+
+
 class CaseTasksResponse(BaseModel):
-    tasks: list[CaseTaskSchema]
+    tasks: list[CaseTaskRead]
 
 
 class CaseRelatedSchema(CaseRelationshipSchema):
@@ -252,6 +324,8 @@ class CaseRelatedSchema(CaseRelationshipSchema):
 
 class CaseRelationshipsResponse(BaseModel):
     relationships: list[CaseRelatedSchema]
+    # Links to restricted cases the caller may not read, left out: a count only.
+    hidden: int = 0
 
 
 class CaseCloseResponse(BaseModel):
@@ -271,9 +345,15 @@ class CaseMergeResponse(BaseModel):
     message: str
 
 
+class CaseSearchResult(CaseSchema):
+    owner_state: OwnerStateField
+
+
 class CaseSearchResponse(BaseModel):
-    results: list[CaseSchema]
+    results: list[CaseSearchResult]
     total: int
     limit: int
     offset: int
     has_more: bool
+    # Restricted cases the caller may not read, never filtered (#4356).
+    restricted_not_counted: int = 0

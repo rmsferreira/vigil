@@ -76,6 +76,8 @@ LEGACY_COPY_REVISION = "0018_legacy_audit_copy"
 # A baseline view over config_audit_log that nothing reads; it goes with it.
 LEGACY_VIEW = "recent_config_changes"
 ACTION_LEGACY_DROP = "audit.legacy_dropped"
+# Drops the shared IOC index's legacy rows; refused while any Case is unsynced.
+CASE_ONLY_REVISION = "0100_shared_ioc_case_only"
 
 
 class UpgradeBusy(RuntimeError):
@@ -182,6 +184,49 @@ def _previous_version(upgrade_dir: Optional[Path]) -> Optional[str]:
     return None
 
 
+def _joins(script: ScriptDirectory, current) -> bool:
+    """True when every current revision is behind this image's one head."""
+    if len(current) < 2:
+        return False
+    heads = script.get_heads()
+    if len(heads) != 1:
+        return False
+    ancestors = {rev.revision for rev in script.iterate_revisions(heads[0], "base")}
+    try:
+        known = {script.get_revision(rev).revision for rev in current}
+    except CommandError:
+        return False
+    return known < ancestors
+
+
+def unsynced_cases_refusal(conn) -> Optional[str]:
+    """Why CASE_ONLY_REVISION can't run yet: Cases the shared IOC index hasn't
+    reconciled, whose legacy rows it would drop. None when there are none."""
+    if conn.execute(text("SELECT to_regclass('public.cases')")).scalar() is None:
+        return None  # a fresh install
+    has_column = conn.execute(
+        text(
+            "SELECT 1 FROM information_schema.columns WHERE table_schema = "
+            "'public' AND table_name = 'cases' AND column_name = 'indicators_synced_at'"
+        )
+    ).scalar()
+    if has_column:
+        n = conn.execute(
+            text("SELECT count(*) FROM public.cases WHERE indicators_synced_at IS NULL")
+        ).scalar_one()
+        found = f"{n} Case(s) are not yet linked for intake"
+    else:
+        n = conn.execute(text("SELECT count(*) FROM public.cases")).scalar_one()
+        found = f"the database predates 1.1.3 and holds {n} Case(s)"
+    if not n:
+        return None
+    return (
+        f"{found}; this release drops the legacy rows they still match on. Install "
+        "1.1.3 (or any later release before this one), let its catch-up finish (the "
+        "bell's 'Bringing existing Cases in' line goes away), then upgrade again"
+    )
+
+
 def plan(
     conn,
     script: ScriptDirectory,
@@ -195,7 +240,11 @@ def plan(
     current = MigrationContext.configure(
         conn, opts={"version_table_schema": "public"}
     ).get_current_heads()
-    if len(current) > 1:
+    # A database left on two heads can move forward when this image joins them
+    # into one. Anything else with more than one revision is not a database
+    # this image can serve.
+    joined = _joins(script, current)
+    if len(current) > 1 and not joined:
         return Plan(REFUSE, f"database has more than one revision: {list(current)}")
     revision = current[0] if current else None
     if revision is not None:
@@ -242,10 +291,30 @@ def plan(
                 return found
             adoption = found
 
-    pending = [
-        s.revision
-        for s in reversed(list(script.iterate_revisions("heads", revision or "base")))
-    ]
+    if joined:
+        applied: set[str] = set()
+        for rev in current:
+            applied.update(
+                item.revision for item in script.iterate_revisions(rev, "base")
+            )
+        head = script.get_heads()[0]
+        pending = [
+            item.revision
+            for item in reversed(list(script.iterate_revisions(head, "base")))
+            if item.revision not in applied
+        ]
+    else:
+        pending = [
+            s.revision
+            for s in reversed(
+                list(script.iterate_revisions("heads", revision or "base"))
+            )
+        ]
+    # Before the restore point and the acknowledgement: neither gets past it.
+    if CASE_ONLY_REVISION in pending:
+        refusal = unsynced_cases_refusal(conn)
+        if refusal:
+            return Plan(REFUSE, refusal, revision=revision, pending=pending)
     previous = _previous_version(upgrade_dir)
     restart = Plan(
         RESTART,
@@ -683,10 +752,14 @@ def run(
 
 
 def _default_url() -> str:
-    from core.storage.connection import DatabaseConfig
+    from core.storage.connection import DatabaseConfig, MissingPostgresPasswordError
 
     # POSTGRES_* only: the upgrade logs in as the owner, not the app's DSN.
-    return DatabaseConfig(connection_string="").get_database_url()
+    try:
+        return DatabaseConfig(connection_string="").get_database_url()
+    except MissingPostgresPasswordError as e:
+        # One line, not a traceback: the message says what to run.
+        raise SystemExit(f"ERROR: {e}") from None
 
 
 def main(argv: Optional[list[str]] = None) -> int:

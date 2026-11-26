@@ -1,15 +1,30 @@
-import type { Ceiling, WorkflowAgreement } from '../services/api'
+import type { AgreementTally, Ceiling, ModelAgreement, WorkflowAgreement } from '../services/api'
 
 /** One workflow's stored entry in the ceiling (core/response/ceiling.py workflow_entry). */
 export interface WorkflowTier {
   tier: 'act' | 'assist'
   floor: number | null
-  evidence: { agreed: number; disagreed: number; agreement_rate: number | null; window_end: string } | null
+  evidence: {
+    agreed: number
+    disagreed: number
+    agreement_rate: number | null
+    window_end: string
+    false_close_rate: number | null
+    answered: number
+    wilson_low: number | null
+    wilson_high: number | null
+  } | null
   /** a principal id, or "system" when Vigil lowered it */
   by: string
   /** that principal's name, read at request time; null when blank or erased */
   by_label: string | null
   at: string
+  /** the model the tier was earned (or lost) on; absent when it was not resolved */
+  model?: string
+  /** set when Vigil lowered it on a model change: the model it was on before */
+  from_model?: string
+  /** the model-change judgement's reason, naming both models */
+  reason?: string
 }
 
 export function workflowTier(ceiling: Ceiling | null | undefined, id: string | null | undefined): WorkflowTier | undefined {
@@ -35,4 +50,40 @@ export function agreementText(row: Pick<WorkflowAgreement, 'agreed' | 'disagreed
   if (!row || !scored || row.agreement_rate == null) return null
   const pct = Math.round(row.agreement_rate * 100)
   return { text: `${scored} ${scored === 1 ? 'review' : 'reviews'} · ${pct}% agree`, pct }
+}
+
+const asPct = (rate: number) => Math.round(rate * 100)
+
+/** "30 days · 4% false close · 25 answered · 1–9%". Null when the rate is absent. */
+export function falseCloseText(
+  row: Pick<AgreementTally, 'false_close_rate' | 'answered' | 'wilson_low' | 'wilson_high'> | null | undefined,
+): string | null {
+  if (!row || row.false_close_rate == null) return null
+  const range =
+    row.wilson_low != null && row.wilson_high != null
+      ? ` · ${asPct(row.wilson_low)}–${asPct(row.wilson_high)}%`
+      : ''
+  return `30 days · ${asPct(row.false_close_rate)}% false close · ${row.answered} answered${range}`
+}
+
+/** Agreements given without opening the evidence, over those plus the ones that did. Null when neither was counted. */
+export function uncheckedText(row: Pick<WorkflowAgreement, 'agreed' | 'agreed_unchecked'> | null | undefined): string | null {
+  const agreed = row?.agreed ?? 0
+  const unchecked = row?.agreed_unchecked ?? 0
+  const total = agreed + unchecked
+  if (!row || total === 0) return null
+  return `${asPct(unchecked / total)}% agreed without the evidence`
+}
+
+/** A workflow's per-model tallies, the model its tier is on first, then by most scored closes. */
+export function modelsInOrder(row: WorkflowAgreement | undefined, inForce: string | undefined): ModelAgreement[] {
+  const scored = (m: ModelAgreement) => m.agreed + m.disagreed
+  return [...(row?.by_model ?? [])].sort(
+    (a, b) => Number(b.model === inForce) - Number(a.model === inForce) || scored(b) - scored(a),
+  )
+}
+
+/** Why a model change dropped a workflow: the bracketed tail of the judgement's reason, else the whole reason. */
+export function dropWhy(reason: string | null | undefined): string | undefined {
+  return reason?.match(/\(([^()]*)\)$/)?.[1] ?? reason ?? undefined
 }

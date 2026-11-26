@@ -3,9 +3,13 @@ import { IntakeBanners } from '../../shared/AutoOpsOffBanner'
 import { useAutoOpsOff } from '../../shared/useAutoOpsOff'
 import { Link, useLocation, useSearchParams } from 'react-router-dom'
 import type { ConsoleScreenProps } from '../../shared/types'
-import { approvalsApi, configApi, ingestionApi, triageApi, type NeedsYouItem } from '../../services/api'
+import { approvalsApi, configApi, day1Api, ingestionApi, productionReportApi, productionStartApi, triageApi, type NeedsYouItem } from '../../services/api'
 import type { Schema } from '../../services/apiTypes'
+import { CallArgs } from '../../shared/CallArgs'
+import { visibleText } from '../../shared/visibleText'
 import { HoldButton } from '../../shared/HoldButton'
+import { ContainmentTargets } from '../../shared/containment'
+import { canApprove, chosenCandidate, containmentOf } from '../../shared/containmentRead'
 import { Icon } from '../../shared/icons'
 import { InfoTip } from '../../shared/InfoTip'
 import { LIVE_COMMANDS } from '../../shell/commandBarModel'
@@ -21,12 +25,31 @@ import {
 } from './setupHidden'
 import { errorText } from '../../shared/errorText'
 import { useAuth } from '../../contexts/AuthContext'
+import { stepUpDetailOf } from '../../services/stepUp'
+import { reportStamp } from '../report/stamp'
 import { CloseCaseDialog } from '../cases/ClosureFields'
 import { closesOnCase } from '../../shared/closesOnCase'
 import './home.css'
+import { caseLabel } from '../../shared/caseLabel'
 
 const POLL_MS = 20_000
 const VISIBLE = 4
+
+function sameInstant(left: string | null | undefined, right: string | null | undefined): boolean {
+  if (!left || !right) return false
+  const a = Date.parse(left)
+  const b = Date.parse(right)
+  if (Number.isNaN(a) || Number.isNaN(b)) return left === right
+  return a === b
+}
+
+/** datetime-local is the viewer's zone; the server takes UTC. Seconds stay, so the minute setup finished in can still be declared. */
+function dateTimeLocal(iso: string | null): string {
+  const d = iso ? new Date(iso) : new Date()
+  if (Number.isNaN(d.getTime())) return ''
+  const pad = (n: number) => String(n).padStart(2, '0')
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`
+}
 
 const STEP_ACTION: Record<string, string> = {
   connect_tools: 'Set up',
@@ -51,6 +74,12 @@ function answersOnCase(item: NeedsYouItem): boolean {
 }
 
 type Pickup = { share: number; launched: number; today: number }
+
+const READINESS_TIP = {
+  source: 'Background service, model routability and integration health',
+  calculation: 'Computed when Home reads it',
+  limit: 'None',
+}
 
 const SETUP_TIP = {
   source: 'Setup steps',
@@ -118,7 +147,7 @@ function DecisionCard({
 }: {
   item: NeedsYouItem
   busy: boolean
-  onApprove: (item: NeedsYouItem, fused: boolean) => void
+  onApprove: (item: NeedsYouItem, fused: boolean, candidate?: string) => void
   onReject: (item: NeedsYouItem, reason: string) => void
   onOpenCase: (id: string) => void
   /** Set when Close case answers this card. */
@@ -126,16 +155,26 @@ function DecisionCard({
 }) {
   const [rejecting, setRejecting] = useState(false)
   const [reason, setReason] = useState('')
+  const [picked, setPicked] = useState<string | null>(null)
   const caseId = item.case_id
   const asking = item.case_ids?.length ?? 0
-  const meta = [caseId && `Case ${caseId}`, asking > 1 && `requested by ${asking} cases`, item.reason]
-    .filter(Boolean)
-    .join(' · ')
+  // On a restricted case you can't read: only its readers see it or decide it.
+  const restricted = Boolean(item.restricted)
+  const meta = restricted
+    ? 'Only the readers of its case can see or decide it'
+    : [caseId && caseLabel(caseId), asking > 1 && `requested by ${asking} cases`, item.waiting || item.reason]
+        .filter(Boolean)
+        .join(' · ')
   const ask = cardAsk(item)
   const advice = item.kind === 'recommendation'
   // Nothing executes a recommendation: no Approve, and Reject only clears one with no case to close.
-  const approvable = !answersOnCase(item) && !advice
-  const rejectable = approvable || (advice && !caseId)
+  // An isolation or disable acts on a resolved vendor record: none, and there is nothing to approve.
+  const containment = restricted ? null : containmentOf(item.containment)
+  const decidable = !restricted && !answersOnCase(item) && !advice
+  const approvable = decidable && !(containment && containment.candidates.length === 0)
+  const ready = !busy && canApprove(containment, picked)
+  const candidate = chosenCandidate(containment, picked)
+  const rejectable = !restricted && (decidable || (advice && !caseId))
   const linkClass = answersOnCase(item) || advice ? 'home-btn primary' : 'home-btn ghost'
 
   return (
@@ -144,7 +183,9 @@ function DecisionCard({
         <span className="home-waited">{waited(item.created_at)}</span>
         <span className="home-kind">{KIND_LABEL[item.kind]}</span>
       </div>
-      <h3 title={ask.full}>{ask.text}</h3>
+      <h3 title={visibleText(ask.full)}>{visibleText(ask.text)}</h3>
+      <CallArgs tool={item.tool} args={item.args} />
+      {containment && <ContainmentTargets containment={containment} picked={picked} onPick={setPicked} group={item.source_id} />}
       {meta && (
         <p className="home-card-meta" title={meta}>
           {meta}
@@ -153,11 +194,11 @@ function DecisionCard({
       <div className="home-actions">
         {/* A hunt stopped at a limit is answered with Keep going on its case, not approved here. */}
         {!approvable ? null : item.reversibility === 'reversible' ? (
-          <button type="button" className="home-btn primary" disabled={busy} onClick={() => onApprove(item, true)}>
+          <button type="button" className="home-btn primary" disabled={!ready} onClick={() => onApprove(item, true, candidate)}>
             Approve
           </button>
         ) : (
-          <HoldButton label="Approve" disabled={busy} onConfirm={() => onApprove(item, false)} />
+          <HoldButton label="Approve" disabled={!ready} onConfirm={() => onApprove(item, false, candidate)} />
         )}
         {!rejectable ? null : rejecting ? (
           <form
@@ -233,13 +274,29 @@ export default function HomeScreen({ openCase, startTour, fillCommand, onCommand
   const [showAll, setShowAll] = useState(false)
   const [setup, setSetup] = useState<Schema<'SetupStepsResponse'> | null>(null)
   const [setupError, setSetupError] = useState<string | null>(null)
+  const [readiness, setReadiness] = useState<Schema<'InstallReadiness'> | null>(null)
+  const [readinessError, setReadinessError] = useState<string | null>(null)
   const [hidden, setHidden] = useState<string[]>(() => readSetupHidden())
   const [demoMessage, setDemoMessage] = useState<string | null>(null)
   const [demoBusy, setDemoBusy] = useState(false)
   const busyRef = useRef<string | null>(null)
   const loadTicket = useRef(0)
   const { notify, pending, settled } = useToast()
-  const canClose = useAuth().hasPermission('cases.write')
+  const { hasPermission } = useAuth()
+  const canClose = hasPermission('cases.write')
+  const canRunReport = hasPermission('platform.write')
+  const [reportLine, setReportLine] = useState<Schema<'Day1Status'> | null>(null)
+  const [reportError, setReportError] = useState<string | null>(null)
+  const [rerunning, setRerunning] = useState(false)
+  const [production, setProduction] = useState<Schema<'ProductionStart'> | null>(null)
+  const [productionError, setProductionError] = useState<string | null>(null)
+  const [productionReport, setProductionReport] = useState<Schema<'ProductionReportStatus'> | null>(null)
+  const [productionReportError, setProductionReportError] = useState<string | null>(null)
+  const [runningProduction, setRunningProduction] = useState(false)
+  const [declareOpen, setDeclareOpen] = useState(false)
+  const [declareAt, setDeclareAt] = useState('')
+  const [declaring, setDeclaring] = useState(false)
+  const [declareError, setDeclareError] = useState<string | null>(null)
   const [closing, setClosing] = useState<string | null>(null)
 
   const load = useCallback(async () => {
@@ -255,9 +312,77 @@ export default function HomeScreen({ openCase, startTour, fillCommand, onCommand
       },
       () => null,
     )
-    const [needsResult, pickup] = await Promise.all([needs, shareRead])
+    const readyRead = configApi.getInstallReadiness().then(
+      (res) => ({ ok: true as const, data: res.data }),
+      (err: unknown) => ({ ok: false as const, err }),
+    )
+    const setupRead = configApi.getSetupSteps().then(
+      (res) => ({ ok: true as const, data: res.data }),
+      (err: unknown) => ({ ok: false as const, err }),
+    )
+    const reportRead = day1Api.status().then(
+      (res) => ({ ok: true as const, data: res.data }),
+      (err: unknown) => ({ ok: false as const, err }),
+    )
+    const productionRead = productionStartApi.get().then(
+      (res) => ({ ok: true as const, data: res.data }),
+      (err: unknown) => ({ ok: false as const, err }),
+    )
+    const productionReportRead = productionReportApi.status().then(
+      (res) => ({ ok: true as const, data: res.data }),
+      (err: unknown) => ({ ok: false as const, err }),
+    )
+    const [needsResult, pickup, readyResult, setupResult, reportResult, productionResult, productionReportResult] =
+      await Promise.all([
+        needs,
+        shareRead,
+        readyRead,
+        setupRead,
+        reportRead,
+        productionRead,
+        productionReportRead,
+      ])
     if (ticket !== loadTicket.current) return
     setShare(pickup)
+    if (readyResult.ok) {
+      setReadiness(readyResult.data)
+      setReadinessError(null)
+    } else {
+      setReadinessError(errorText(readyResult.err, 'Could not load install readiness'))
+    }
+    if (setupResult.ok) {
+      setSetup(setupResult.data)
+      setSetupError(null)
+    } else {
+      setSetupError(errorText(setupResult.err, 'Could not load setup steps'))
+    }
+    if (reportResult.ok) {
+      setReportLine(reportResult.data)
+      setReportError(null)
+    } else if ((reportResult.err as { response?: { status?: number } })?.response?.status === 403) {
+      setReportLine(null)
+      setReportError(null)
+    } else {
+      setReportError(errorText(reportResult.err, 'Could not load the Day 1 Report'))
+    }
+    if (productionResult.ok) {
+      setProduction(productionResult.data)
+      setProductionError(null)
+    } else if ((productionResult.err as { response?: { status?: number } })?.response?.status === 403) {
+      setProduction(null)
+      setProductionError(null)
+    } else {
+      setProductionError(errorText(productionResult.err, 'Could not load the production start'))
+    }
+    if (productionReportResult.ok) {
+      setProductionReport(productionReportResult.data)
+      setProductionReportError(null)
+    } else if ((productionReportResult.err as { response?: { status?: number } })?.response?.status === 403) {
+      setProductionReport(null)
+      setProductionReportError(null)
+    } else {
+      setProductionReportError(errorText(productionReportResult.err, 'Could not load the Production Start Report'))
+    }
     if (!needsResult.ok) {
       setError(errorText(needsResult.err, 'Could not load what needs you'))
       return
@@ -282,21 +407,6 @@ export default function HomeScreen({ openCase, startTour, fillCommand, onCommand
       document.removeEventListener('visibilitychange', onVisibility)
     }
   }, [load])
-
-  useEffect(() => {
-    let cancelled = false
-    configApi
-      .getSetupSteps()
-      .then((res) => {
-        if (!cancelled) setSetup(res.data)
-      })
-      .catch((err) => {
-        if (!cancelled) setSetupError(errorText(err, 'Could not load setup steps'))
-      })
-    return () => {
-      cancelled = true
-    }
-  }, [])
 
   // a fused commit just landed or failed (possibly after Home was left and reopened): refresh
   const seenSettled = useRef(settled)
@@ -354,18 +464,22 @@ export default function HomeScreen({ openCase, startTour, fillCommand, onCommand
   // page's decision block. A held (irreversible) approve commits at once.
   const fused = useFusedDecision(decisionFailText)
 
-  const approve = (item: NeedsYouItem, fuse: boolean) => {
-    if (fuse) return fused.approve(item)
-    void run(item.source_id, () => approvalsApi.approve(item.source_id), `Approved: ${item.title}`)
+  const approve = (item: NeedsYouItem, fuse: boolean, candidate?: string) => {
+    if (fuse) return fused.approve(item, candidate)
+    void run(item.source_id, () => approvalsApi.approve(item.source_id, candidate), (res) => {
+      // An isolation or disable runs on approval: say what the vendor answered.
+      const state = (res as { data?: { action?: { execution_result?: { state?: string } } } })?.data?.action?.execution_result?.state
+      return `Approved: ${item.title}${state ? ` · ${state}` : ''}`
+    })
   }
 
-  const run = async (id: string, act: () => Promise<unknown>, doneText: string) => {
+  const run = async (id: string, act: () => Promise<unknown>, doneText: string | ((res: unknown) => string)) => {
     if (busyRef.current) return
     busyRef.current = id
     setBusy(id)
     try {
-      await act()
-      notify('ok', doneText)
+      const res = await act()
+      notify('ok', typeof doneText === 'string' ? doneText : doneText(res))
       await load()
     } catch (err) {
       setError(errorText(err, 'Could not update that decision'))
@@ -408,6 +522,64 @@ export default function HomeScreen({ openCase, startTour, fillCommand, onCommand
   // Later commands stay in the palette. A trailing space is the bar's signal to open that command's preview.
   const shownChips = fillCommand ? LIVE_COMMANDS : []
   const boardClear = shownCount !== null && !error && shown.length === 0 && !noAlerts
+
+  const openDeclare = () => {
+    setDeclareError(null)
+    setDeclareOpen((open) => {
+      if (open) return false
+      setDeclareAt(dateTimeLocal(production?.started_at ?? null))
+      return true
+    })
+  }
+
+  const saveProduction = async (startedAt: string | null) => {
+    setDeclaring(true)
+    setDeclareError(null)
+    try {
+      await productionStartApi.set(startedAt)
+      setDeclareOpen(false)
+      await load()
+    } catch (err) {
+      if (!stepUpDetailOf(err)) setDeclareError(errorText(err, 'Could not save the production start'))
+    } finally {
+      setDeclaring(false)
+    }
+  }
+
+  const declareProduction = () => {
+    const started = new Date(declareAt)
+    if (Number.isNaN(started.getTime())) {
+      setDeclareError('Enter a time.')
+      return
+    }
+    void saveProduction(started.toISOString())
+  }
+
+  const runProduction = async () => {
+    setRunningProduction(true)
+    try {
+      await productionReportApi.run()
+      notify('ok', 'Production Start Report is ready.')
+      await load()
+    } catch (err) {
+      if (!stepUpDetailOf(err)) notify('err', errorText(err, 'Could not run the Production Start Report'))
+    } finally {
+      setRunningProduction(false)
+    }
+  }
+
+  const rerunReport = async () => {
+    setRerunning(true)
+    try {
+      await day1Api.run()
+      notify('ok', 'Day 1 Report is ready.')
+      await load()
+    } catch (err) {
+      if (!stepUpDetailOf(err)) notify('err', errorText(err, 'Could not run the Day 1 Report'))
+    } finally {
+      setRerunning(false)
+    }
+  }
 
   const sectionHead = (title: string, sub: string | null, tip: ReactNode, link: ReactNode) => (
     <div className="home-head">
@@ -464,6 +636,190 @@ export default function HomeScreen({ openCase, startTour, fillCommand, onCommand
           </div>
         )}
         {error && <p role="alert">{error}</p>}
+        {(production !== null || productionError !== null) && (
+          <section aria-label="Production start">
+            {productionError && <p role="alert">{productionError}</p>}
+            {production && (
+              <div className="home-readiness">
+                <p className="home-report-line">
+                  {production.started_at
+                    ? `In production since ${reportStamp(production.started_at)}`
+                    : 'Not in production'}
+                  {canRunReport && (
+                    <button
+                      type="button"
+                      className="btn ghost"
+                      aria-expanded={declareOpen}
+                      onClick={openDeclare}
+                      disabled={declaring}
+                    >
+                      Declare
+                    </button>
+                  )}
+                </p>
+                {declareOpen && canRunReport && (
+                  <form
+                    className="home-production-form"
+                    onSubmit={(event) => {
+                      event.preventDefault()
+                      declareProduction()
+                    }}
+                  >
+                    <input
+                      type="datetime-local"
+                      className="field-input"
+                      aria-label="Production start time"
+                      step={1}
+                      value={declareAt}
+                      disabled={declaring}
+                      onChange={(event) => setDeclareAt(event.target.value)}
+                    />
+                    <button type="submit" className="btn ghost" disabled={declaring || !declareAt}>
+                      {declaring ? 'Saving…' : 'Declare'}
+                    </button>
+                    {production.started_at && (
+                      <button
+                        type="button"
+                        className="btn ghost"
+                        disabled={declaring}
+                        onClick={() => void saveProduction(null)}
+                      >
+                        Clear
+                      </button>
+                    )}
+                  </form>
+                )}
+                {declareError && <p role="alert">{declareError}</p>}
+                {productionReportError && <p role="alert">{productionReportError}</p>}
+                {productionReport?.running_since && (
+                  <p className="home-report-line">
+                    Running since {reportStamp(productionReport.running_since)}.
+                  </p>
+                )}
+                {productionReport?.incomplete_since && (
+                  <p className="home-report-line">
+                    Didn't complete.
+                    {canRunReport && production.started_at && (
+                      <button
+                        type="button"
+                        className="btn ghost"
+                        onClick={() => void runProduction()}
+                        disabled={runningProduction}
+                      >
+                        {runningProduction ? 'Running…' : 'Re-run'}
+                      </button>
+                    )}
+                  </p>
+                )}
+                {productionReport?.latest_id &&
+                  !sameInstant(production.started_at, productionReport.latest_started_at) && (
+                    <p className="home-report-line">
+                      The latest report used a different start.
+                      {canRunReport && production.started_at && (
+                        <button
+                          type="button"
+                          className="btn ghost"
+                          onClick={() => void runProduction()}
+                          disabled={runningProduction}
+                        >
+                          {runningProduction ? 'Running…' : 'Run'}
+                        </button>
+                      )}
+                      {canRunReport && !production.started_at && (
+                        <button type="button" className="btn ghost" disabled>
+                          Not in production yet
+                        </button>
+                      )}
+                    </p>
+                  )}
+                {canRunReport && !production.started_at && !productionReport?.latest_id && (
+                  <p className="home-report-line">
+                    <button type="button" className="btn ghost" disabled>
+                      Not in production yet
+                    </button>
+                  </p>
+                )}
+                {productionReport?.latest_id && (
+                  <Link to={`/report?record=${encodeURIComponent(productionReport.latest_id)}`}>
+                    Latest production report
+                  </Link>
+                )}
+              </div>
+            )}
+          </section>
+        )}
+        {(readiness !== null || readinessError !== null) && (
+          <section aria-label="Install readiness">
+            {sectionHead(
+              'Install readiness',
+              null,
+              <InfoTip label="How install readiness is calculated" align="start" {...READINESS_TIP} />,
+              null,
+            )}
+            {readinessError && <p role="alert">{readinessError}</p>}
+            {readiness && (
+              <div className="home-readiness">
+                <p className="home-readiness-line">{readiness.line}</p>
+                {readiness.items.length > 0 && (
+                  <ul>
+                    {readiness.items.map((item) => (
+                      <li key={item.id} className={item.href ? 'has-link' : undefined}>
+                        <p>{item.text}</p>
+                        {item.href ? (
+                          <Link to={item.href}>{item.fix}</Link>
+                        ) : (
+                          <p className="home-readiness-fix">{item.fix}</p>
+                        )}
+                      </li>
+                    ))}
+                  </ul>
+                )}
+                {readiness.notes.length > 0 && (
+                  <ul className="home-readiness-notes">
+                    {readiness.notes.map((note) => (
+                      <li key={note.id}>{note.text}</li>
+                    ))}
+                  </ul>
+                )}
+              </div>
+            )}
+          </section>
+        )}
+        {(reportLine !== null || reportError !== null) &&
+          (reportError !== null ||
+            reportLine?.running_since ||
+            reportLine?.incomplete_since ||
+            reportLine?.latest_id) && (
+          <section aria-label="Day 1 Report">
+            {sectionHead('Day 1 Report', null, null, null)}
+            {reportError && <p role="alert">{reportError}</p>}
+            {reportLine && (
+              <div className="home-readiness">
+                {reportLine.running_since && (
+                  <p className="home-report-line">Running since {reportStamp(reportLine.running_since)}.</p>
+                )}
+                {reportLine.incomplete_since && (
+                  <p className="home-report-line">
+                    Didn't complete.
+                    {canRunReport && (
+                      <button
+                        type="button"
+                        className="btn ghost"
+                        onClick={() => void rerunReport()}
+                        disabled={rerunning}
+                      >
+                        {rerunning ? 'Running…' : 'Re-run'}
+                      </button>
+                    )}
+                  </p>
+                )}
+                {reportLine.latest_id && (
+                  <Link to={`/report?record=${encodeURIComponent(reportLine.latest_id)}`}>Latest report</Link>
+                )}
+              </div>
+            )}
+          </section>
+        )}
         {!noAlerts && (
           <section aria-label="Setup" id={HOME_SETUP_ID}>
             {sectionHead(

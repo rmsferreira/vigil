@@ -5,7 +5,7 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 from core.config import is_demo_mode
-from core.exceptions import DatabaseError
+from core.exceptions import DatabaseError, TeamRefused
 from core.storage import case_trail_hook
 from core.storage.connection import (
     SchemaDriftError,
@@ -477,6 +477,10 @@ class DatabaseDataService:
         description: str = "",
         status: str = "open",
         case_id: Optional[str] = None,
+        assignee: Optional[str] = None,
+        readers: Optional[List[str]] = None,
+        reader_teams: Optional[List[str]] = None,
+        recheck_mark: Optional[Dict] = None,
     ) -> Optional[Dict]:
         if self._demo_mode and self._demo_service:
             return self._demo_service.create_case(
@@ -501,9 +505,15 @@ class DatabaseDataService:
                     description=description,
                     status=status,
                     priority=priority,
+                    assignee=assignee,
+                    readers=readers,
+                    reader_teams=reader_teams,
+                    recheck_mark=recheck_mark,
                 )
                 return CaseSchema.dump(case) if case else None
             except case_trail_hook.RAISED:
+                raise
+            except TeamRefused:
                 raise
             except Exception as e:
                 logger.error(f"Error creating case in DB: {e}")
@@ -569,15 +579,10 @@ class DatabaseDataService:
                 return []
         return []
 
-    def add_finding_to_case(self, case_id: str, finding_id: str) -> bool:
-        """Add a finding to an existing case.
+    def add_finding_to_case(self, case_id: str, finding_id: str):
+        """Link one finding. See ``DatabaseService.add_finding_to_case``.
 
-        Args:
-            case_id: The case ID
-            finding_id: The finding ID to add
-
-        Returns:
-            True if successful, False otherwise
+        False when the write failed or no database is available.
         """
         if self._demo_mode and self._demo_service:
             return self._demo_service.add_finding_to_case(case_id, finding_id)
@@ -589,6 +594,42 @@ class DatabaseDataService:
                 raise
             except Exception as e:
                 logger.error(f"Error adding finding to case in DB: {e}")
+                return False
+        return False
+
+    def add_findings_to_case(self, case_id: str, finding_ids: List[str]):
+        """Link many findings in one transaction. None when the case is missing.
+
+        False when the write failed.
+        """
+        if self._demo_mode and self._demo_service:
+            return self._demo_service.add_findings_to_case(case_id, finding_ids)
+
+        if self._db_available:
+            try:
+                return self._db_service.add_findings_to_case(case_id, finding_ids)
+            except case_trail_hook.RAISED:
+                raise
+            except Exception as e:
+                logger.error(f"Error adding findings to case in DB: {e}")
+                return False
+        return None
+
+    def remove_finding_from_case(self, case_id: str, finding_id: str):
+        """Unlink one finding. See ``DatabaseService.remove_finding_from_case``.
+
+        False when the write failed or no database is available.
+        """
+        if self._demo_mode and self._demo_service:
+            return self._demo_service.remove_finding_from_case(case_id, finding_id)
+
+        if self._db_available:
+            try:
+                return self._db_service.remove_finding_from_case(case_id, finding_id)
+            except case_trail_hook.RAISED:
+                raise
+            except Exception as e:
+                logger.error(f"Error removing finding from case in DB: {e}")
                 return False
         return False
 

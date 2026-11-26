@@ -8,8 +8,8 @@ export type PricingSource = 'exact' | 'zero' | 'unknown'
 
 const NOT_PRICED = 'not priced'
 const NOT_BILLED = 'not billed'
-const NOT_PRICED_HINT = 'No rate is known for this model, so its spend cannot be measured. Set one in the gateway’s pricing overrides, or mark its provider self-hosted (config.self_hosted) if it costs nothing.'
-const NOT_BILLED_HINT = 'This model is not billed. A rate for a self-hosted model is set in the gateway’s pricing overrides; a provider is marked self-hosted with config.self_hosted.'
+const NOT_PRICED_HINT = 'No rate is known for this model, so its spend cannot be measured. Set one in the gateway’s pricing overrides; a hosted model that costs nothing gets its zero price there too. A provider whose model runs on hardware you control is stated self-hosted (config.self_hosted), which also prices it at zero.'
+const NOT_BILLED_HINT = 'This model is not billed: its provider is stated self-hosted (config.self_hosted), meaning the model runs on hardware you control, or the gateway’s pricing overrides set its rate to zero.'
 
 /** Provenance vocabulary, identical everywhere it appears. */
 export const PROVENANCE_LABEL: Record<PricingSource, string> = {
@@ -37,6 +37,15 @@ export function describeCost({ usd, source, digits = 2 }: CostInput): CostView {
   }
   if (source === 'zero') return { kind: 'not-billed', text: NOT_BILLED, hint: NOT_BILLED_HINT }
   return { kind: 'amount', text: dollars(usd, digits), source: source ?? undefined }
+}
+
+/** " · $0.42 over" once spend passes its ceiling, else "". Strict on the unrounded figures; under a cent reads
+ *  "under $0.01 over". A ceiling that is 0, null or not a number is no ceiling. */
+export function fmtOver(spent: number | null | undefined, ceiling: number | null | undefined): string {
+  if (typeof spent !== 'number' || typeof ceiling !== 'number' || !Number.isFinite(spent) || !Number.isFinite(ceiling)
+    || ceiling <= 0 || !(spent > ceiling)) return ''
+  const over = spent - ceiling
+  return over < 0.01 ? ' · under $0.01 over' : ` · ${dollars(over, 2)} over`
 }
 
 /** Plain-text form for template strings and KPI values. */

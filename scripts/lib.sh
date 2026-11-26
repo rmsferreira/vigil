@@ -52,9 +52,10 @@ wsl_preflight() {
     return 0
 }
 
-# Containers reach the host-native Ollama via host.docker.internal, but
-# load_env exports the host-side OLLAMA_URL and shell env beats the compose
-# default - so rewrite it here, at the single container boundary.
+# Containers reach the host-native Ollama via host.docker.internal. env.example
+# leaves OLLAMA_URL unset, but an operator may set a host-side localhost value,
+# which load_env exports and shell env beats the compose default - so rewrite
+# it here, at the single container boundary.
 _container_ollama_url() {
     echo "${OLLAMA_URL:-http://localhost:11434}" \
         | sed -e 's|//localhost:|//host.docker.internal:|' \
@@ -78,6 +79,9 @@ dc() {
     # Compose refuses to start redis without one (`${REDIS_PASSWORD:?}`), so a
     # caller that skipped start.sh still gets the install's password.
     ensure_redis_password >&2 || return 1
+    # Compose refuses to start without all three (`:?`). Fill-only: dc also wraps
+    # logs, backups and restores, which must not change a login.
+    ensure_postgres_passwords >&2
     local -a medic_files=() medic_env=()
     _dc_medic
     OLLAMA_URL="$(_container_ollama_url)" \
@@ -101,6 +105,13 @@ _dc_medic() {
         echo "Warning: can't read $settings; Compose runs without Medic's overlay." >&2
         return 0
     fi
+    # The gateway's two credential files are each optional, but Compose won't
+    # start a container whose secret file is missing. An empty 0600 placeholder
+    # reads as absent to the gateway; an existing file is never touched.
+    for f in medic_gateway_token viewer_password; do
+        f="${settings%/*}/$f"
+        [ -e "$f" ] || [ -L "$f" ] || (umask 077 && : > "$f") 2>/dev/null || true
+    done
     while IFS= read -r line || [ -n "$line" ]; do
         case "$line" in VIGIL_MEDIC_*=*) ;; *) continue ;; esac
         # Override files come from Vigil's own environment, never from compose.env.
@@ -369,6 +380,66 @@ frontend_deps_stale() {
     [ "$dir/package-lock.json" -nt "$dir/node_modules/.package-lock.json" ]
 }
 
+# sha256 of the given files' concatenated contents followed by stdin.
+files_digest() {
+    { cat "$@"; cat; } | if command -v sha256sum >/dev/null; then sha256sum; else shasum -a 256; fi | cut -d' ' -f1
+}
+
+# Install the pinned MCP connectors from infra/docker/mcp-packages under
+# $VIGIL_MCP_PREFIX (default: the repo's .mcp/), as Dockerfile.mcp-runner does,
+# so installed_launch runs them instead of npx/uvx resolving at runtime. Each
+# half is skipped while its stamp matches its sources. Never fatal: on failure
+# it sets MCP_CONNECTORS_PROBLEM, and connectors fall back to npx/uvx.
+#   $1 non-empty to skip the npm half (no usable node)
+install_mcp_connectors() {
+    local no_node="$1" src="$REPO_ROOT/infra/docker/mcp-packages"
+    export VIGIL_MCP_PREFIX="${VIGIL_MCP_PREFIX:-$REPO_ROOT/.mcp}"
+    local npm_dir="$VIGIL_MCP_PREFIX/npm" uv_dir="$VIGIL_MCP_PREFIX/uv-tools"
+    local log="$REPO_ROOT/logs/mcp-install.log" failed="" stamp
+    mkdir -p "$REPO_ROOT/logs" "$VIGIL_MCP_PREFIX" || { MCP_CONNECTORS_PROBLEM="cannot create $VIGIL_MCP_PREFIX"; return 0; }
+
+    local npm_files=("$src/package.json" "$src/package-lock.json" "$src/.npmrc" "$src/postinstall.mjs")
+    stamp=$(files_digest "${npm_files[@]}" </dev/null)
+    if [ -n "$no_node" ] || ! command -v npm >/dev/null; then
+        failed="npm (no Node.js 20+)"
+    elif [ "$(cat "$npm_dir/.vigil-stamp" 2>/dev/null)" != "$stamp" ]; then
+        echo "Installing pinned npm MCP connectors into $npm_dir (log: $log)..."
+        rm -rf "$npm_dir" && mkdir -p "$npm_dir" && cp "${npm_files[@]}" "$npm_dir/"
+        if (cd "$npm_dir" && npm ci --omit=dev --no-audit --no-fund) >>"$log" 2>&1; then
+            echo "$stamp" > "$npm_dir/.vigil-stamp"
+        else
+            # A half-done tree may hold unpatched connectors at their pins.
+            rm -rf "$npm_dir"; failed="npm"
+        fi
+    fi
+
+    # The tool venvs are built on the venv's interpreter, so its pin is in the stamp.
+    stamp=$(python_pin | files_digest "$src/uv-tools.txt")
+    if ! ensure_uv; then
+        failed="${failed:+$failed, }uv (no uv)"
+    elif [ "$(cat "$uv_dir/.vigil-stamp" 2>/dev/null)" != "$stamp" ]; then
+        echo "Installing pinned uv MCP connectors into $uv_dir (log: $log)..."
+        rm -rf "$uv_dir" && mkdir -p "$uv_dir"
+        local line uv_failed=0
+        while read -r line; do
+            case "$line" in ''|'#'*) continue ;; esac
+            # Unquoted on purpose: a line is a spec plus its flags, as xargs -L1 reads it.
+            # shellcheck disable=SC2086
+            UV_TOOL_DIR="$uv_dir" UV_TOOL_BIN_DIR="$uv_dir/.bin" UV_PYTHON_DOWNLOADS=never \
+                "$UV" tool install --python "$REPO_ROOT/venv/bin/python" $line >>"$log" 2>&1 \
+                || { uv_failed=1; echo "uv tool install failed: $line" >>"$log"; }
+        done < "$src/uv-tools.txt"
+        # Tools that did install stay usable; no stamp, so the next start retries.
+        if [ "$uv_failed" -eq 0 ]; then echo "$stamp" > "$uv_dir/.vigil-stamp"; else failed="${failed:+$failed, }uv"; fi
+    fi
+
+    if [ -n "$failed" ]; then
+        MCP_CONNECTORS_PROBLEM="not installed: $failed (see $log); those connectors fall back to npx/uvx"
+        echo "Warning: MCP connectors: $MCP_CONNECTORS_PROBLEM" >&2
+    fi
+    return 0
+}
+
 # Where dependency versions come from. requirements.lock is fully pinned and
 # resolved for every supported platform, so two people installing months apart
 # get the same tree; requirements.txt (open ranges) is the fallback for a
@@ -469,25 +540,33 @@ env_file_value() {
 
 # --- Minted secrets in .env ---
 # Fill an empty KEY once (a value the caller exported, else a new one) and
-# never replace a set one. Two lines are left alone: which one to fill is a
-# guess, and a wrong guess splits two processes onto different values. Never
-# fails: start.sh runs under set -e, and the caller that needs the value says
-# what is missing. Rewritten in place (cat, not mv) so .env keeps its owner
-# and mode; the line keeps its `export` and its CR, if any.
+# never replace a set one, unless it is one of the space-separated values in
+# the optional third argument (published ones). Two lines are left alone: which
+# one to fill is a guess, and a wrong guess splits two processes onto different
+# values. Never fails: start.sh runs under set -e, and the caller that needs the
+# value says what is missing. Rewritten in place (cat, not mv) so .env keeps its
+# owner and mode; the line keeps its `export` and its CR, if any.
 _fill_env_secret() {
-    local key="$1" blurb="$2"
+    local key="$1" blurb="$2" replace="${3:-}"
     # A later ${key} on the same `local` line is still unset under `set -u`.
-    local env="$REPO_ROOT/.env" re="${_ENV_LINE_RE}${key}=" lines token
+    local env="$REPO_ROOT/.env" re="${_ENV_LINE_RE}${key}=" lines token cur
     [ -f "$env" ] || return 0
     lines="$(grep -cE "$re" "$env" || true)"
     if [ "$lines" -gt 1 ]; then
         echo "Warning: .env sets ${key} $lines times; left as is (the last one counts)." >&2
         return 0
     fi
-    [ -n "$(env_file_value "$key" "$env")" ] && return 0
+    cur="$(env_file_value "$key" "$env")"
+    if [ -n "$cur" ]; then
+        case " $replace " in *" $cur "*) ;; *) return 0 ;; esac
+    fi
     # printenv, not ${!key}: an unset name under set -u is a fatal unbound
     # variable, and an empty one must still fall through to a new value.
     token="$(printenv "$key" 2>/dev/null || true)"
+    # load_env exported the value being replaced; it must not come back.
+    if [ -n "$token" ]; then
+        case " $replace " in *" $token "*) token="" ;; esac
+    fi
     [ -n "$token" ] || token="$(openssl rand -hex 32 2>/dev/null)" || token=""
     [ -n "$token" ] || token="$(od -An -tx1 -N32 /dev/urandom 2>/dev/null | tr -d ' \n')" || token=""
     if [ -z "$token" ]; then
@@ -513,7 +592,11 @@ _fill_env_secret() {
     fi
     rm -f "$env.tmp.$$"
     export "${key}=${token}"
-    echo "Set ${key} in .env (${blurb})"
+    if [ -n "$cur" ]; then
+        echo "Replaced the published ${key} in .env (${blurb})"
+    else
+        echo "Set ${key} in .env (${blurb})"
+    fi
 }
 
 # The backend and the agent layer share AGENT_INTERNAL_TOKEN. env.example ships
@@ -529,6 +612,88 @@ ensure_agent_token() {
 # start that service while the variable is empty. Same mint as the agent token.
 ensure_bifrost_admin_password() {
     _fill_env_secret BIFROST_ADMIN_PASSWORD "Bifrost's management API password"
+}
+
+# Database passwords anyone can read: env.example's and Compose's old values,
+# and Helm's. Same list as _SHIPPED_DEFAULT_PASSWORDS in
+# core/storage/connection.py and infra/docker/initdb/00_apply.sh.
+PUBLISHED_POSTGRES_PASSWORDS="deeptempo_secure_password_change_me vigil_app_password_change_me vigil_agent_password_change_me change-me-before-production"
+
+# The database owner's, vigil_app's and vigil_agent's passwords, per install. In .env, not
+# ~/.vigil: Compose and agent_up.sh read them there. Fills an empty one and keeps
+# a set one. --replace-published (start.sh) also replaces a published value;
+# sync_postgres_passwords then sets the database to match. Without it, an empty
+# owner password stays empty while a Postgres volume exists: that volume was
+# initialised with Compose's old fallback, and a new value in .env would no
+# longer match it. Compose then stops with a message naming ./start.sh.
+ensure_postgres_passwords() {
+    local replace=""
+    [ -f "$REPO_ROOT/.env" ] || return 0
+    [ "${1:-}" = "--replace-published" ] && replace="$PUBLISHED_POSTGRES_PASSWORDS"
+    if [ -n "$replace" ] || [ -n "$(env_file_value POSTGRES_PASSWORD)" ] \
+            || ! _postgres_volume_may_exist; then
+        _fill_env_secret POSTGRES_PASSWORD "the database owner's password" "$replace"
+    fi
+    _fill_env_secret POSTGRES_APP_PASSWORD "vigil_app's database password" "$replace"
+    _fill_env_secret POSTGRES_AGENT_PASSWORD "vigil_agent's database password" "$replace"
+    # Compose reads them from the environment: a caller that never ran load_env
+    # (dc in vigil-backup.sh, setup_dev.sh) still gets .env's.
+    local key v
+    for key in POSTGRES_PASSWORD POSTGRES_APP_PASSWORD POSTGRES_AGENT_PASSWORD; do
+        [ -n "$(printenv "$key" 2>/dev/null || true)" ] && continue
+        v="$(env_file_value "$key")"
+        [ -z "$v" ] || export "$key=$v"
+    done
+}
+
+# True when Compose's postgres_data volume (or its container) exists, or
+# Docker can't say.
+_postgres_volume_may_exist() {
+    docker info >/dev/null 2>&1 || return 0
+    docker inspect deeptempo-postgres >/dev/null 2>&1 && return 0
+    docker volume inspect "${COMPOSE_PROJECT_NAME:-docker}_postgres_data" >/dev/null 2>&1
+}
+
+# Set the passwords .env holds inside deeptempo-postgres, as the owner over the
+# container's local socket, which the stock image trusts without a password.
+# .env is the source of truth and this can always run again, so a change cut
+# off between writing .env and here finishes on the next ./start.sh. vigil_app
+# and vigil_agent are set once the upgrade one-shot has created them (which sets
+# them too).
+sync_postgres_passwords() {
+    local owner app agent i=0
+    owner="$(env_file_value POSTGRES_PASSWORD)"
+    app="$(env_file_value POSTGRES_APP_PASSWORD)"
+    agent="$(env_file_value POSTGRES_AGENT_PASSWORD)"
+    if [ -z "$owner" ] || [ -z "$app" ] || [ -z "$agent" ]; then
+        echo "POSTGRES_PASSWORD, POSTGRES_APP_PASSWORD and POSTGRES_AGENT_PASSWORD must all be set in .env" >&2
+        return 1
+    fi
+    # Over TCP: the first boot's init server listens on the socket only, and
+    # restarts once it is done.
+    until docker exec deeptempo-postgres pg_isready -q -h 127.0.0.1 -U deeptempo -d deeptempo_soc 2>/dev/null; do
+        i=$((i + 1))
+        [ "$i" -lt 60 ] || { echo "PostgreSQL did not become ready" >&2; return 1; }
+        sleep 1
+    done
+    # \getenv, so neither value is on a command line.
+    printf '%s\n' \
+        '\getenv owner_pw VIGIL_OWNER_PW' \
+        '\getenv app_pw VIGIL_APP_PW' \
+        '\getenv agent_pw VIGIL_AGENT_PW' \
+        "ALTER ROLE deeptempo PASSWORD :'owner_pw';" \
+        "SELECT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'vigil_app') AS has_app \\gset" \
+        '\if :has_app' \
+        "ALTER ROLE vigil_app PASSWORD :'app_pw';" \
+        '\endif' \
+        "SELECT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'vigil_agent') AS has_agent \\gset" \
+        '\if :has_agent' \
+        "ALTER ROLE vigil_agent PASSWORD :'agent_pw';" \
+        '\endif' \
+        | VIGIL_OWNER_PW="$owner" VIGIL_APP_PW="$app" VIGIL_AGENT_PW="$agent" docker exec -i \
+            -e VIGIL_OWNER_PW -e VIGIL_APP_PW -e VIGIL_AGENT_PW deeptempo-postgres \
+            psql -X -q -v ON_ERROR_STOP=1 -U deeptempo -d deeptempo_soc >/dev/null \
+        || { echo "Could not set the database passwords from .env" >&2; return 1; }
 }
 
 # The password .env or the environment holds, for host scripts that call
@@ -809,9 +974,24 @@ host_state_dir() {
     (cd "$state" && pwd)
 }
 
+# The user the backup and upgrade one-shots run as: the host's uid:gid, so what
+# they write in the bind mounts is the host user's. On macOS the host uid (501)
+# cannot enter the image's /home/vigil, owned by its vigil user (1000), and
+# Docker Desktop writes bind mounts as the host user whatever the container's
+# uid, so there they run as the image's user. VIGIL_BACKUP_RUN_USER overrides both.
+backup_run_user() {
+    if [ -n "${VIGIL_BACKUP_RUN_USER:-}" ]; then
+        echo "$VIGIL_BACKUP_RUN_USER"
+    elif [ "$(uname -s)" = Darwin ]; then
+        echo "1000:1000"
+    else
+        echo "$(id -u):$(id -g)"
+    fi
+}
+
 # Host paths and `docker compose run` flags every backup container shares.
 # Exports the State Directory and investigation workdir the compose `backup`
-# service mounts and sets BACKUP_RUN_ARGS (host user, plus the repo-root .env
+# service mounts and sets BACKUP_RUN_ARGS (backup_run_user, plus the repo-root .env
 # when present, mounted $1: ro by default).
 prepare_backup_mounts() {
     local env_mode="${1:-ro}"
@@ -826,9 +1006,22 @@ prepare_backup_mounts() {
     export VIGIL_BACKUP_INVESTIGATIONS_DIR="$(cd "$investigations" && pwd)"
     mkdir -p "$upgrade"
     export VIGIL_UPGRADE_HOST_DIR="$(cd "$upgrade" && pwd)"
-    BACKUP_RUN_ARGS=(--user "$(id -u):$(id -g)")
+    BACKUP_RUN_ARGS=(--user "$(backup_run_user)")
     if [ -f "$REPO_ROOT/.env" ]; then
         BACKUP_RUN_ARGS+=(-v "$REPO_ROOT/.env:/app/.env:$env_mode")
+    fi
+    # The erasure list the host API keeps (core/audit/retention.outside_path):
+    # mounted at a fixed path, or every snapshot would carry an empty list and a
+    # restore would bring erased people back. The env var outranks the .env above.
+    local erasure="${VIGIL_ERASURE_DIR:-${VIGIL_UPGRADE_DIR:-}}"
+    if [ -n "$erasure" ]; then
+        case "$erasure" in
+            /*) ;;
+            *) erasure="$REPO_ROOT/$erasure" ;;
+        esac
+        mkdir -p "$erasure"
+        BACKUP_RUN_ARGS+=(-v "$(cd "$erasure" && pwd):/var/lib/vigil-erasure"
+            -e VIGIL_ERASURE_DIR=/var/lib/vigil-erasure)
     fi
 }
 

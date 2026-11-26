@@ -290,6 +290,12 @@ class WorkflowRun(Base):
     # Why the model path stopped the run, for the console's table to word. Null on a
     # run a model call did not stop, and on every run that ended before this column.
     stop_cause: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    # What the run's report stands on, from its terminal (#4962): whether the turn cap
+    # ended it, the cited refs it holds, and its review's grounding. Null is unsaid,
+    # never false: a run before these columns, or a plugin that does not cite or ground.
+    capped: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True)
+    citation_count: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    grounded: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True)
     # How far a hunt has got and the ceiling it runs under, as the agent layer last
     # reported them. Null for a run that never has (compose, or a hunt before its first
     # iteration lands), which the case list then reads from the trigger context.
@@ -394,6 +400,11 @@ class ApprovalAction(Base):
         Boolean, nullable=False, default=True, server_default="true"
     )
     status: Mapped[str] = mapped_column(String(16), nullable=False)
+    # A stop holds an approved outside action until a person releases it.
+    # The executor skips a held row. Default false: a new row is not held.
+    held: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
     approved_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     approved_by: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
     approved_by_principal_id: Mapped[Optional[str]] = mapped_column(Text, nullable=True)

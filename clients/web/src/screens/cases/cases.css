@@ -30,8 +30,19 @@
   min-width: 168px;
 }
 
-.case-page .case-title-row { display: flex; align-items: flex-start; gap: 12px; }
-.case-page .case-title-row .btn { flex: none; margin-left: auto; }
+.case-page .case-title-row { display: flex; align-items: flex-start; flex-wrap: wrap; gap: 12px; }
+.case-page .case-title-row h2 { min-width: 0; }
+/* The title keeps a readable width; the actions wrap under it before it narrows past that. */
+.case-page .detail-head .case-title-row h2 { flex: 1 1 240px; }
+.case-page .case-title-actions {
+  margin-left: auto;
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 8px;
+  max-width: 100%;
+}
+.case-page .case-title-actions .btn { flex: none; }
 
 .case-page .detail-head h2 {
   flex: 1;
@@ -42,6 +53,22 @@
   letter-spacing: -0.2px;
   line-height: 1.25;
   overflow-wrap: anywhere;
+}
+
+.case-page .case-recheck {
+  margin: 0;
+  font-size: 13px;
+  line-height: 1.45;
+  color: var(--tx1);
+  overflow-wrap: anywhere;
+  min-width: 0;
+}
+
+.case-page .case-recheck .differ {
+  display: inline-block;
+  margin-left: 8px;
+  color: var(--vio);
+  font-weight: 650;
 }
 
 .case-page .case-state-line {
@@ -68,14 +95,24 @@
 .case-page .dh-meta .case-trust {
   margin: 0 0 0 auto;
   font-size: 12px;
+  max-width: 100%;
+  min-width: 0;
 }
 
-/* Trust strip (CaseDetail board): a 72x4 meter, then the text and its ⓘ. Neutral fill unless the workflow has a floor. */
+/* Trust strip: agreement (meter stays with its text), the 30-day false-close rate,
+   and agreements given without the evidence. The row wraps between figures. */
 .case-page .dh-meta .case-trust-on {
   display: inline-flex;
   align-items: center;
-  gap: 8px;
+  flex-wrap: wrap;
+  gap: 4px 8px;
+  max-width: 100%;
   color: var(--tx2);
+}
+.case-page .case-trust-agree {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
   white-space: nowrap;
 }
 .case-page .case-trust-bar {
@@ -261,6 +298,11 @@
 .case-needs .needs-row .needs-actions .home-hold { min-width: 124px; }
 .case-needs .needs-more li .needs-reject { background: var(--bg1); }
 
+/* The optional reason before a containment's undo hold (#5273). */
+.case-contain .contain-why { display: flex; flex-direction: column; gap: 6px; }
+.case-contain .contain-why label { font-size: 12px; color: var(--tx2); overflow-wrap: anywhere; }
+.case-contain .contain-why textarea { box-sizing: border-box; min-height: 0; }
+
 .case-needs .needs-more-foot {
   display: flex;
   align-items: center;
@@ -433,6 +475,7 @@
 .side-kv dt { color: var(--tx2); }
 .side-kv dd { margin: 0; overflow-wrap: anywhere; }
 .side-kv .case-sla { white-space: nowrap; }
+.side-kv .side-opened { text-align: left; overflow-wrap: anywhere; }
 
 /* Entities: one per line; a long value loses its middle to an ellipsis, the whole of it stays in the DOM to copy.
    Inline, not flex: a flex item copies as its own line, which would split a hash in two. */
@@ -699,12 +742,13 @@
   overflow-wrap: anywhere;
 }
 
-.case-page .case-closed h3 {
-  margin: 0;
-  font-size: 20px;
-  font-weight: 650;
-  line-height: 1.3;
+/* An agent's headline, or an analyst's note kept whole with its line breaks. */
+.case-page .case-closed .case-closed-verdict {
+  font-size: 15px;
+  font-weight: 600;
+  line-height: 1.45;
   color: var(--tx0);
+  white-space: pre-line;
   overflow-wrap: anywhere;
 }
 
@@ -817,6 +861,11 @@
   -webkit-line-clamp: 2;
   overflow: hidden;
 }
+
+/* The run's report as Markdown at a prose measure; a very long one is cut by height until opened. */
+.case-page .case-report { max-width: var(--text-max); font-size: 13px; line-height: 1.5; color: var(--tx1); overflow-wrap: anywhere; }
+.case-page .case-report-clamped { max-height: 40em; overflow: hidden; }
+.case-page .case-report-toggle { align-self: flex-start; }
 
 /* Paused or stopped: the Now card's place, without its accent or breathing dot. */
 .case-page .case-stopped {
@@ -1592,11 +1641,11 @@
 }
 
 /* the fixed tracks, their gaps and the row's padding, plus the title's floor: below it the grid scrolls in its card */
-.cases-grid { --cg-tracks: 810px; min-width: calc(var(--cg-tracks) + var(--col-main-min)); }
+.cases-grid { --cg-tracks: 976px; min-width: calc(var(--cg-tracks) + var(--col-main-min)); }
 
 .cg-row {
   display: grid;
-  grid-template-columns: 22px 176px minmax(0, 1fr) 80px 72px 96px 116px 108px 32px; /* compact widths, so 1280 with the side bar fits; the id keeps 176px (#2054) and the title takes the rest */
+  grid-template-columns: 22px 176px minmax(0, 1fr) 80px 72px 132px 120px 116px 108px 32px; /* compact widths, so 1280 with the side bar fits; the id keeps 176px (#2054) and the title takes the rest. Status fits "Agent working". */
   gap: 10px;
   align-items: center;
   padding: 11px 14px;
@@ -1620,8 +1669,8 @@
 /* Kind, Owner and Time left (304px + 3 gaps) step aside while Ask Vigil is docked: a hidden grid cell
    would still take a track, so the cells leave the grid and the tracks are redefined without them */
 @container main (max-width: 1399px) {
-  .main.chat-open .cases-grid { --cg-tracks: 476px; }
-  .main.chat-open .cg-row { grid-template-columns: 22px 176px minmax(0, 1fr) 72px 96px 32px; }
+  .main.chat-open .cases-grid { --cg-tracks: 642px; }
+  .main.chat-open .cg-row { grid-template-columns: 22px 176px minmax(0, 1fr) 72px 132px 120px 32px; }
   .main.chat-open .cg-row > .col-low { display: none; }
 }
 
@@ -1653,6 +1702,7 @@
 .cg-title,
 .cg-sub,
 .cg-kind,
+.cg-team,
 .cg-owner-name {
   overflow: hidden;
   text-overflow: ellipsis;
@@ -1662,7 +1712,10 @@
 .cg-sub { color: var(--tx2); }
 
 .cg-owner { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.cg-owner-text { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
 .cg-owner-name { color: var(--tx0); }
+/* a stored owner that is not a current account: meta type, wraps under the name */
+.owner-note { font-size: 12px; color: var(--tx2); overflow-wrap: anywhere; }
 .cg-avatar {
   flex-shrink: 0;
   display: inline-flex;
@@ -2092,3 +2145,72 @@
   .case-page .case-stage { flex-direction: column; overflow-y: auto; }
   .case-side { flex: none; width: auto; border-left: 0; border-top: 1px solid var(--ln0); overflow: visible; padding: 16px; }
 }
+
+/* Task rows: the assignee picker, compact, beside the due date. */
+.task-meta { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 12px; margin-top: 4px; font-size: 12px; color: var(--tx-faint); }
+.task-meta .person-pick, .task-meta .person-pick-fallback { flex: 1 1 140px; width: auto; max-width: 240px; }
+.task-meta .field-select, .task-meta .person-pick-input { padding: 3px 8px; font-size: 12px; }
+
+/* Reopen: the owner the case reopens with, beside the button. */
+/* Five cards: five across, then three, then two. A fifth card must not leave the others on the four-column grid. */
+.stat-cards.cases-strip { grid-template-columns: repeat(5, minmax(0, 1fr)); }
+.stat-cards.cases-strip .stat-card-sub {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  overflow-wrap: anywhere;
+}
+@container main (max-width: 1099px) {
+  .stat-cards.cases-strip { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+}
+@container main (max-width: 699px) {
+  .stat-cards.cases-strip { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .stat-cards.cases-strip > :last-child { grid-column: 1 / -1; }
+}
+
+.case-page .case-reopen { align-items: center; }
+.case-page .case-reopen-owner { display: flex; width: 220px; max-width: 100%; }
+.case-page .case-assess .owner-fix { flex: 1 1 100%; margin-top: 0; }
+
+/* Restricted cases (#4361): the marker, the reader picker and the help text. */
+.restricted-mark { display: inline-flex; align-items: center; gap: 6px; min-width: 0; max-width: 100%; vertical-align: middle; }
+
+.restricted-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  flex-shrink: 0;
+  padding: 1px 7px;
+  border: 1px solid var(--ln1);
+  border-radius: 999px;
+  background: var(--bg3);
+  color: var(--tx0);
+  font-size: 11px;
+  font-weight: 650;
+  line-height: 16px;
+}
+.restricted-readers { font-size: 12px; color: var(--tx2); min-width: 0; overflow-wrap: anywhere; }
+.cg-sub .restricted-readers { overflow-wrap: normal; }
+.restrict-help { margin: 0; padding-left: 18px; display: flex; flex-direction: column; gap: 4px; font-size: 12px; line-height: 1.45; color: var(--tx2); }
+.restrict-toggle { display: inline-flex; align-items: center; gap: 8px; font-size: 13px; font-weight: 650; color: var(--tx0); cursor: pointer; }
+.reader-pick { display: flex; flex-direction: column; gap: 12px; }
+.reader-pick-group { display: flex; flex-direction: column; gap: 6px; }
+.reader-pick-head { font-size: 12px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em; color: var(--tx3); }
+.reader-pick-list {
+  display: flex;
+  flex-direction: column;
+  max-height: 200px;
+  overflow-y: auto;
+  border: 1px solid var(--ln0);
+  border-radius: var(--radius-card-inner);
+  background: var(--bg2);
+}
+.reader-pick-row { display: flex; align-items: center; gap: 8px; padding: 6px 10px; font-size: 13px; color: var(--tx0); cursor: pointer; min-width: 0; }
+.reader-pick-row.synced { align-items: flex-start; flex-wrap: wrap; }
+.reader-pick-row + .reader-pick-row { border-top: 1px solid var(--ln0); }
+.reader-pick-row:hover { background: var(--bg3); }
+.reader-pick-name { min-width: 0; overflow-wrap: anywhere; }
+.reader-pick-sub { font-size: 12px; color: var(--tx2); white-space: nowrap; }
+.reader-pick-sync { flex: 1 1 100%; padding-left: 22px; font-size: 12px; line-height: 1.4; color: var(--tx2); overflow-wrap: anywhere; }
+.reader-pick-note { margin: 0; padding: 6px 10px; font-size: 12px; color: var(--tx2); }
+p.reader-pick-note { padding: 0; }

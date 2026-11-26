@@ -6,9 +6,13 @@
 # Global
 # -----------------------------------------------------------------------------
 global:
-  # Container registry where Vigil images live. Set in release.yml.
-  imageRegistry: ghcr.io
-  # Image repo namespace. Images resolve to <registry>/<namespace>-<component>
+  # One registry for every image the chart and its subcharts render, for a
+  # mirrored site. Empty: Vigil's images come from ghcr.io and third-party ones
+  # from their own registry. Set: every image moves to <registry>/<path>, with
+  # Docker Hub's implied library/ written out (postgres → <registry>/library/postgres).
+  # An explicit image.repository is used as written.
+  imageRegistry: ""
+  # Image repo namespace. Vigil's images resolve to <registry>/<namespace>-<component>
   # e.g. ghcr.io/vigil-soc/vigil-backend
   imageNamespace: vigil-soc/vigil
   imagePullPolicy: IfNotPresent
@@ -27,7 +31,7 @@ commonLabels: {}
 backend:
   replicaCount: 2
   image:
-    # Final image ref: {{ global.imageRegistry }}/{{ global.imageNamespace }}-backend:{{ tag }}
+    # Final image ref: <global.imageRegistry or ghcr.io>/<global.imageNamespace>-backend:<tag>
     repository: ""   # empty → auto-derive from global.imageNamespace + "-backend"
     tag: ""          # empty → fall back to .Chart.AppVersion
     pullPolicy: ""   # empty → inherit global.imagePullPolicy
@@ -56,6 +60,10 @@ backend:
   affinity: {}
   # Extra env merged on top of the shared ConfigMap/Secret. Useful for overrides.
   extraEnv: []
+  # The declared intent directory, read-only, when skills live in it (README:
+  # "Skills in the declared directory"). The backend only reads its REVISION.
+  extraVolumes: []
+  extraVolumeMounts: []
   # Backend-specific feature flags written into the ConfigMap.
   env:
     BIND_HOST: "0.0.0.0"
@@ -98,6 +106,12 @@ daemon:
   tolerations: []
   affinity: {}
   extraEnv: []
+  # Declared intent (README: "Declared intent directory"). Mount a directory
+  # holding INTENT.md and REVISION here, and set VIGIL_INTENT_DIR to its path
+  # in extraEnv. The daemon is the one applier; backend and llmWorker mount it
+  # too only when skills live in it.
+  extraVolumes: []
+  extraVolumeMounts: []
 
 # -----------------------------------------------------------------------------
 # LLM Worker (ARQ worker, processes Claude requests off Redis queue)
@@ -146,6 +160,10 @@ llmWorker:
   tolerations: []
   affinity: {}
   extraEnv: []
+  # The declared intent directory, read-only, when skills live in it (README:
+  # "Skills in the declared directory").
+  extraVolumes: []
+  extraVolumeMounts: []
 
 # -----------------------------------------------------------------------------
 # Agent worker — the TypeScript BullMQ consumer. Runs alongside llmWorker, not
@@ -286,7 +304,36 @@ mcpRunner:
   tolerations: []
   affinity: {}
   # HTTPS_PROXY/NO_PROXY etc. set here are forwarded to every server it starts.
+  # The AWS credential pointers (AWS_ROLE_ARN, AWS_WEB_IDENTITY_TOKEN_FILE,
+  # AWS_CONFIG_FILE, AWS_PROFILE, AWS_REGION, ...) reach the Security Lake server
+  # only, and never raw keys. On EKS, annotate serviceAccount for IRSA or add a
+  # Pod Identity association: the webhook injects the token volume and env even
+  # with automountServiceAccountToken: false, and serviceAccount is shared with
+  # the backend, whose Settings test runs on the same role. The token is
+  # projected root-owned 0600 (no fsGroup); the runner copies each file a
+  # pointer names into that server's own 0700 HOME, as its uid, and refreshes
+  # the copy every 60 s, so no other server's uid can read it.
   extraEnv: []
+  # Without the webhook (self-managed IRSA), project the token yourself:
+  #   extraVolumes:
+  #     - name: aws-iam-token
+  #       projected:
+  #         sources:
+  #           - serviceAccountToken:
+  #               audience: sts.amazonaws.com
+  #               expirationSeconds: 86400
+  #               path: token
+  #   extraVolumeMounts:
+  #     - name: aws-iam-token
+  #       mountPath: /var/run/secrets/eks.amazonaws.com/serviceaccount
+  #       readOnly: true
+  #   extraEnv:
+  #     - {name: AWS_ROLE_ARN, value: "arn:aws:iam::123456789012:role/vigil-security-lake"}
+  #     - {name: AWS_WEB_IDENTITY_TOKEN_FILE, value: /var/run/secrets/eks.amazonaws.com/serviceaccount/token}
+  # A shared config works the same way: a Secret volume with defaultMode: 0400,
+  # mounted read-only, and AWS_CONFIG_FILE pointing at it.
+  extraVolumes: []
+  extraVolumeMounts: []
 
 # -----------------------------------------------------------------------------
 # Read-only case shell (#4199): the agent image's `node dist/shell.js`, behind
@@ -324,8 +371,12 @@ detectionRules:
 postgresql:
   enabled: true
   image:
-    repository: postgres
-    tag: "16-alpine"
+    # Docker Hub's library/ written out: the Bitnami subchart reads this key too,
+    # and both then land on <global.imageRegistry>/library/postgres.
+    repository: library/postgres
+    # Pinned by digest, the same reference as both docker-compose files (CI
+    # checks). A tag you set replaces the pin; image.digest, if set, wins.
+    tag: "16-alpine@sha256:f2f98726820d0342055351c6e9d36e705f5bfffb3dd53ff556325114b08afb6d"
     pullPolicy: IfNotPresent
   auth:
     database: deeptempo_soc
@@ -398,8 +449,12 @@ postgresql:
 redis:
   enabled: true
   image:
-    repository: redis
-    tag: "7-alpine"
+    # Docker Hub's library/ written out: the Bitnami subchart reads this key too,
+    # and both then land on <global.imageRegistry>/library/redis.
+    repository: library/redis
+    # Pinned by digest, the same reference as both docker-compose files (CI
+    # checks). A tag you set replaces the pin; image.digest, if set, wins.
+    tag: "7-alpine@sha256:7f7d30b7fdd09467bac58198a1f166dd69789d348d4fe859cccb20e0cf287fbe"
     pullPolicy: IfNotPresent
   service:
     port: 6379
@@ -481,11 +536,18 @@ bifrost:
   enabled: true
   image:
     repository: maximhq/bifrost
-    # Same tag as docker-compose's BIFROST_IMAGE_TAG default.
-    tag: "v2.2.1"
+    # Pinned by digest, the same reference as both docker-compose files (CI
+    # checks). A tag you set replaces the pin; image.digest, if set, wins.
+    tag: "v2.2.1@sha256:a8942692af7b4b89196cd8fc33653b7353488dfd58b24078fe793b8574a8084b"
     pullPolicy: IfNotPresent
   service:
     port: 8080
+  # With no route out the gateway exits at boot fetching its pricing and model
+  # parameter sheets from getbifrost.ai. true points it at the empty sheets in
+  # files/bifrost/ instead: cloud models then go unpriced, and a provider stated
+  # self-hosted prices at zero (docs/upgrading.md, "Running with no route out").
+  # Compose: BIFROST_LOCAL_SHEETS.
+  localSheets: false
   # /app/data holds what Bifrost is told at runtime (provider edits made in its UI)
   # and logs.db. With persistence off that is an emptyDir: both are lost whenever
   # the pod restarts. The backend re-pushes providers and keys on its next start,
@@ -615,6 +677,16 @@ serviceAccount:
 #   stateDirectory.volume:
 #     persistentVolumeClaim:
 #       claimName: vigil-state
+# (set `stateDirectory.volume.emptyDir=null` too, or Helm keeps the default
+# emptyDir beside the claim.)
+#
+# Off an emptyDir, the erasure list (erased-principals.txt) is kept here too:
+# VIGIL_ERASURE_DIR is exported to the same workloads, and to the `apply`
+# upgrade Job, which mounts the volume. With an emptyDir the list stays in the
+# upgrade directory. With ReadWriteOnce storage whose pods land on different
+# nodes, the `apply` Job's pod cannot attach the claim while the old pods hold
+# it; `apply` is the Job that stops them, so `helm upgrade` waits until its
+# timeout. Use ReadWriteMany, or keep every pod on one node.
 stateDirectory:
   mountPath: /var/lib/vigil
   volume:
@@ -723,6 +795,16 @@ secrets:
   #   openssl rand -hex 24
   vigilAppPassword: ""
 
+  # vigil_agent password, for agent-serve and agent-worker only. That role holds
+  # the agent tables and nothing else. Materialized as POSTGRES_AGENT_PASSWORD;
+  # must differ from vigilAppPassword and postgresPassword. With existingSecret
+  # or externalSecret, that Secret must contain the key POSTGRES_AGENT_PASSWORD.
+  # Unset, the chart generates one and keeps it across upgrades with lookup;
+  # set it under helm template or a GitOps controller, where lookup sees nothing.
+  # Generate with:
+  #   openssl rand -hex 24
+  vigilAgentPassword: ""
+
   # Required when DEV_MODE=false (see env.example). Generate with:
   #   python -c "import secrets; print(secrets.token_urlsafe(64))"
   jwtSecretKey: ""
@@ -737,6 +819,11 @@ secrets:
   # not this one. Empty generates one, kept across upgrades. With existingSecret
   # or externalSecret, that Secret must carry MCP_RUNNER_TOKEN instead.
   mcpRunnerToken: ""
+
+  # Bearer the backend presents to the agent shell, in its own Secret
+  # (<fullname>-agent-shell). Empty generates one, kept across upgrades. With
+  # existingSecret or externalSecret, that Secret must carry SHELL_TOKEN instead.
+  agentShellToken: ""
 
   # Optional data-source integrations.
   splunkPassword: ""
@@ -793,11 +880,28 @@ config:
 
   # Secrets / auth policy
   ENABLE_KEYRING: "false"
+  # Key rotation period in whole days. Empty is 12 months (365), the longest
+  # Vigil allows. 1 to 365 is used. Anything longer, or not a whole number of
+  # days, is ignored: 12 months still applies and the API logs that once at start.
+  KEY_ROTATION_DAYS: ""
   # Ingress / load-balancer addresses allowed to set X-Forwarded-For.
   # Empty trusts the TCP peer. Set the ingress controller's pod CIDR when
   # ingress terminates TLS. "*" is ignored by the API.
   VIGIL_TRUSTED_PROXIES: ""
-  PASSWORD_RESET_TTL_SECONDS: "3600"
+  # Skill scanning, and so the hold on unscanned or flagged operator skills. The
+  # chart's configmap reaches the backend, llm-worker and daemon alike, so they
+  # agree on it: a process that thought scanning was off would hand held skills
+  # to its runs. The backend image carries the scanner at this path and the
+  # backend runs the scans. Set to "" to turn scanning off everywhere.
+  VIGIL_SKILL_SCANNER: "/opt/skillspector/bin/skillspector"
+  # Empty keeps scans static. A Bifrost model id (e.g. vertex/gemini-2.5-pro) adds
+  # model-backed scanning: each skill's full content goes to that model (about
+  # $0.16 and 70 s per skill with gemini-2.5-pro), and a CRITICAL finding holds
+  # a skill. Shared with the daemon and llm-worker because the mode picks the rule.
+  VIGIL_SKILL_SCANNER_MODEL: ""
+  # Hold new repo rule versions from coverage until the import check passes them
+  # or a person approves them; "false" lets them count unchecked.
+  VIGIL_RULE_IMPORT_CHECK: "true"
   # Include the context path under a subdirectory (e.g. https://example.com/vigil).
   VIGIL_FRONTEND_URL: ""
 
@@ -895,6 +999,11 @@ config:
   DAEMON_SLACK_ENABLED: "true"
   DAEMON_PAGERDUTY_ENABLED: "false"
   DAEMON_THREAT_HUNT_INTERVAL: "86400"
+  # The supervisory model's scheduled check, in seconds (five minutes at least).
+  # Off by default; "true" switches the model on. The backend and the daemon read
+  # the same value.
+  DAEMON_SUPERVISORY_ENABLED: "false"
+  DAEMON_SUPERVISORY_INTERVAL: "3600"
   # Ages out only the episodic read log; findings and processed events are
   # kept until an admin deletes them.
   DAEMON_CLEANUP_RETENTION_DAYS: "90"
@@ -910,6 +1019,10 @@ config:
   ORCHESTRATOR_MAX_ITERATIONS: "50"
   ORCHESTRATOR_MAX_COST: "5.0"
   ORCHESTRATOR_MAX_RUNTIME: "3600"
+  # Investigate and compose runs whose start names no wall, in seconds.
+  # 60–86400; outside that the API keeps 1800 and logs it. Autonomous runs
+  # keep ORCHESTRATOR_MAX_RUNTIME. Not an intent knob.
+  WORKFLOW_DEFAULT_WALL_SECONDS: "1800"
   ORCHESTRATOR_MAX_HOURLY_COST: "20.0"
   ORCHESTRATOR_STALE_THRESHOLD: "300"
   ORCHESTRATOR_WORKDIR: "/app/data/investigations"
@@ -920,6 +1033,8 @@ config:
   # is cleared on restart and is not shared between backend replicas. With
   # stateDirectory on ReadWriteMany storage, set this to null to use its
   # skills/ folder (created on the first save), or to an existing directory.
+  # A path under the declared intent directory (VIGIL_INTENT_DIR) makes the
+  # skills managed by it: Vigil refuses every write there (README).
   VIGIL_SKILLS_PATH: ""
 
   # OTEL — empty exports nothing; set it to a reachable collector to turn on
@@ -1059,8 +1174,11 @@ networkPolicies:
 # -----------------------------------------------------------------------------
 # Medic — the install's own ops-health watcher (System Watcher). Off by default.
 # -----------------------------------------------------------------------------
-# Observe-only: it reads pods, logs and the agent worker's /readyz, and reaches
-# the backend only through its read-only gateway (a separate pod). Everything it
+# It reads pods, logs and the agent worker's /readyz, and reaches the backend only
+# through its read-only gateway (a separate pod). Its one action is clearing a hung
+# soc-daemon: with daemon.enabled it can delete the soc-daemon pod (and no other),
+# through a separate ServiceAccount, and only on a click; a raise to "on its own"
+# needs medic.persistence.enabled. Everything it
 # renders carries its own labels, not the chart's selector pair, so the chart's
 # NetworkPolicies never select it, and its own policies render whatever
 # networkPolicies.enabled says.
@@ -1159,9 +1277,16 @@ medic:
       limits:
         cpu: 500m
         memory: 128Mi
-    # The Viewer account the gateway logs in as. Required when medic.enabled.
-    # The password comes from an existing Secret, mounted as a file; it is
-    # never put in this file or in any pod's environment.
+    # The gateway's API token, from a Secret mounted as a file (never env).
+    # The chart never renders or fills it, so an upgrade can't overwrite it:
+    # the command NOTES prints mints the token and creates the Secret. Until
+    # then the gateway reports no_credential. name "" → <release>-medic-gateway-token.
+    tokenSecret:
+      name: ""
+      key: token
+    # The Viewer service account the token belongs to. Required when
+    # medic.enabled. passwordSecret is optional: only a site set up before
+    # tokens has one, and its password works until the token is first used.
     viewer:
       username: ""
       passwordSecret:
@@ -1215,11 +1340,3 @@ pgadmin:
     limits:
       cpu: 500m
       memory: 512Mi
-
-# -----------------------------------------------------------------------------
-# Tests (helm test)
-# -----------------------------------------------------------------------------
-tests:
-  image:
-    repository: curlimages/curl
-    tag: "8.10.1"

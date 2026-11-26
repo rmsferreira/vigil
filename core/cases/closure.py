@@ -34,6 +34,29 @@ class ClosureCategory(str, Enum):
     UNSPECIFIED = "unspecified"
 
 
+class FalsePositiveCause(str, Enum):
+    """Which kind of fix a false-positive determination is.
+
+    It refines a ``false_positive`` close and a noise mark. Absence is a null
+    column, not a member: ``not_given`` is not stored.
+    """
+
+    EXPECTED = "expected"
+    TOO_BROAD = "too_broad"
+    DATA = "data"
+    OTHER = "other"
+
+
+def false_positive_cause_value(value: str | None) -> str | None:
+    """The cause to store. ``None`` stays null; anything else must be in the set."""
+    if value is None:
+        return None
+    try:
+        return FalsePositiveCause(value.strip()).value
+    except ValueError:
+        raise ValueError(f"{value!r} is not a false-positive cause") from None
+
+
 class ClosedByKind(str, Enum):
     """The Trust word a reader shows, and the kind a noise mark stores.
 
@@ -58,6 +81,13 @@ CLOSURE_OUTCOMES: Mapping[ClosureCategory, VerdictOutcome] = {
     ClosureCategory.FALSE_POSITIVE: VerdictOutcome.FALSE_POSITIVE,
     ClosureCategory.UNABLE_TO_RESOLVE: VerdictOutcome.INCONCLUSIVE,
     ClosureCategory.UNSPECIFIED: VerdictOutcome.INCONCLUSIVE,
+}
+
+# The cause an agent's dismissal records, keyed on the disposition the run returned.
+# ``benign`` was real, authorised activity: a false alarm over it is ``expected``.
+# ``false_positive`` said the alert was wrong without saying which way, so no entry.
+DISMISSAL_CAUSES: Mapping[str, FalsePositiveCause] = {
+    "benign": FalsePositiveCause.EXPECTED,
 }
 
 # ``close_channel`` values. Trust is derived; the client cannot send either.
@@ -98,8 +128,10 @@ __all__: Sequence[str] = (
     "CLOSURE_OUTCOMES",
     "ClosedByKind",
     "ClosureCategory",
+    "FalsePositiveCause",
     "PERSON_CHANNELS",
     "closed_by_person",
     "closure_says_real",
+    "false_positive_cause_value",
     "trust_word",
 )

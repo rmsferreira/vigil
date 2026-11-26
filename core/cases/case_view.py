@@ -32,10 +32,14 @@ HISTORY_KEYS_MAX = 50
 README = """\
 This directory is one Vigil case, read-only except scratch/.
 
-  case.json             the case record
+  case.json             the case record; team is its owning team (id, name,
+                        is_default). owner_state says if its assignee is a
+                        current person (current, not_current; null if none).
+                        owner_on_team says whether that person is on the team,
+                        and is absent when the case is unassigned
   findings/index.tsv    finding_id, severity, timestamp, title, one per line
   findings/<id>.json    every finding on the case, in full
-  tasks.json            the case's tasks
+  tasks.json            the case's tasks, each with owner_state likewise
   escalations.json      its escalations
   flows.json            per host pair sums of its network-flow findings (when any)
   evidence/index.json   each evidence item: id, name, type, hashes, and its file
@@ -51,6 +55,11 @@ A document condensed before a hunt read it is attached here as the original.
 def shell_address() -> Tuple[Optional[str], Optional[str]]:
     """The agent-shell sidecar's unix socket, else its URL; neither when absent."""
     return os.getenv("SHELL_SOCKET") or None, os.getenv("SHELL_URL") or None
+
+
+def shell_token() -> str:
+    """The bearer the shell requires over TCP (#4570); empty over its socket."""
+    return os.environ.get("SHELL_TOKEN", "")  # noqa: ENV001 - shell bearer
 
 
 class EvidenceUnreadable(Exception):
@@ -199,6 +208,7 @@ def _json(value: Any) -> str:
 
 def _records(case_id: str) -> Tuple[Optional[Args], Args, List[Args], List[Any]]:
     """The case, its side records, its findings in full, its evidence rows."""
+    from core.cases.assignee import with_owner_state
     from core.cases.case_evidence_service import CaseEvidenceService
     from core.storage.database_data_service import get_database_data_service
     from core.storage.schemas import FindingSchema
@@ -211,6 +221,9 @@ def _records(case_id: str) -> Tuple[Optional[Args], Args, List[Args], List[Any]]
         on_case = findings_on_case(session, case_id)
         findings = FindingSchema.dump_many(newest_first(on_case).all())
         records = side_records(session, case_id, on_case)
+        # One owner lookup for the case and its tasks (a copy: demo rows are shared).
+        case = dict(case)
+        with_owner_state(session, [case, *records["tasks"]])
         evidence = [
             (evidence_summary(row), row.file_path)
             for row in CaseEvidenceService().get_case_evidence(case_id, session=session)
@@ -218,7 +231,7 @@ def _records(case_id: str) -> Tuple[Optional[Args], Args, List[Args], List[Any]]
     return case, records, findings, evidence
 
 
-def _history(findings: List[Args]) -> Tuple[List[str], Optional[Args]]:
+def _history(case_id: str, findings: List[Args]) -> Tuple[List[str], Optional[Args]]:
     from core.cases.linked_entities import linked_entity_keys
     from core.memory.recall import recall_entity
 
@@ -227,7 +240,10 @@ def _history(findings: List[Args]) -> Tuple[List[str], Optional[Args]]:
         keys = keys[:HISTORY_KEYS_MAX]
         if not keys:
             return keys, None
-        return keys, recall_entity({"entity_keys": keys, "caller_kind": "case_shell"})
+        # This case's own memory is offered here even when it is restricted.
+        return keys, recall_entity(
+            {"entity_keys": keys, "caller_kind": "case_shell"}, own_case=case_id
+        )
     except Exception as exc:  # noqa: BLE001 - the rest of the view still serves
         return [], {"unavailable": f"entity history could not be read: {exc}"}
 
@@ -271,7 +287,41 @@ def _tar(files: Dict[str, str]) -> bytes:
     return buffer.getvalue()
 
 
-_renders: "OrderedDict[Tuple[str, str, str], Tuple[float, bytes]]" = OrderedDict()
+_renders: "OrderedDict[Tuple[str, str, str], Tuple[float, Any, bytes]]" = OrderedDict()
+
+# Everything the tar renders from the database, as of now: a held render is
+# served only while this is unchanged (#5243). Counts catch a removed row a
+# max(updated_at) would miss; escalations have no updated_at, so their times.
+_STAMP_SQL = """
+SELECT (SELECT updated_at FROM cases WHERE case_id = :c), f.*, t.*, e.*, x.*
+FROM (SELECT count(*), max(fi.updated_at) FROM case_findings cf
+        JOIN findings fi ON fi.finding_id = cf.finding_id
+        WHERE cf.case_id = :c) f,
+     (SELECT count(*), max(updated_at) FROM case_tasks WHERE case_id = :c) t,
+     (SELECT count(*), max(updated_at) FROM case_evidence WHERE case_id = :c) e,
+     (SELECT count(*), max(greatest(escalated_at, acknowledged_at, resolved_at))
+        FROM case_escalations WHERE case_id = :c) x
+"""
+
+
+def _stamp(case_id: str) -> Optional[Tuple[Any, ...]]:
+    """The case's freshness stamp in one round trip; None when it can't be read."""
+    from sqlalchemy import text
+
+    from core.storage.unit_of_work import unit_of_work
+
+    try:
+        with unit_of_work() as session:
+            return tuple(session.execute(text(_STAMP_SQL), {"c": case_id}).one())
+    except Exception:  # noqa: BLE001 - no stamp: render afresh, never serve held
+        return None
+
+
+def _held_still_good(case_id: str) -> Tuple[bool, Any]:
+    """Whether the caller may still read the case, and its stamp now."""
+    from core.cases.case_access import readable
+
+    return readable(case_id), _stamp(case_id)
 
 
 # Person and agent both: recall logs its read against the agent it ran for.
@@ -288,13 +338,24 @@ async def render_case_view(case_id: str) -> Optional[bytes]:
     """The case as a tar, or None when there is no such case."""
     key = (case_id, *_caller())
     held = _renders.get(key)
+    stamp = None
     if held and held[0] > time.monotonic():
-        return held[1]
+        # Asked again on every hit, so a reader removed inside the TTL is not
+        # served what they could read a moment ago (#4358).
+        may_read, stamp = await asyncio.to_thread(_held_still_good, case_id)
+        if not may_read:
+            _renders.pop(key, None)
+            return None
+        if stamp is not None and stamp == held[1]:
+            return held[2]
+    else:
+        # Taken before the render, so a write during it re-renders next time.
+        stamp = await asyncio.to_thread(_stamp, case_id)
 
     case, records, findings, evidence = await asyncio.to_thread(_records, case_id)
     if case is None:
         return None
-    keys, history = await asyncio.to_thread(_history, findings)
+    keys, history = await asyncio.to_thread(_history, case_id, findings)
     index, texts = await _evidence_files(evidence)
 
     files: Dict[str, str] = {"README.txt": README, "case.json": _json(case)}
@@ -318,7 +379,10 @@ async def render_case_view(case_id: str) -> Optional[bytes]:
         files["entities/history.json"] = _json(history)
 
     view = _tar(files)
-    _renders[key] = (time.monotonic() + RENDER_TTL_S, view)
+    if stamp is None:
+        _renders.pop(key, None)
+        return view
+    _renders[key] = (time.monotonic() + RENDER_TTL_S, stamp, view)
     _renders.move_to_end(key)
     while len(_renders) > RENDERS_KEPT:
         _renders.popitem(last=False)

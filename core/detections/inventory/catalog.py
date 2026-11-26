@@ -29,6 +29,12 @@ One failing lint is keyed to one environment: it is listed and searched, but
 left out of every coverage count (``CREDITED``), and analyze_coverage's by_tool
 counts it as ``lint_failing``. Lint is no flag and no rule_health entry.
 
+A new repo or local rule, or a new version of one (not the overlay's, never a
+SIEM copy), also carries checks['import'] (``import_check``): pending, then
+passed, flagged, failed or approved; unchecked with the check switched off.
+Only passed, approved and unchecked count; a held rule is listed and searched
+(its hit says ``held``), never counted, and by_tool counts it as ``held``.
+
 A flag is a (rule, check) whose latest recorded change went pass -> fail, on a
 rule not removed (a drift flag stays on a removed copy). Nothing to fail, or a
 change to unknown, is no flag; a later change back to pass clears it. It is a
@@ -58,7 +64,10 @@ from core.storage.models import (
     DetectionRuleStage,
     DetectionRuleVersion,
     Finding,
+    FindingMitrePrediction,
+    case_findings,
 )
+from core.time import utcnow
 
 logger = logging.getLogger(__name__)
 
@@ -82,7 +91,17 @@ CAUGHT = DetectionRuleVersion.checks["caught"]["result"].astext
 # environment): listed and searched, never counted as coverage.
 LINT = DetectionRuleVersion.checks["lint"]["result"].astext
 LINT_FAILS = LINT == "fail"
-CREDITED = LINT.is_distinct_from("fail")
+# A new repo rule or version (not the overlay's) is held from coverage until the
+# import check passes or a person approves it (``import_check``); a version
+# stored before the hold has no key and counts.
+IMPORT = DetectionRuleVersion.checks["import"]["result"].astext
+IMPORT_COUNTS = ("passed", "approved", "unchecked")
+IMPORT_HELD = ("pending", "flagged", "failed")
+HELD = IMPORT.in_(IMPORT_HELD)
+# The one predicate for what counts as coverage, everywhere.
+CREDITED = and_(
+    LINT.is_distinct_from("fail"), or_(IMPORT.is_(None), IMPORT.in_(IMPORT_COUNTS))
+)
 # No alert across Quiet's whole 30-day search: a never-firing rule.
 NEVER_FIRED = DetectionRuleVersion.checks["silent"]["days_fired"].astext == "0"
 # The per-tool tally columns _by_tool reads, in order, before the count.
@@ -97,6 +116,7 @@ TALLIED = (
     CAUGHT,
     NEVER_FIRED,
     LINT_FAILS,
+    HELD,
 )
 RUNS_RESULTS = ("pass", "fail", "unknown")
 # The rollout stages a listed copy can be in (#3995).
@@ -223,6 +243,74 @@ def _change_row(c: Any) -> Dict[str, Any]:
     }
 
 
+# caught.py's label for its evidence: "caught in Case <id> (proven, <trust>)",
+# "caught in hunt <id> (...)", "caught in emulation <run id> (compose run on <host>)",
+# and a fail's "missed in emulation <run id> (...)".
+_CAUGHT_IN = re.compile(r"(caught|missed) in (Case|hunt|emulation) (\S+) \([^)]*\)")
+_HIDDEN_CAUGHT = {
+    "case": "a Case you cannot read",
+    "hunt": "a hunt on a Case you cannot read",
+    "emulation": "an emulation on a Case you cannot read",
+}
+# Fields a Caught result names its run by, dropped with the run.
+_CAUGHT_RUN_FIELDS = ("run_id", "hostname")
+
+
+def _caught_of(row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Where a payload row holds a Caught reason: a caught change row itself, its
+    checks' Caught, or a deployed copy's own Caught."""
+    if row.get("check") == CAUGHT_CHECK:
+        return row
+    checks = row.get("checks")
+    held = (
+        checks.get(CAUGHT_CHECK) if isinstance(checks, dict) else row.get(CAUGHT_CHECK)
+    )
+    return held if isinstance(held, dict) else None
+
+
+def redact_caught(session: Any, rows: Iterable[Dict[str, Any]]) -> None:
+    """Each row's Caught reason as the reader may see it (#4718): one naming a Case,
+    or a hunt or emulation run on a Case, the reader cannot read keeps its result,
+    technique and day but names neither (nor the run's id and host fields). Rewrites the payload rows, never the stored checks.
+    """
+    rows = list(rows)
+    runs: Dict[str, Tuple[str, str]] = {}
+    for row in rows:
+        reason = (_caught_of(row) or {}).get("reason")
+        if isinstance(reason, str) and (m := _CAUGHT_IN.search(reason)):
+            runs[reason] = (m.group(2).lower(), m.group(3))
+    if not runs:
+        return
+    from core.detections.gaps import _unreadable_runs
+
+    hidden = _unreadable_runs(
+        session,
+        [
+            {"investigation_kind": kind, "investigation_id": run_id}
+            for kind, run_id in set(runs.values())
+        ],
+    )
+    for row in rows:
+        held = _caught_of(row)
+        run = runs.get((held or {}).get("reason"))
+        if held is None or run not in hidden:
+            continue
+        new = _CAUGHT_IN.sub(
+            lambda m: f"{m.group(1)} in {_HIDDEN_CAUGHT[run[0]]}",
+            held["reason"],
+            count=1,
+        )
+        kept = {k: v for k, v in held.items() if k not in _CAUGHT_RUN_FIELDS} | {
+            "reason": new
+        }
+        if held is row:  # a change row carries no run fields
+            row["reason"] = new
+        elif isinstance(row.get("checks"), dict):
+            row["checks"] = {**row["checks"], CAUGHT_CHECK: kept}
+        else:
+            row[CAUGHT_CHECK] = kept
+
+
 def _latest_join():
     return and_(
         DetectionRuleVersion.rule_id == DetectionRule.id,
@@ -257,7 +345,15 @@ def _summary(
         "description": str(description or "")[:width],
         "file_path": rule.path,
         "checks": checks or {},
+        # Held from coverage by the import check: checks.import says why.
+        "held": held_state(checks) is not None,
     }
+
+
+def held_state(checks: Optional[Dict[str, Any]]) -> Optional[str]:
+    """The import check's result when it holds the version from coverage, else None."""
+    result = ((checks or {}).get("import") or {}).get("result")
+    return result if result in IMPORT_HELD else None
 
 
 def open_flags() -> List[Dict[str, Any]]:
@@ -276,6 +372,8 @@ def open_flags() -> List[Dict[str, Any]]:
             }
             for row in session.execute(_flags()).all()
         ]
+        # A Caught fail names its emulation run and host: hidden as on a rule's row.
+        redact_caught(session, flags)
     flags.sort(key=lambda f: f["since"], reverse=True)
     for flag in flags:
         del flag["changed_at"]
@@ -401,7 +499,9 @@ def recent_changes(rule_id: int, limit: int = RECENT_CHANGES) -> List[Dict[str, 
             .order_by(CHANGE.changed_at.desc(), CHANGE.id.desc())
             .limit(limit)
         ).all()
-        return [_change_row(c) for c in rows]
+        changes = [_change_row(c) for c in rows]
+        redact_caught(session, changes)
+        return changes
 
 
 def _tally(bucket: Dict[str, int], result: Optional[str], count: int) -> None:
@@ -414,7 +514,7 @@ def _siem_tools(session: Any) -> List[str]:
     return sorted(
         session.scalars(
             select(DetectionRule.source)
-            .where(~DetectionRule.source.startswith(REPO_PREFIX), LISTED)
+            .where(DetectionRule.source.in_(LISTING_SIEMS), LISTED)
             .distinct()
         )
     )
@@ -486,19 +586,31 @@ def _by_tool(rows: Iterable[Any]) -> Dict[str, Dict[str, Any]]:
     """(TALLIED..., count) rows as rules per tool, and for a SIEM's its Runs, Sees,
     Quiet, Accurate, Noisy, Silent and Caught, and (where Noisy and Silent run)
     its never-firing rules. A repo or overlay entry counts its rules failing lint
-    (``lint_failing``), which are not coverage."""
+    (``lint_failing``) and those held by the import check (``held``), which are
+    not coverage."""
     out: Dict[str, Dict[str, Any]] = {}
     for *tallied, count in rows:
-        tool, runs, sees, quiet, accurate, noisy, silent, caught, never, lint_fails = (
-            tallied
-        )
+        (
+            tool,
+            runs,
+            sees,
+            quiet,
+            accurate,
+            noisy,
+            silent,
+            caught,
+            never,
+            lint_fails,
+            held,
+        ) = tallied
         entry = out.setdefault(tool, {"rules": 0})
         entry["rules"] += count
         if tool in ("repo", OVERLAY):
             entry["lint_failing"] = entry.get("lint_failing", 0) + (
                 count if lint_fails else 0
             )
-        else:
+            entry["held"] = entry.get("held", 0) + (count if held else 0)
+        elif tool in LISTING_SIEMS:  # a provider inventory has no checks to tally
             for check, result in (
                 ("runs", runs),
                 ("sees", sees),
@@ -532,7 +644,7 @@ def rule_counts() -> Dict[str, int]:
 
 def rules_by_technique() -> Dict[str, Set[int]]:
     """Each technique an active rule declares, and the ids of those rules; a rule
-    failing lint is no coverage and left out."""
+    failing lint or held by the import check is no coverage and left out."""
     technique = func.unnest(DetectionRule.techniques).table_valued("t").alias("t")
     with get_db_manager().session_scope() as session:
         rows = session.execute(
@@ -548,7 +660,7 @@ def rules_by_technique() -> Dict[str, Set[int]]:
 
 def rules_by_tactic() -> Dict[str, int]:
     """How many active rules declare each tactic (only Sigma and Elastic do),
-    leaving out rules failing lint."""
+    leaving out rules failing lint or held."""
     tactic = func.unnest(DetectionRule.tactics).table_valued("t").alias("t")
     with get_db_manager().session_scope() as session:
         rows = session.execute(
@@ -564,7 +676,7 @@ def rules_by_tactic() -> Dict[str, int]:
 
 def techniques_per_language() -> Dict[str, int]:
     """Distinct techniques the active rules of each format declare, leaving out
-    rules failing lint."""
+    rules failing lint or held."""
     technique = func.unnest(DetectionRule.techniques).table_valued("t").alias("t")
     with get_db_manager().session_scope() as session:
         rows = session.execute(
@@ -580,7 +692,8 @@ def techniques_per_language() -> Dict[str, int]:
 
 def rules_for_technique(technique: str, top: int = 5) -> Dict[str, Any]:
     """Active rules declaring ``technique``: the count by format (rules failing lint
-    left out, as they are no coverage) and the first ``top``."""
+    or held left out, as they are no coverage) and the first ``top`` with their stage,
+    what LogLM flagged on it, and the concluded hunts that tested it."""
     declares = DetectionRule.techniques.contains([technique])
     with get_db_manager().session_scope() as session:
         by_source = dict(
@@ -613,14 +726,96 @@ def rules_for_technique(technique: str, top: int = 5) -> Dict[str, Any]:
             _summary(rule, content, checks, 200) for rule, content, checks in first
         ]
         _with_links(session, detections, [rule for rule, _, _ in first])
+        # Each listed rule's current rollout stage, as _stage_fields reads it:
+        # an overlay copy has stage rows, any other rule has none (null).
+        stages = dict(
+            session.execute(
+                select(CURRENT_STAGE.c.rule_id, CURRENT_STAGE.c.stage).where(
+                    CURRENT_STAGE.c.rule_id.in_([d["rule_id"] for d in detections])
+                )
+            ).all()
+        )
+        for detection in detections:
+            detection["stage"] = stages.get(detection["rule_id"])
+        redact_caught(session, detections)
         deployed = _repo_deployed(session, declares)
+        loglm = _loglm_flags(session, technique)
+        earlier = _earlier_hunts(session, technique)
     return {
         "count": sum(by_source.values()),
         "by_source": by_source,
         "by_tool": by_tool,
         "repo_deployed": deployed,
         "detections": detections,
+        "loglm": loglm,
+        "earlier_hunts": earlier,
     }
+
+
+LOGLM_DAYS = 30
+LOGLM_IDS = 5
+EARLIER_HUNTS = 10
+
+
+def _loglm_flags(session: Any, technique: str) -> Dict[str, Any]:
+    """LogLM findings stored in the last LOGLM_DAYS days with a prediction on
+    ``technique``: how many, and the newest few ids. An id linked to a Case the
+    caller can't read (#4359) is left out of the ids; it still counts."""
+    # Here, not at import: core.auth needs the JWT secret, which image builds lack.
+    from core.auth.permissions import case_read_clause
+    from core.storage.models import Case
+
+    flagged = (
+        Finding.data_source == "loglm",
+        Finding.created_at >= utcnow() - timedelta(days=LOGLM_DAYS),
+        select(FindingMitrePrediction.finding_id)
+        .where(
+            FindingMitrePrediction.finding_id == Finding.finding_id,
+            func.upper(FindingMitrePrediction.technique_id) == technique,
+        )
+        .exists(),
+    )
+    restricted = (
+        select(case_findings.c.finding_id)
+        .join(Case, Case.case_id == case_findings.c.case_id)
+        .where(case_findings.c.finding_id == Finding.finding_id, ~case_read_clause())
+        .exists()
+    )
+    count = session.scalar(select(func.count()).select_from(Finding).where(*flagged))
+    ids = session.scalars(
+        select(Finding.finding_id)
+        .where(*flagged, ~restricted)
+        .order_by(Finding.created_at.desc(), Finding.finding_id.desc())
+        .limit(LOGLM_IDS)
+    ).all()
+    return {"days": LOGLM_DAYS, "count": count or 0, "newest": list(ids)}
+
+
+def _earlier_hunts(session: Any, technique: str) -> List[Dict[str, Any]]:
+    """Concluded hunts on ``technique``, newest first, one per hunt with each
+    hypothesis outcome. A hunt whose run the caller can't read is left out by
+    ``list_prior_hunts`` itself."""
+    from core.memory.prior_hunts import list_prior_hunts
+
+    hunts: Dict[str, Dict[str, Any]] = {}
+    skipped: Set[str] = set()
+    for row in list_prior_hunts((), [technique], session=session)["concluded"]:
+        if row["investigation_id"] in skipped:
+            continue
+        hunt = hunts.get(row["investigation_id"])
+        if hunt is None:
+            if len(hunts) == EARLIER_HUNTS:
+                skipped.add(row["investigation_id"])
+                continue
+            hunt = hunts[row["investigation_id"]] = {
+                "origin_run_id": row["origin_run_id"],
+                "concluded_at": row["concluded_at"],
+                "outcomes": [],
+            }
+        hunt["outcomes"].append(
+            {"hypothesis": str(row["statement"] or "")[:200], "outcome": row["outcome"]}
+        )
+    return list(hunts.values())
 
 
 def _repo_deployed(session: Any, declares: Any) -> Dict[str, Dict[str, int]]:
@@ -662,7 +857,11 @@ def siem_checks_by_technique() -> Dict[str, Dict[str, Any]]:
             .select_from(DetectionRule)
             .join(DetectionRuleVersion, _latest_join())
             .join(technique, technique.c.t.isnot(None))
-            .where(ACTIVE, ~DetectionRule.source.startswith(REPO_PREFIX))
+            .where(
+                ACTIVE,
+                ~DetectionRule.source.startswith(REPO_PREFIX),
+                DetectionRule.source.not_in(PROVIDER_SOURCES),
+            )
             .group_by(technique.c.t, RUNS, SEES)
         ).all()
     out: Dict[str, Dict[str, Any]] = {}
@@ -816,6 +1015,7 @@ def rules_not_passing(limit: int = 200) -> Dict[str, Any]:
             }
             for rule, checks in rows
         ]
+        redact_caught(session, rules)
     return {
         "rules": rules,
         "total": sum(t["not_passing"] for t in by_tool.values()),
@@ -913,6 +1113,7 @@ def _fires(session: Any) -> Dict[str, Dict[Any, List[Dict[str, Any]]]]:
                     "data_source": r.data_source,
                     "entity_context": r.entity_context,
                     "timestamp": r.timestamp,
+                    "title": r.title,  # a Defender alert's rule is its title's
                 }
                 for r in rows
             },
@@ -939,6 +1140,8 @@ def _fires(session: Any) -> Dict[str, Dict[Any, List[Dict[str, Any]]]]:
         if found.get("resolved"):
             by_rule.setdefault(found["rule_id"], []).append(hit)
             continue
+        if not _name_answers(r.data_source):
+            continue  # attributed by its provider's rule id or not at all
         context = r.entity_context if isinstance(r.entity_context, dict) else {}
         name = context.get("rule_name") or r.title
         if name:
@@ -954,6 +1157,8 @@ def _fired(
     copy carries (``shared``) can't tell them apart, so its name-only findings
     count on none of them."""
     traced = fires.get("by_rule", {}).get(rule.id, [])
+    if not _name_answers(rule.source):
+        return traced, 0
     named = fires.get("by_name", {}).get(rule.name, [])
     return (traced, len(named)) if shared else (traced + named, 0)
 
@@ -1307,13 +1512,14 @@ def _health_rows(
     # repo origin share one, and are one rule.
     names: Dict[str, set] = {}
     for rule in copies["rows"]:
-        names.setdefault(rule.name, set()).add(rule_of[rule.id])
+        if _name_answers(rule.source):
+            names.setdefault(rule.name, set()).add(rule_of[rule.id])
     mapped = set()
     for rule in copies["rows"]:
         checks = rule.checks or {}
         if rule.techniques:
             mapped.add(rule_of[rule.id])
-        hits, unsure = _fired(fires, rule, len(names[rule.name]) > 1)
+        hits, unsure = _fired(fires, rule, len(names.get(rule.name, ())) > 1)
         fired[rule.id] = hits[:FIRES_LISTED]
         days: Dict[str, int] = {}
         for hit in hits:
@@ -1335,6 +1541,8 @@ def _health_rows(
                 "tool": tool_of(rule.source),
                 "status": rule.status,
                 "techniques": list(rule.techniques or []),
+                # Named in an Emulate's goal: the version a catch proves.
+                "version": rule.latest_version,
                 "where": _where(checks, tool_of(rule.source)),
                 "health": state,
                 "flags": flags,
@@ -1356,6 +1564,13 @@ def _health_rows(
                 # Its active exceptions, and the hits they silenced (#3794).
                 "exceptions": len(excepted.get(rule.id, [])),
                 "silenced": _silenced(checks, excepted.get(rule.id, []), since_day),
+                # The Accurate sweep's judged-false split. The screen reads it
+                # here and does not scan findings.
+                "false_split": _false_split(checks),
+                # The import check on this version (checks['import']): its own key,
+                # as ``held`` here is a person's Revert hold on the stage.
+                "import_result": (checks.get("import") or {}).get("result"),
+                "import_reason": (checks.get("import") or {}).get("reason"),
                 **_stage_fields(rule.id, copies),
             }
         )
@@ -1395,6 +1610,21 @@ def _health_rows(
         "mapped": len(mapped),
         "by_siem": _by_siem(listed),
     }
+
+
+def _false_split(checks: Dict[str, Any]) -> Optional[Dict[str, int]]:
+    """Judged-false counts on an Accurate payload, or None before a sweep wrote them."""
+    # accurate imports this module; the keys live with the sweep that writes them.
+    from core.detections.inventory.accurate import FALSE_SPLIT
+
+    accurate = checks.get("accurate")
+    if not isinstance(accurate, dict) or "not_given" not in accurate:
+        return None
+    out: Dict[str, int] = {}
+    for key in FALSE_SPLIT:
+        value = accurate.get(key, 0)
+        out[key] = value if type(value) is int else 0
+    return out
 
 
 def _stage_fields(rule_id: int, copies: Dict[str, Any]) -> Dict[str, Any]:
@@ -1522,6 +1752,14 @@ def _restaged(
 def _row_flags(row: Dict[str, Any]) -> List[str]:
     """The flag filters a row matches: its failing flags, and Caught if it passed."""
     return row["flags"] + ([CAUGHT_CHECK] if row["caught"] else [])
+
+
+def listing_changed() -> None:
+    """Make the next listing read scan its marks now, not after ``_SCAN_EVERY``:
+    for a write the stage marks don't show (an approval rewrites checks only)."""
+    with _listing_lock:
+        if "scanned" in _listing:
+            _listing["scanned"] = float("-inf")
 
 
 def _listing_now() -> Dict[str, Any]:
@@ -1759,6 +1997,26 @@ def rule_findings(rule_id: int) -> Dict[str, Any]:
     return {"rule_id": rule_id, "total": 0, "days": FIRES_WINDOW_DAYS, "findings": []}
 
 
+def rule_detail(rule_id: int) -> Optional[Dict[str, Any]]:
+    """One active or disabled rule as ``search`` finds it by id (its latest
+    version's stored checks, an overlay rule's stage rows with their proof, its
+    link or deployed copies, its recent check changes), with that version's
+    query, its parsed content and the whole description. None when the rule is
+    not listed."""
+    hits = search("", None, 1, rule_id=rule_id)
+    if not hits:
+        return None
+    hit = hits[0]
+    with get_db_manager().session_scope() as session:
+        version = session.get(DetectionRuleVersion, (rule_id, hit["version"]))
+        content = version.content if version else {}
+        hit["query"] = version.query if version else ""
+    hit["content"] = content
+    description = content.get("description") if isinstance(content, dict) else None
+    hit["description"] = str(description or "")
+    return hit
+
+
 def search(
     query: str,
     language: Optional[str],
@@ -1771,6 +2029,8 @@ def search(
     quiet: Optional[str] = None,
     accurate: Optional[str] = None,
     caught: Optional[str] = None,
+    rule_id: Optional[int] = None,
+    held: Optional[bool] = None,
 ) -> List[Dict]:
     """Active and disabled rules whose format, path or parsed content contains ``query``.
 
@@ -1778,8 +2038,9 @@ def search(
     ``quiet`` and ``accurate`` keep rules whose latest version has that check result;
     ``caught`` 'pass' keeps caught versions, 'untested' the rest; ``stage`` keeps
     rules currently there; ``flagged`` keeps rules with (or without) an open
-    flag. Each hit says whether it is flagged; a single hit carries its recent
-    check changes.
+    flag. ``rule_id`` keeps that one rule. ``held`` keeps rules the import check
+    holds from coverage (or those it does not). Each hit says whether it is
+    flagged and whether it is held; a single hit carries its recent check changes.
     """
     escaped = query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
     haystack = (
@@ -1816,6 +2077,10 @@ def search(
         statement = statement.where(
             CAUGHT.is_(None) if caught == "untested" else CAUGHT == caught
         )
+    if rule_id is not None:
+        statement = statement.where(DetectionRule.id == rule_id)
+    if held is not None:
+        statement = statement.where(HELD if held else HELD.isnot(True))
     flags = _flags().subquery()
     if flagged is not None:
         is_flagged = DetectionRule.id.in_(select(flags.c.rule_id))
@@ -1842,6 +2107,14 @@ def search(
             for hit in overlay:
                 hit["stages"] = history.get(hit["rule_id"], [])
                 hit["stage"] = hit["stages"][-1]["stage"] if hit["stages"] else None
+        copies = [
+            c
+            for hit in hits
+            for listed in (hit.get("deployed") or {}).values()
+            if isinstance(listed, list)
+            for c in listed
+        ]
+        redact_caught(session, hits + copies)
     if len(hits) == 1:
         hits[0]["recent_changes"] = recent_changes(hits[0]["rule_id"])
     return hits
@@ -2007,10 +2280,54 @@ def _splunk_ref(records: List[Any]) -> Any:
     return name, (f"{app}/{name}@{owner}", f"{app}/{name}")
 
 
+_ALERT_RULES = re.compile(r"/alertRules/", re.IGNORECASE)
+
+
+def _sentinel_rule_ids(record: Any) -> List[str]:
+    """The analytic rule names an incident's related_analytic_rule_ids end in,
+    deduplicated: ARM ids cut at the last /alertRules/, a bare name kept."""
+    ids = record.get("related_analytic_rule_ids") if isinstance(record, dict) else None
+    out: Dict[str, None] = {}
+    for value in ids if isinstance(ids, list) else []:
+        if isinstance(value, str) and value.strip():
+            name = _ALERT_RULES.split(value.strip())[-1].strip("/")
+            if name:
+                out[name] = None
+    return list(out)
+
+
+def _sentinel_rule_id(record: Any) -> Optional[str]:
+    """The one analytic rule that raised the incident, or None: of several, none."""
+    ids = _sentinel_rule_ids(record)
+    return ids[0] if len(ids) == 1 else None
+
+
 # Inventory source -> the SIEM a reason names.
-SIEM_NAMES = {"elastic": "Kibana", "wazuh": "Wazuh", "splunk": "Splunk"}
-# The key readers, in order: a Kibana rule wins over a Wazuh one.
-KEY_READERS = (("elastic", _kibana_rule_id), ("wazuh", _wazuh_rule_id))
+SIEM_NAMES = {
+    "elastic": "Kibana",
+    "wazuh": "Wazuh",
+    "splunk": "Splunk",
+    "azure_sentinel": "Sentinel",
+    "microsoft_defender": "Defender",
+}
+DEFENDER = "microsoft_defender"
+# A {{Column}} placeholder in a Defender alert title, filled per alert.
+_PLACEHOLDER = re.compile(r"\{\{.*?\}\}")
+# A finding's data_source -> (inventory source, key reader), in order: a Kibana
+# rule wins over a Wazuh one. Splunk reads its search name in _splunk_ref.
+KEY_READERS = {
+    "elastic": (("elastic", _kibana_rule_id), ("wazuh", _wazuh_rule_id)),
+    "azure_sentinel": (("azure_sentinel", _sentinel_rule_id),),
+}
+# Read-only provider inventories, never traced by a rule name and never checked.
+# Sentinel attributes by the analytic rule id; Defender by an alertTemplate.title
+# exactly one microsoft_defender rule publishes, within that source only.
+PROVIDER_SOURCES = ("azure_sentinel", DEFENDER)
+
+
+def _name_answers(source: Optional[str]) -> bool:
+    """Whether a rule of ``source`` (or a finding from it) can be traced by name."""
+    return source not in PROVIDER_SOURCES
 
 
 def _named(finding: Mapping[str, Any]) -> Optional[Tuple[int, int]]:
@@ -2033,9 +2350,12 @@ def _rule_ref(finding: Mapping[str, Any]) -> Any:
     """(inventory source, native keys to try, alert time, Splunk search name) the
     finding names, or why it is unknown. No keys: match the search name alone."""
     source = finding.get("data_source")
-    if source not in ("elastic", "splunk"):
+    if source == DEFENDER:
+        return _defender_ref(finding)
+    if source != "splunk" and source not in KEY_READERS:
         return _unknown(
-            f"only Kibana, Wazuh and Splunk rules resolve; this finding is from {source}"
+            "only Kibana, Wazuh, Splunk, Sentinel and Defender rules resolve; "
+            f"this finding is from {source}"
         )
     context = finding.get("entity_context")
     evidence = context.get("source_evidence") if isinstance(context, dict) else None
@@ -2048,17 +2368,102 @@ def _rule_ref(finding: Mapping[str, Any]) -> Any:
             return ref
         siem, (name, keys) = "splunk", ref
     else:
-        for siem, read in KEY_READERS:
+        for siem, read in KEY_READERS[source]:
             key = next(filter(None, map(read, records)), None)
             if key is not None:
                 keys = (key,)
                 break
         else:
-            return _unknown("the alert names no Kibana or Wazuh detection rule")
+            if source == "elastic":
+                return _unknown("the alert names no Kibana or Wazuh detection rule")
+            named = max((len(_sentinel_rule_ids(r)) for r in records), default=0)
+            return _unknown(
+                f"the incident names {named} analytic rules, so no one rule raised it"
+                if named > 1
+                else "the incident names no analytic rule id"
+            )
     fired = _when(finding.get("timestamp"))
     if fired is None:
         return _unknown("the finding has no alert time to pick a version by")
     return siem, keys, fired, name
+
+
+def _title(value: Any) -> str:
+    return re.sub(r"\s+", " ", value).strip() if isinstance(value, str) else ""
+
+
+def _defender_ref(finding: Mapping[str, Any]) -> Any:
+    """(DEFENDER, no keys, alert time, alert title) for a custom-detection
+    finding, or why it is unknown: built-in detections are not in the inventory."""
+    context = finding.get("entity_context")
+    detected = context.get("detectionSource") if isinstance(context, dict) else None
+    if not isinstance(detected, str) or detected.casefold() != "customdetection":
+        return _unknown(
+            "only Defender custom detections are listed by "
+            "/security/rules/detectionRules; this finding's detectionSource is "
+            f"{detected or 'absent'}"
+        )
+    title = _title(finding.get("title"))
+    if not title:
+        return _unknown("the Defender custom-detection finding has no title")
+    fired = _when(finding.get("timestamp"))
+    if fired is None:
+        return _unknown("the finding has no alert time to pick a version by")
+    return DEFENDER, (), fired, title
+
+
+def _defender_titles(
+    session: Any,
+) -> Tuple[Dict[str, Dict[int, DetectionRule]], List[Tuple[DetectionRule, str]]]:
+    """Every alert title any stored version of a Defender rule published (its
+    name when the template has none): exact titles to their rules, and the
+    {{placeholder}} templates apart. Removed and disabled rules count."""
+    template = DetectionRuleVersion.content["detectionAction"]["alertTemplate"]
+    exact: Dict[str, Dict[int, DetectionRule]] = {}
+    templates: Dict[Tuple[int, str], DetectionRule] = {}
+    for rule, raw in session.execute(
+        select(DetectionRule, template["title"].astext)
+        .join(DetectionRuleVersion, DetectionRuleVersion.rule_id == DetectionRule.id)
+        .where(DetectionRule.source == DEFENDER)
+    ):
+        title = _title(raw) or _title(rule.name)
+        if _PLACEHOLDER.search(title):
+            templates[(rule.id, title)] = rule
+        elif title:
+            exact.setdefault(title, {})[rule.id] = rule
+    return exact, [(r, t) for (_, t), r in templates.items()]
+
+
+def _defender_match(
+    title: str,
+    exact: Dict[str, Dict[int, DetectionRule]],
+    templates: List[Tuple[DetectionRule, str]],
+) -> Any:
+    """The one Defender rule publishing ``title``, or why there is none."""
+    found = sorted(exact.get(title, {}).values(), key=lambda r: r.native_key)
+    if len(found) == 1:
+        return found[0]
+    if found:
+        out = _unknown(
+            f"{len(found)} Defender custom detections share alertTemplate.title "
+            f"{title!r} (" + ", ".join(f"{r.native_key}: {r.name}" for r in found) + ")"
+        )
+        out["candidates"] = [
+            {"rule_id": r.id, "native_key": r.native_key, "name": r.name} for r in found
+        ]
+        return out
+    for rule, template in templates:
+        pattern = ".+".join(map(re.escape, _PLACEHOLDER.split(template)))
+        if re.fullmatch(pattern, title):
+            return _unknown(
+                "the Defender alert title matches a parameterized template rule "
+                f"({rule.native_key}: {rule.name}) and cannot be attributed "
+                "unambiguously on Graph v1.0"
+            )
+    return _unknown(
+        "no Defender custom detection in the inventory publishes "
+        f"alertTemplate.title {title!r}"
+    )
 
 
 def rule_for_finding(finding: Mapping[str, Any]) -> Dict[str, Any]:
@@ -2072,7 +2477,8 @@ def rule_for_finding(finding: Mapping[str, Any]) -> Dict[str, Any]:
     Splunk notable resolves by its search_name, with app and owner read from its
     orig_sid (its top-level fields, else its _raw stash record); with no
     readable sid, by search_name alone only when exactly one Splunk saved search
-    has that name.
+    has that name. A Sentinel incident resolves by the one analytic rule its
+    related_analytic_rule_ids names.
     """
     if _named(finding) is None:
         ref = _rule_ref(finding)
@@ -2080,7 +2486,9 @@ def rule_for_finding(finding: Mapping[str, Any]) -> Dict[str, Any]:
             return ref  # unknown without reading the inventory
     try:
         with get_db_manager().session_scope() as session:
-            return resolve_findings(session, {0: finding})[0]
+            found = resolve_findings(session, {0: finding})[0]
+            redact_caught(session, [found])
+            return found
     except Exception:  # a finding read must not fail on the inventory
         logger.exception("Could not resolve the rule of a finding")
         return _unknown("the rule inventory could not be read")
@@ -2099,7 +2507,20 @@ def resolve_findings(
         (r[0], key) for r in refs.values() if isinstance(r, tuple) for key in r[1]
     }
     # Splunk notables with no readable sid: matched on the saved search's name.
-    names = {r[3] for r in refs.values() if isinstance(r, tuple) and not r[1]}
+    names = {
+        r[3]
+        for r in refs.values()
+        if isinstance(r, tuple) and not r[1] and r[0] != DEFENDER
+    }
+    # Defender custom detections: matched on the alert title, within Defender.
+    titles: Dict[Any, Any] = {}
+    if any(isinstance(r, tuple) and r[0] == DEFENDER for r in refs.values()):
+        exact, templates = _defender_titles(session)
+        titles = {
+            k: _defender_match(r[3], exact, templates)
+            for k, r in refs.items()
+            if isinstance(r, tuple) and r[0] == DEFENDER
+        }
     rules: Dict[tuple, DetectionRule] = {}
     by_name: Dict[str, List[DetectionRule]] = {}
     versions: Dict[int, List[DetectionRuleVersion]] = {}
@@ -2119,9 +2540,11 @@ def resolve_findings(
             )
         ):
             by_name.setdefault(r.name, []).append(r)
-    ids = {r.id for r in rules.values()} | {
-        r.id for found in by_name.values() for r in found
-    }
+    ids = (
+        {r.id for r in rules.values()}
+        | {r.id for found in by_name.values() for r in found}
+        | {r.id for r in titles.values() if isinstance(r, DetectionRule)}
+    )
     if ids:
         loads = [defer(DetectionRuleVersion.content)]
         if not full:
@@ -2150,6 +2573,14 @@ def resolve_findings(
             out[k] = ref
             continue
         siem, keys, fired, name = ref
+        if siem == DEFENDER:
+            rule = titles[k]
+            out[k] = (
+                _pick(rule, versions.get(rule.id, []), fired, full)
+                if isinstance(rule, DetectionRule)
+                else rule
+            )
+            continue
         if keys:
             rule = next((rules[(siem, n)] for n in keys if (siem, n) in rules), None)
             missing = f"{SIEM_NAMES[siem]} rule {keys[-1]} is not in the inventory"
@@ -2242,6 +2673,7 @@ def case_rules(session: Any, findings: Iterable[Any]) -> Dict[str, Any]:
             "data_source": r.data_source,
             "entity_context": r.entity_context,
             "timestamp": r.timestamp,
+            "title": r.title,
         }
         for r in rows
     }
@@ -2250,6 +2682,7 @@ def case_rules(session: Any, findings: Iterable[Any]) -> Dict[str, Any]:
         r.finding_id: _alert_name(r)
         for r in rows
         if not (resolved.get(r.finding_id) or {}).get("resolved")
+        and _name_answers(r.data_source)
     }
     carriers, versions = _name_carriers(session, {n for n in names.values() if n})
     cards: Dict[Tuple[int, int], Dict[str, Any]] = {}
@@ -2257,7 +2690,8 @@ def case_rules(session: Any, findings: Iterable[Any]) -> Dict[str, Any]:
     for r in rows:
         found = resolved.get(r.finding_id) or _unknown("no rule could be read")
         by_name = False
-        if not found.get("resolved"):
+        # A provider-attributed alert keeps _rule_ref's reason: no name fallback.
+        if not found.get("resolved") and _name_answers(r.data_source):
             alt = _by_name(names[r.finding_id], r.timestamp, carriers, versions)
             if alt.get("resolved"):
                 found, by_name = alt, True
@@ -2287,6 +2721,7 @@ def case_rules(session: Any, findings: Iterable[Any]) -> Dict[str, Any]:
         card["health"] = health
         card["worst"] = _worst(health, card["flags"], card["caught"])
         listed.append(card)
+    redact_caught(session, listed)
     listed.sort(
         key=lambda c: (WORST_ORDER.index(c["worst"]), c["rule_id"], -c["version"])
     )
@@ -2355,7 +2790,11 @@ def _name_carriers(
         return {}, {}
     copies = list(
         session.scalars(
-            select(DetectionRule).where(LISTED, DetectionRule.name.in_(names))
+            select(DetectionRule).where(
+                LISTED,
+                DetectionRule.name.in_(names),
+                DetectionRule.source.not_in(PROVIDER_SOURCES),
+            )
         )
     )
     origin_ids = {

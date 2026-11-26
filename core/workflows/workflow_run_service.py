@@ -3,16 +3,18 @@ from __future__ import annotations
 import logging
 import uuid
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Mapping, Optional
 
-from sqlalchemy import select
+from sqlalchemy import exists, func, select
 from sqlalchemy.exc import SQLAlchemyError
 
+from core.storage.config_service import write_config_audit
 from core.storage.connection import get_db_manager
-from core.storage.models import WorkflowRun, WorkflowRunPhase
+from core.storage.models import Case, WorkflowRun, WorkflowRunPhase
 from core.storage.schemas import WorkflowRunPhaseSchema, WorkflowRunSchema
 from core.telemetry import get_meter
 from core.time import utcnow
+from core.workflows.redecision_hold import MARK
 from core.workflows.run_rating import RATED_STATUS
 
 logger = logging.getLogger(__name__)
@@ -21,6 +23,9 @@ logger = logging.getLogger(__name__)
 LIST_RUNS_MAX = 200
 
 IN_FLIGHT_STATUSES = ("running", "paused")
+
+# duration_ms columns are int4; a longer duration (~24.8 days) is stored as NULL.
+DURATION_MS_MAX = 2_147_483_647
 
 _runs_finished: Any = None
 
@@ -48,6 +53,34 @@ def _as_naive_utc(value: datetime) -> datetime:
     if value.tzinfo is not None:
         return value.astimezone(timezone.utc).replace(tzinfo=None)
     return value
+
+
+def _unreadable():
+    """A run on a restricted case the caller can't read (#4359). A run's case is
+    ``trigger_context.case_id``; the read rule is the case's own."""
+    from core.auth.permissions import case_read_clause
+
+    return exists().where(
+        Case.case_id == WorkflowRun.trigger_context["case_id"].astext,
+        ~case_read_clause(),
+    )
+
+
+def run_hidden(session, run_id: str) -> bool:
+    """Whether ``run_id`` is a run on a case the caller can't read."""
+    return bool(
+        session.execute(
+            select(exists().where(WorkflowRun.run_id == run_id, _unreadable()))
+        ).scalar()
+    )
+
+
+def run_unreadable(run_id: str) -> bool:
+    """``run_hidden`` in its own session, for a caller holding none. A run id
+    read by a tool or forwarded to agent-serve, which keys reads by run id
+    alone, is checked here first."""
+    with get_db_manager().session_scope() as session:
+        return run_hidden(session, run_id)
 
 
 class WorkflowRunService:
@@ -188,6 +221,7 @@ class WorkflowRunService:
         reason: Optional[str] = None,
         stop_cause: Optional[str] = None,
         finished_at: Optional[datetime] = None,
+        facts: Optional[Mapping[str, Any]] = None,
     ) -> bool:
         """Mark a run terminal. ``status`` must be one of the check-
         constrained values: completed | failed | cancelled.
@@ -201,6 +235,10 @@ class WorkflowRunService:
 
         ``finished_at`` is the instant the agent sealed the report. Absent, the
         row is stamped when this write lands.
+
+        ``facts`` is what the report stands on (``capped``, ``citation_count``,
+        ``grounded``), from the bridge's terminal. When given, all three follow it,
+        None included; a caller that finalizes the run itself leaves them as they are.
         """
         if status not in ("completed", "failed", "cancelled"):
             logger.error("finalize_run: invalid status %r", status)
@@ -223,8 +261,7 @@ class WorkflowRunService:
                 row.status = status
                 row.finished_at = now
                 # Truncate result_summary to avoid committing megabyte
-                # prompt transcripts to the DB — full transcripts live
-                # in the reasoning_traces table.
+                # prompt transcripts to the DB.
                 if result_summary is not None:
                     row.result_summary = result_summary[:50_000]
                 if error is not None:
@@ -234,11 +271,15 @@ class WorkflowRunService:
                 if reason is not None:
                     row.reason = str(reason)[:5_000]
                 row.stop_cause = str(stop_cause)[:80] if stop_cause else None
+                if facts is not None:
+                    row.capped = facts.get("capped")
+                    row.citation_count = facts.get("citation_count")
+                    row.grounded = facts.get("grounded")
                 if cost_usd is not None:
                     row.total_cost_usd = cost_usd
                 if row.started_at is not None:
-                    delta = now - row.started_at
-                    row.duration_ms = int(delta.total_seconds() * 1000)
+                    ms = int((now - row.started_at).total_seconds() * 1000)
+                    row.duration_ms = ms if ms <= DURATION_MS_MAX else None
         except SQLAlchemyError as e:
             logger.error("Could not finalise workflow run %s: %s", run_id, e)
             return False
@@ -260,9 +301,14 @@ class WorkflowRunService:
         finished_after: Optional[datetime] = None,
         limit: int = 50,
         offset: int = 0,
+        readable: bool = False,
+        hidden: Optional[List[int]] = None,
     ) -> List[Dict[str, Any]]:
         """List runs, newest first. Does not include the (potentially
         large) ``result_summary`` field — use ``get_run`` for detail.
+
+        ``readable`` leaves out runs on a case the caller can't read; pass a
+        list as ``hidden`` and how many matched but were left out is appended.
 
         ``workflow_source`` filters by how the run was started (e.g. "agent"
         for runs enqueued through the agent-runs API). ``run_kind`` matches
@@ -277,6 +323,11 @@ class WorkflowRunService:
                 # Deleted rows are hidden here rather than dropped from the table:
                 # the ledger behind a run is the only account of what an agent did.
                 stmt = select(WorkflowRun).where(WorkflowRun.deleted_at.is_(None))
+                # Re-decision runs stay out of every listing. A fetch by run id
+                # still returns the ledger.
+                stmt = stmt.where(
+                    WorkflowRun.trigger_context[MARK].astext.is_distinct_from("true")
+                )
                 if workflow_id:
                     stmt = stmt.where(WorkflowRun.workflow_id == workflow_id)
                 if workflow_source:
@@ -303,6 +354,15 @@ class WorkflowRunService:
                     stmt = stmt.where(
                         WorkflowRun.finished_at <= _as_naive_utc(finished_at)
                     )
+                if readable:
+                    if hidden is not None:
+                        left_out = stmt.where(_unreadable())
+                        hidden.append(
+                            session.execute(
+                                select(func.count()).select_from(left_out.subquery())
+                            ).scalar_one()
+                        )
+                    stmt = stmt.where(~_unreadable())
                 stmt = (
                     stmt.order_by(WorkflowRun.started_at.desc())
                     .limit(limit)
@@ -340,12 +400,16 @@ class WorkflowRunService:
             row = session.execute(stmt).scalars().first()
             return WorkflowRunSchema.dump_summary(row) if row else None
 
-    def get_run(self, run_id: str) -> Optional[Dict[str, Any]]:
-        """Get one run with the full ``result_summary`` attached."""
+    def get_run(self, run_id: str, readable: bool = False) -> Optional[Dict[str, Any]]:
+        """Get one run with the full ``result_summary`` attached. With
+        ``readable``, a run on a case the caller can't read is None."""
         try:
             db = get_db_manager()
             with db.session_scope() as session:
-                row = session.get(WorkflowRun, run_id)
+                stmt = select(WorkflowRun).where(WorkflowRun.run_id == run_id)
+                if readable:
+                    stmt = stmt.where(~_unreadable())
+                row = session.execute(stmt).scalars().first()
                 return WorkflowRunSchema.dump(row) if row else None
         except SQLAlchemyError as e:
             logger.warning("Error fetching workflow run %s: %s", run_id, e)
@@ -368,19 +432,34 @@ class WorkflowRunService:
             logger.warning("Error rating workflow runs: %s", e)
             return {}
 
-    def delete_run(self, run_id: str) -> bool:
-        """Hide ``run_id`` from the listings. False when there is no such live run."""
-        try:
-            db = get_db_manager()
-            with db.session_scope() as session:
-                row = session.get(WorkflowRun, run_id)
-                if row is None or row.deleted_at is not None:
-                    return False
-                row.deleted_at = utcnow()
-                return True
-        except SQLAlchemyError as e:
-            logger.warning("Error deleting workflow run %s: %s", run_id, e)
-            return False
+    def delete_run(self, run_id: str, changed_by: Optional[str] = None) -> bool:
+        """Hide ``run_id`` from the listings. False when there is no such live run.
+
+        With ``changed_by``, the trail records who hid it, in the same transaction.
+        A database or trail error raises, so a refused entry is never a "not found".
+        """
+        db = get_db_manager()
+        with db.session_scope() as session:
+            row = session.get(WorkflowRun, run_id)
+            if row is None or row.deleted_at is not None:
+                return False
+            row.deleted_at = utcnow()
+            if changed_by:
+                write_config_audit(
+                    session,
+                    config_type="workflow_run",
+                    config_key=run_id,
+                    action="delete",
+                    old_value={
+                        "workflow_id": row.workflow_id,
+                        "workflow_version": row.workflow_version,
+                        "status": row.status,
+                        "case_id": (row.trigger_context or {}).get("case_id"),
+                    },
+                    new_value={"deleted_at": row.deleted_at.isoformat()},
+                    changed_by=changed_by,
+                )
+            return True
 
     def set_result_summary(self, run_id: str, summary: str) -> bool:
         """Re-render the stored account of a run that has already finished.
@@ -464,8 +543,10 @@ class WorkflowRunService:
                     if finished_at is not None:
                         row.finished_at = finished_at
                         if row.started_at:
-                            delta = finished_at - row.started_at
-                            row.duration_ms = int(delta.total_seconds() * 1000)
+                            ms = int(
+                                (finished_at - row.started_at).total_seconds() * 1000
+                            )
+                            row.duration_ms = ms if ms <= DURATION_MS_MAX else None
             return True
         except SQLAlchemyError as e:
             logger.warning(

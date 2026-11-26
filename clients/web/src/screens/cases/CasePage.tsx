@@ -1,8 +1,9 @@
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { utcClock, utcDay, utcDayClock } from '../../shared/utc'
 import { Link } from 'react-router-dom'
+import { CopyButton } from '../../shared/CopyButton'
 import { analyticsApi, approvalsApi, auditApi, autonomyApi, casesApi, workflowApi, type CaseRecordRow, type Ceiling, type NeedsYouItem, type WorkflowAgreement } from '../../services/api'
-import { actsByDefault, agreementText, workflowTier } from '../../shared/autonomy'
+import { actsByDefault, agreementText, falseCloseText, uncheckedText, workflowTier } from '../../shared/autonomy'
 import { AUTONOMY_CHANGED, notifyAutonomyChanged } from '../settings/useSettings'
 import { FilterChip } from '../../shared/FilterChip'
 import { InfoTip } from '../../shared/InfoTip'
@@ -16,13 +17,21 @@ import { STOP_CAUSES } from '../../shared/stopCause'
 import { StopAction } from '../../shared/StopLine'
 import { StatePill, statePill } from '../../shared/StatePill'
 import { TabStrip } from '../../shared/TabStrip'
+import { CallArgs } from '../../shared/CallArgs'
+import { visibleText } from '../../shared/visibleText'
 import { HoldButton } from '../../shared/HoldButton'
+import { ContainmentTargets } from '../../shared/containment'
+import { canApprove, chosenCandidate, containmentOf, undoable, type Containment } from '../../shared/containmentRead'
+import { CaseContainments } from './CaseContainments'
 import { Icon } from '../../shared/icons'
 import { useToast } from '../../shell/toast'
 import { useFusedDecision } from '../../shell/useFusedDecision'
 import { EmptyState } from '../../shared/ui'
+import { Markdown } from '../../shared/Markdown'
 import { useAuth } from '../../contexts/AuthContext'
-import type { CaseRow } from '../../data/data'
+import type { CaseRecord } from '../../data/data'
+import { RestrictedMark, useReaderNames } from './RestrictCase'
+import { OwnerFix, PersonPicker, isOwnerNotCurrent, usePeople, onTeam } from '../../shared/people'
 import type { ChatSeed } from '../../shared/types'
 import Chat from '../../shell/Chat'
 import { EvidenceTrail, MergedEvidenceTrail } from './EvidenceTrail'
@@ -33,7 +42,7 @@ import { CloseCaseDialog, type ClosureCategory } from './ClosureFields'
 import { CaseSide } from './CaseSide'
 import { caseCitations, evidenceInNote } from './caseCitations'
 import type { Citation } from '../../shell/citations'
-import { errorDetail, runLabel, timeLeft, when } from './caseFormat'
+import { errorDetail, OWNER_CANNOT_READ_NOTE, runLabel, timeLeft, when } from './caseFormat'
 import {
   addedBy,
   agentRows,
@@ -41,6 +50,7 @@ import {
   closureFlag,
   chainOldestFirst,
   endedRun,
+  runReport,
   EVIDENCE_PAGE,
   EXPLANATION_TONE,
   explanationWord,
@@ -74,6 +84,7 @@ import {
 } from './caseFold'
 import './cases.css'
 import { CLOSURE_CATEGORIES, type CaseClosureView, type CaseInvestigationRef, type CaseLinkedFinding, type Phase } from './useCases'
+import { caseLabel } from '../../shared/caseLabel'
 
 const TABS = ['Summary', 'Explanations', 'Evidence', 'Checked', 'Memory and blind spots', 'Record'] as const
 type Tab = (typeof TABS)[number]
@@ -112,25 +123,33 @@ function closedLine(closure: CaseClosureView | null): string {
     .join(' · ')
 }
 
-/** The header's trust strip: how often this workflow's verdict matched a person's closure, last 30 days,
- *  and whether its runs act on their own. The bar is judged against the workflow's floor when it has one. */
+/** The header's trust strip: this workflow's 30-day agreement, its false-close rate, and the share of
+ *  agreements given without opening the evidence. The bar is judged against the workflow's floor when it has one. */
 function TrustStrip({ row, ceiling, workflowId }: { row: WorkflowAgreement | undefined; ceiling: Ceiling | null; workflowId: string | undefined }) {
   const shown = agreementText(row)
   const acts = actsByDefault(ceiling, workflowId) ? ' · acts by default' : ''
-  if (!shown) {
-    return acts ? <span className="case-trust case-trust-on"><NotMeasured />{acts}</span> : <NotMeasured className="case-trust" />
-  }
+  const falseClose = falseCloseText(row)
+  const unchecked = uncheckedText(row)
   const floor = workflowTier(ceiling, workflowId)?.floor
   const tone = floor && row?.agreement_rate != null ? (row.agreement_rate * 100 >= floor ? ' good' : ' poor') : ''
   return (
     <span className="case-trust case-trust-on">
-      <span className={`case-trust-bar${tone}`} aria-hidden><span style={{ width: `${shown.pct}%` }} /></span>
-      {shown.text}{acts}
+      {shown ? (
+        <span className="case-trust-agree">
+          <span className={`case-trust-bar${tone}`} aria-hidden><span style={{ width: `${shown.pct}%` }} /></span>
+          {shown.text}
+        </span>
+      ) : (
+        <NotMeasured />
+      )}
+      {falseClose ? <span>{falseClose}</span> : <NotMeasured label="30 days" />}
+      {unchecked ? <span>{unchecked}</span> : <NotMeasured label="Without evidence" />}
+      {acts}
       <InfoTip
         label="How this is measured"
-        source="Cases closed in the last 30 days that a run of this workflow investigated."
-        calculation="A person's closure, resolved or false positive, scored against the investigation's verdict: the share where both said the same."
-        limit="Leaves out abstentions (inconclusive, needs review), closures without a determination (duplicate, unable to resolve, unspecified) and cases the agent closed alone."
+        source="Cases closed in the last 30 days that a run of this workflow investigated, and the dismissals drawn into the sample in that window."
+        calculation="Agreement is a person's closure, resolved or false positive, against the investigation's verdict: the share where both said the same. False close is answered draws the investigation called not real and the person called real, over those answers, with the 95% Wilson range. Without evidence is agreements given before the Evidence section was opened, over those plus the agreements that opened it."
+        limit="Agreement leaves out abstentions, closures without a determination, cases the agent closed alone, and agreements given without opening the evidence. Nothing answered leaves the false-close rate unmeasured, and no agreement either way leaves the unchecked share unmeasured."
       />
     </span>
   )
@@ -269,6 +288,7 @@ function fromRun(cp: OpenCheckpointRow, caseId: string, runId: string | null): N
     checkpoint_id: cp.checkpoint_id,
     checkpoint_class: cp.checkpoint_class,
     hypotheses: cp.hypotheses,
+    restricted: false,
   }
 }
 
@@ -313,7 +333,7 @@ function CaseNeeds({
   error: string | null
   /** The run's explanations, to say which one an approval tests against when the queue does not. */
   board: HypothesisRow[]
-  onApprove: (item: NeedsYouItem) => void
+  onApprove: (item: NeedsYouItem, candidate?: string) => void
   onReject: (item: NeedsYouItem, reason: string) => void
 }) {
   const [showAll, setShowAll] = useState(false)
@@ -350,7 +370,7 @@ function CaseNeeds({
       {recommended.length > 0 && (
         <div className="needs-more">
           <h3>Recommended actions · {recommended.length}</h3>
-          <p className="needs-note">{recommended.length === 1 ? 'Vigil has no executor for this. Do it' : 'Vigil has no executor for these. Do them'} in your own tools, then close the case.</p>
+          <p className="needs-note">{recommended.length === 1 ? 'Vigil cannot carry this out. Do it' : 'Vigil cannot carry these out. Do them'} in your own tools, then close the case.</p>
           <ul aria-label="Recommended actions">
             {recommended.map((item) => (
               <li key={item.source_id}>
@@ -358,6 +378,11 @@ function CaseNeeds({
                   <span className="needs-row-title">{item.title}</span>
                 </div>
                 {item.reason && <p className="needs-row-reason">{item.reason}</p>}
+                {containmentOf(item.containment) ? (
+                  <ContainmentTargets containment={containmentOf(item.containment)!} picked={null} onPick={() => {}} group={item.source_id} />
+                ) : (
+                  <p className="contain-missing">Vigil has no executor for this kind of action.</p>
+                )}
               </li>
             ))}
           </ul>
@@ -367,21 +392,39 @@ function CaseNeeds({
   )
 }
 
+const UNDOABLE = 'Vigil can undo this'
+
+/** Whether Vigil can undo a containment: the picked carrier's undo, or every carrier's when they agree (#5234). */
+function undoFact(containment: Containment | null, picked: string | null): string | null {
+  const candidates = containment?.candidates ?? []
+  if (candidates.length === 0) return null
+  const chosen = candidates.filter((c) => (picked ? c.id === picked : true))
+  const can = new Set((chosen.length ? chosen : candidates).map(undoable))
+  if (can.size > 1) return 'Depends on the carrier: pick one'
+  return can.has(true) ? UNDOABLE : 'Vigil cannot undo this'
+}
+
 type NeedProps = {
   item: NeedsYouItem
   busy: boolean
   board?: HypothesisRow[]
-  onApprove: (item: NeedsYouItem) => void
+  /** An isolation or account disable sends the resolved candidate it acts on. */
+  onApprove: (item: NeedsYouItem, candidate?: string) => void
   onReject: (item: NeedsYouItem, reason: string) => void
 }
 
-function ApproveButton({ item, busy, onApprove, label }: NeedProps & { label?: string }) {
+/** Approve, sending the picked containment candidate; not shown when nothing resolved, waiting while several await a pick. */
+function ApproveButton({ item, busy, onApprove, label, picked = null }: NeedProps & { label?: string; picked?: string | null }) {
+  const containment = containmentOf(item.containment)
+  if (containment && containment.candidates.length === 0) return null
+  const blocked = busy || !canApprove(containment, picked)
+  const go = () => onApprove(item, chosenCandidate(containment, picked))
   return item.reversibility === 'reversible' ? (
-    <button type="button" className="btn primary" aria-label={label} disabled={busy} onClick={() => onApprove(item)}>
+    <button type="button" className="btn primary" aria-label={label} disabled={blocked} onClick={go}>
       Approve
     </button>
   ) : (
-    <HoldButton label="Hold to approve" name={label && `Hold to approve ${item.title}`} disabled={busy} onConfirm={() => onApprove(item)} />
+    <HoldButton label="Hold to approve" name={label && `Hold to approve ${item.title}`} disabled={blocked} onConfirm={go} />
   )
 }
 
@@ -417,8 +460,10 @@ function RejectForm({ item, busy, onReject }: NeedProps) {
 function CaseNeed(props: NeedProps) {
   const { item, busy, board = [] } = props
   const [rejecting, setRejecting] = useState(false)
+  const [picked, setPicked] = useState<string | null>(null)
   const waited = waiting(item.created_at)
   const approving = approvedRows(item, board)
+  const containment = containmentOf(item.containment)
 
   if (item.kind === 'parked') return <ParkedNeed item={item} waited={waited} />
   return (
@@ -427,7 +472,9 @@ function CaseNeed(props: NeedProps) {
         <span className="needs-dot" aria-hidden="true" />
         Needs your decision{waited && ` · waiting ${waited}`}
       </span>
-      <h3>{item.title}</h3>
+      <h3>{visibleText(item.title)}</h3>
+      <CallArgs tool={item.tool} args={item.args} />
+      {containment && <ContainmentTargets containment={containment} picked={picked} onPick={setPicked} group={item.source_id} />}
       {approving.length > 0 && (
         <ul className="needs-approving" aria-label="What you are approving">
           {approving.map((row, i) => (
@@ -446,10 +493,10 @@ function CaseNeed(props: NeedProps) {
           </>
         )}
         <dt>Reversibility</dt>
-        <dd>{item.reversibility === 'reversible' ? 'Reversible' : 'Cannot be undone'}</dd>
+        <dd>{undoFact(containment, picked) ?? (item.reversibility === 'reversible' ? 'Reversible' : 'Cannot be undone')}</dd>
       </dl>
       <div className="needs-actions">
-        <ApproveButton {...props} />
+        <ApproveButton {...props} picked={picked} />
         <button
           type="button"
           className="btn neutral"
@@ -510,16 +557,20 @@ function ParkedNeed({ item, waited }: { item: NeedsYouItem; waited: string }) {
 function CaseNeedRow(props: NeedProps) {
   const { item, busy } = props
   const [rejecting, setRejecting] = useState(false)
-  const reversible = item.reversibility === 'reversible'
+  const [picked, setPicked] = useState<string | null>(null)
+  const containment = containmentOf(item.containment)
+  // A containment says whether its carrier can be undone; anything else reads its stored class.
+  const fact = undoFact(containment, picked)
+  const reversible = fact ? fact === UNDOABLE : item.reversibility === 'reversible'
   return (
     <li>
       <div className="needs-row">
-        <span className="needs-row-title">{item.title}</span>
+        <span className="needs-row-title">{visibleText(item.title)}</span>
         <span className={reversible ? 'needs-row-rev' : 'needs-row-rev irreversible'}>
-          {reversible ? 'Reversible' : 'Cannot be undone'}
+          {fact ?? (reversible ? 'Reversible' : 'Cannot be undone')}
         </span>
         <div className="needs-actions">
-          <ApproveButton {...props} label={`Approve ${item.title}`} />
+          <ApproveButton {...props} label={`Approve ${item.title}`} picked={picked} />
           <button
             type="button"
             className="btn neutral"
@@ -532,6 +583,8 @@ function CaseNeedRow(props: NeedProps) {
           </button>
         </div>
       </div>
+      <CallArgs tool={item.tool} args={item.args} />
+      {containment && <ContainmentTargets containment={containment} picked={picked} onPick={setPicked} group={item.source_id} />}
       {rejecting && <RejectForm {...props} />}
     </li>
   )
@@ -867,7 +920,7 @@ function AnsweredCard({ answer, watch }: { answer: 'approve' | 'reject' | null; 
   )
 }
 
-/** A run that has ended: its verdicts in one statement, the run's own words behind the ⓘ, and the open
+/** A run that has ended: its verdicts in one statement and the open
  *  question it could not conclude past put to you as a decision rather than buried in prose. */
 function OutcomeCard({ ended, watch, onAsk }: { ended: EndedRun; watch: ReactNode; onAsk: (text: string) => void }) {
   return (
@@ -876,7 +929,6 @@ function OutcomeCard({ ended, watch, onAsk }: { ended: EndedRun; watch: ReactNod
         <div className="stopped-line">
           <b>Ended</b>
           <span className="clamp2" title={ended.line}>{ended.line}</span>
-          {ended.raw && <InfoTip label="What the run reported" text={ended.raw} align="start" />}
           {watch}
         </div>
         {ended.cause && (
@@ -907,6 +959,23 @@ function OutcomeCard({ ended, watch, onAsk }: { ended: EndedRun; watch: ReactNod
         </section>
       )}
     </>
+  )
+}
+
+/** What the latest concluded run reported, as Markdown: a typical report in full, a very long one cut until opened. */
+function ReportCard({ report }: { report: string }) {
+  const [open, setOpen] = useState(false)
+  const long = report.length > 4000 || report.split('\n').length > 50
+  return (
+    <section className="case-card" aria-label="Report">
+      <h3>Report</h3>
+      <div className={`case-report${long && !open ? ' case-report-clamped' : ''}`}><Markdown>{report}</Markdown></div>
+      {long && (
+        <button type="button" className="btn neutral case-report-toggle" onClick={() => setOpen(!open)} aria-expanded={open}>
+          {open ? 'Show less' : 'Show all'}
+        </button>
+      )}
+    </section>
   )
 }
 
@@ -1009,6 +1078,9 @@ export function CasePage({
   investigations,
   closure,
   linkedFindings,
+  openedFrom = null,
+  recheck = null,
+  reviewersDiffer = false,
   phase,
   error,
   pageKey,
@@ -1025,17 +1097,26 @@ export function CasePage({
   canWrite,
   onChanged,
   onRefresh,
+  onClaim,
+  onMove,
+  onRestrict,
 }: {
   id: string
   /** The tab and run to land on; an unknown tab lands on Summary, a run not on the case on All runs. */
   openTab?: string | null
   openRun?: string | null
-  c: CaseRow | null
+  c: CaseRecord | null
   created: string
   combinedState: string
   investigations: CaseInvestigationRef[]
   closure: CaseClosureView | null
   linkedFindings: CaseLinkedFinding[]
+  /** The finding the case was opened from (the first linked). */
+  openedFrom?: string | null
+  /** Set when the Case was opened from a re-check. */
+  recheck?: { source: string; closed_at: string; run_id: string } | null
+  /** A later review disagreed. Names nobody. */
+  reviewersDiffer?: boolean
   phase: Phase
   error: string | null
   /** Route key stored as page_context. Cases passes `cases`; the drawer passes SocConsole's current. */
@@ -1060,9 +1141,18 @@ export function CasePage({
   onChanged: () => void
   /** Re-read the case in place, without blanking it. Used while the run is live. */
   onRefresh?: () => void
+  /** Assign to me, when the caller may take this case. */
+  onClaim?: () => void
+  /** Open the move dialog. A closed case does not. */
+  onMove?: () => void
+  /** Open the restrict dialog: restrict, change readers or lift. */
+  onRestrict?: () => void
 }) {
   const landingTab: Tab = TABS.find((name) => name === openTab) ?? 'Summary'
   const [tab, setTab] = useState<Tab>(landingTab)
+  // True only after this session's tab is Evidence, or a citation focuses an evidence row.
+  // The run fetch on mount does not count. Reset when the case changes.
+  const [evidenceOpened, setEvidenceOpened] = useState(landingTab === 'Evidence')
   const [sla, setSla] = useState<{ due: string; health: string } | null>(null)
   const [workflowNames, setWorkflowNames] = useState<Record<string, string>>({})
   const [rows, setRows] = useState<CaseRecordRow[]>([])
@@ -1076,6 +1166,14 @@ export function CasePage({
   const [runFilter, setRunFilter] = useState<string | null>(openRun ?? null)
   const [askSeed, setAskSeed] = useState<{ id: string; seed: ChatSeed } | null>(null)
   const [focusEvidence, setFocusEvidence] = useState<string | null>(null)
+  const chooseTab = (next: Tab) => {
+    setTab(next)
+    if (next === 'Evidence') setEvidenceOpened(true)
+  }
+  const focusEvidenceRow = (rowId: string) => {
+    setFocusEvidence(rowId)
+    setEvidenceOpened(true)
+  }
   const [note, setNote] = useState('') // Reopen's failure, on Summary
   // Verify chain / Export audit outcome, shown in the Record header; level null while in flight
   const [recStatus, setRecStatus] = useState<{ level: Level; text: string } | null>(null)
@@ -1088,7 +1186,17 @@ export function CasePage({
   const [agreement, setAgreement] = useState<WorkflowAgreement[]>([])
   const [agreementKey, setAgreementKey] = useState(0)
   const [ceiling, setCeiling] = useState<Ceiling | null>(null)
-  const canReadAudit = useAuth().hasPermission('audit.read')
+  const { user, hasPermission } = useAuth()
+  const canReadAudit = hasPermission('audit.read')
+  const canAssign = hasPermission('cases.assign')
+  const me = user?.username ?? ''
+  const { people } = usePeople()
+  const { names: readerNames } = useReaderNames()
+  const member = !!(c?.teamId && people.some((person) => person.username === me && onTeam(person, c.teamId!)))
+  // Reopen's owner: the stored one unless changed here; sent only when changed.
+  const storedOwner = c?.stored.assignee ?? ''
+  const [reopenOwner, setReopenOwner] = useState<string | null>(null)
+  const [reopenStale, setReopenStale] = useState('') // the owner a Reopen was refused over
   const [needsItems, setNeedsItems] = useState<NeedsYouItem[]>([])
   const [needsCount, setNeedsCount] = useState(0)
   const [decisionBusy, setDecisionBusy] = useState<string | null>(null)
@@ -1098,11 +1206,12 @@ export function CasePage({
   // checkpoint that has left the queue while the run still holds it open has been answered.
   const [seenCheckpoints, setSeenCheckpoints] = useState<ReadonlySet<string>>(() => new Set())
   const [answers, setAnswers] = useState<Record<string, 'approve' | 'reject'>>({})
-  const { pending, settled } = useToast()
+  const { pending, settled, notify } = useToast()
   const needsTicket = useRef(0)
   const seenCase = useRef(id)
   if (seenCase.current !== id) {
     seenCase.current = id
+    setEvidenceOpened(landingTab === 'Evidence')
     needsTicket.current += 1
     decisionBusyRef.current = null
     setNeedsItems([])
@@ -1143,7 +1252,7 @@ export function CasePage({
   // Read once per case open (not per poll), and again after a review.
   useEffect(() => {
     let live = true
-    analyticsApi.getAgreement('30d').then((rows) => { if (live) setAgreement(rows) }, () => { if (live) setAgreement([]) })
+    analyticsApi.getAgreement('30d').then((block) => { if (live) setAgreement(block.by_workflow) }, () => { if (live) setAgreement([]) })
     return () => { live = false }
   }, [id, agreementKey])
 
@@ -1163,10 +1272,13 @@ export function CasePage({
 
   useEffect(() => {
     setTab(landingTab)
+    if (landingTab === 'Evidence') setEvidenceOpened(true)
     setAssessed(null)
     setAskSeed(null)
     setFocusEvidence(null)
     setNote('')
+    setReopenOwner(null)
+    setReopenStale('')
     setChip('all')
     setRunFilter(openRun ?? null)
     setEvidenceLimits({})
@@ -1465,11 +1577,11 @@ export function CasePage({
     if (cp) setAnswers((held) => ({ ...held, [cp]: answer }))
   }
 
-  const approve = (item: NeedsYouItem) =>
+  const approve = (item: NeedsYouItem, candidate?: string) =>
     void throughQueue(item, (served) => {
       answered(served, 'approve')
-      if (served.reversibility === 'reversible') fused.approve(served)
-      else void decide(served.source_id, () => approvalsApi.approve(served.source_id))
+      if (served.reversibility === 'reversible') fused.approve(served, candidate)
+      else void decide(served.source_id, () => approvalsApi.approve(served.source_id, candidate))
     })
 
   const reject = (item: NeedsYouItem, reason: string) =>
@@ -1500,15 +1612,38 @@ export function CasePage({
     }
   }
 
-  const reopen = async () => {
+  const handBack = async () => {
+    if (!storedOwner || busy) return
     setBusy(true)
     setNote('')
     try {
-      await casesApi.update(id, { status: 'open' })
-      setAssessed(null)
+      await casesApi.update(id, { assignee: '', expected: { assignee: storedOwner } })
       onChanged()
     } catch (e) {
-      setNote(errorDetail(e, 'Couldn’t reopen the case'))
+      const message = errorDetail(e, 'Couldn’t hand the case back')
+      setNote(message)
+      notify('err', message)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const reopen = async () => {
+    setBusy(true)
+    setNote('')
+    setReopenStale('')
+    const owner = reopenOwner ?? storedOwner
+    try {
+      await casesApi.update(id, {
+        status: 'open',
+        ...(owner !== storedOwner ? { assignee: owner } : {}),
+      })
+      setAssessed(null)
+      setReopenOwner(null)
+      onChanged()
+    } catch (e) {
+      if (isOwnerNotCurrent(e)) setReopenStale(storedOwner)
+      else setNote(errorDetail(e, 'Couldn’t reopen the case'))
     } finally {
       setBusy(false)
     }
@@ -1521,7 +1656,10 @@ export function CasePage({
     setBusy(true)
     setNote('')
     try {
-      await casesApi.closeCase(id, { closure_category: closure.closure_category as ClosureCategory })
+      await casesApi.closeCase(id, {
+        closure_category: closure.closure_category as ClosureCategory,
+        evidence_opened: evidenceOpened,
+      })
       setAssessed('Agreed')
       afterClose()
       onChanged()
@@ -1561,14 +1699,15 @@ export function CasePage({
   const citations = caseCitations(fold, linkedFindings)
   const citeById = new Map(citations.map((cite) => [cite.id, cite]))
   const openCite = (cite: Citation) => {
-    setTab(cite.kind === 'explanation' ? 'Explanations' : 'Evidence')
+    chooseTab(cite.kind === 'explanation' ? 'Explanations' : 'Evidence')
     setRunFilter((held) => (held === runId ? held : null)) // citations point at the primary run
-    if (cite.kind === 'evidence') setFocusEvidence(cite.id)
+    if (cite.kind === 'evidence') focusEvidenceRow(cite.id)
   }
   const left = sla && !closed ? timeLeft(sla.due) : '' // a closed case's clock has stopped
   // Needs you wins; otherwise a run that is paused or stopped says so over the server's combined state.
   const stopped = closed || needsShown > 0 || answeredHere ? null : stoppedRun(fold)
   const ended = closed || needsShown > 0 ? null : endedRun(fold)
+  const report = runReport(fold)
   const pillState = closed ? 'closed' : answeredHere ? (answer === 'reject' ? 'stopped' : 'executing') : stopped?.state ?? pill
   // Full page only: the drawer has its own Escape handler. Escape leaves the page unless something
   // else took the key (a menu or dialog is showing, or a text field has focus). A closed dialog that
@@ -1590,7 +1729,7 @@ export function CasePage({
   }, [onExpand, onClose, onBack])
 
   const watch = <WatchLink runId={runId} />
-  const doors = <Doors counts={tabCounts} lines={doorLines(runs.length > 1 ? runs.map((one) => one.fold) : [fold], foldPhase, runId !== null, rows, recordPhase)} onOpen={setTab} />
+  const doors = <Doors counts={tabCounts} lines={doorLines(runs.length > 1 ? runs.map((one) => one.fold) : [fold], foldPhase, runId !== null, rows, recordPhase)} onOpen={chooseTab} />
   const tone = statePill(pillState, needsShown > 0).tone
   // Running furniture needs a run: a run-less case, or one whose needs item sits in the undo fuse, shows none.
   const running = runId !== null && !closed && !stopped && !ended && !answeredHere && tone !== 'needs'
@@ -1626,6 +1765,8 @@ export function CasePage({
       onReject={reject}
     />
   )
+  // What was approved on this case and where it stands: Release, Enable or Run again (#5060).
+  const containBlock = <CaseContainments key={`contain-${id}`} caseId={id} canDecide={hasPermission('ai_decisions.approve')} refreshKey={needsCount} />
 
   return (
     <div className="detail-pane case-page">
@@ -1636,7 +1777,8 @@ export function CasePage({
         <div className="dh-crumb">
           <button type="button" className="back" onClick={onBack}>Cases</button>
           <span aria-hidden>›</span>
-          <span className="mono">{id.startsWith('case-') ? id : `Case ${id}`}</span>
+          <span className="mono">{caseLabel(id)}</span>
+          <CopyButton text={id} label="case id" />
           <div className="dh-crumb-end">
             {c && <CaseMenu onEdit={onEdit} onMerge={onMerge} onDelete={canDelete ? onDelete : undefined} />}
             {onExpand && (
@@ -1660,12 +1802,35 @@ export function CasePage({
           <>
             <div className="case-title-row">
               <h2>{c.title}</h2>
-              {canWrite && !closed && <button type="button" className="btn primary" onClick={() => setClosing(true)}>Close case</button>}
+              <div className="case-title-actions">
+                {onClaim && (!storedOwner || c.ownerState === 'not_current') && (
+                  <button type="button" className="btn" onClick={onClaim} disabled={busy}>Assign to me</button>
+                )}
+                {canWrite && storedOwner && (storedOwner === me || canAssign) && (
+                  <button type="button" className="btn" onClick={() => void handBack()} disabled={busy}>Hand back</button>
+                )}
+                {onMove && !closed && (member || hasPermission('cases.move')) && (
+                  <button type="button" className="btn" onClick={onMove} disabled={busy}>Move</button>
+                )}
+                {onRestrict && canWrite && (
+                  <button type="button" className="btn" onClick={onRestrict} disabled={busy}>{c.restricted ? 'Readers' : 'Restrict'}</button>
+                )}
+                {canWrite && !closed && <button type="button" className="btn primary" onClick={() => setClosing(true)}>Close case</button>}
+              </div>
             </div>
+            {recheck && (
+              <p className="case-recheck">
+                Opened from a re-check of a ticket closed on {utcDay(recheck.closed_at) || recheck.closed_at} in {recheck.source}.{' '}
+                <Link to={`/workflows?run=${encodeURIComponent(recheck.run_id)}`}>Run</Link>
+                {reviewersDiffer && <span className="differ">Reviewers differ.</span>}
+              </p>
+            )}
             <div className="case-state-line">
               <SeverityMark level={c.prio} />
               <StatePill state={pillState} needs={needsShown > 0} />
               {reason && <span className="case-reason clamp2" title={reason}>{reason}</span>}
+              {c.ownerCannotRead && <span className="owner-note">{OWNER_CANNOT_READ_NOTE}</span>}
+              {c.restricted && <RestrictedMark names={readerNames(c.readers, c.readerTeams)} />}
             </div>
             <div className="dh-meta">
               {latest && <span>{workflowNames[latest.workflow_id] || latest.workflow_name || latest.workflow_id}</span>}
@@ -1704,7 +1869,7 @@ export function CasePage({
           label="Case sections"
           tabs={TABS.map((name) => ({ id: name, label: name, count: name === 'Summary' ? undefined : tabCounts[name] }))}
           active={tab}
-          onChange={setTab}
+          onChange={chooseTab}
         />
       </div>
 
@@ -1716,13 +1881,14 @@ export function CasePage({
             closed ? (
               <>
                 {needsBlock}
+                {containBlock}
                 <section className="case-closed" aria-label="Closed summary">
                   <span className="case-closed-line">
                     {closedLine(closure)}
                   </span>
-                  <h3>{closure?.verdict || '—'}</h3>
+                  <p className="case-closed-verdict">{closure?.verdict || '—'}</p>
                   {verdict && closureFlag(closure, verdict.word) && <VerdictBlock verdict={verdict} card={false} />}
-                  <ClosedRows fold={fold} phase={foldPhase} />
+                  <ClosedRows fold={fold} phase={foldPhase} shown={[report, closure?.verdict ?? '']} />
                   {(canWrite || assessed) && (
                     <div className="case-assess">
                       {(reviewable || assessed) && <span>Your assessment</span>}
@@ -1734,13 +1900,25 @@ export function CasePage({
                       )}
                       {assessed && <span className="case-assess-done">{[assessed, agreementText(workflowAgreement)?.text].filter(Boolean).join(' · ')}</span>}
                       {canWrite && (
-                        <div className="case-actions">
+                        <div className="case-actions case-reopen">
+                          <span className="case-reopen-owner">
+                            <PersonPicker
+                              label="Owner when reopened"
+                              value={reopenOwner ?? storedOwner}
+                              state={reopenOwner === null || reopenOwner === storedOwner ? c?.ownerState : undefined}
+                              onSelect={setReopenOwner}
+                              disabled={!canAssign || busy}
+                              teamId={c?.teamId}
+                            />
+                          </span>
                           <button className="btn" onClick={reopen} disabled={busy}>Reopen</button>
                         </div>
                       )}
+                      {reopenStale && <OwnerFix owner={reopenStale} canChange={canAssign} onAssignToMe={member ? onClaim : undefined} />}
                     </div>
                   )}
                 </section>
+                {report && <ReportCard key={runId} report={report} />}
                 {startedCard}
                 {disagree}
                 {doors}
@@ -1748,12 +1926,14 @@ export function CasePage({
             ) : (
               <>
                 {needsBlock}
+                {containBlock}
                 {verdict && <VerdictBlock verdict={verdict} card />}
                 {startedCard}
                 {running && <NowCard fold={fold} phase={foldPhase} watch={watch} />}
                 {answeredHere && needsShown === 0 && <AnsweredCard answer={answer} watch={watch} />}
                 {stopped && <StoppedCard stopped={stopped} runId={runId} watch={watch} />}
                 {ended && <OutcomeCard ended={ended} watch={watch} onAsk={(text) => setAskSeed({ id, seed: { text } })} />}
+                {report && <ReportCard key={runId} report={report} />}
                 {rootCauseNotStarted && (
                   <section className="case-stopped" aria-label="Root cause">
                     <div className="stopped-line">
@@ -1899,11 +2079,11 @@ export function CasePage({
             </section>
           )}
           {tab === 'Summary' && note && <p className="muted">{note}</p>}
-          <CloseCaseDialog open={closing} id={id} onClose={() => setClosing(false)} onClosed={() => { void loadNeeds(); afterClose(); onChanged() }} />
+          <CloseCaseDialog open={closing} id={id} evidenceOpened={evidenceOpened} onClose={() => setClosing(false)} onClosed={() => { void loadNeeds(); afterClose(); onChanged() }} />
           <CloseCaseDialog
             open={disagreeing}
             id={id}
-            initial={closure?.closure_category === 'false_positive' ? 'resolved' : 'false_positive'}
+            evidenceOpened={evidenceOpened}
             title="Disagree · close it as"
             onClose={() => setDisagreeing(false)}
             onClosed={() => { setAssessed('Disagreed'); afterClose(); onChanged() }}
@@ -1911,7 +2091,7 @@ export function CasePage({
         </div>
 
         <aside className="case-side" aria-label="Case details">
-          <CaseSide key={id} caseId={id} linked={linkedFindings} owner={c?.ownerName || '—'} latest={latest} workflowNames={workflowNames} sla={sla} closed={closed} fold={fold} onWritten={onSideWrite} />
+          <CaseSide key={id} caseId={id} linked={linkedFindings} openedFrom={openedFrom} owner={c ? c.ownerName || 'Unassigned' : '—'} ownerStale={c?.ownerStale ?? false} latest={latest} workflowNames={workflowNames} sla={sla} closed={closed} fold={fold} onWritten={onSideWrite} />
           <details className="case-fold">
             <summary>Files</summary>
             <EvidenceCard caseId={id} title="Files" onWritten={onSideWrite} />
@@ -2254,11 +2434,25 @@ function LaterRow({ title, line }: { title: string; line: string }) {
   )
 }
 
-function ClosedRows({ fold, phase }: { fold: RunFold | null; phase: Phase }) {
+/** Markdown and spacing dropped, so the same text compares equal however it was written. */
+const flat = (text: string) => plainLine(text).replace(/\s+/g, ' ').trim()
+// The disposition word answerText puts before a conclusion's summary.
+const VERDICT_PREFIX = /^(?:Malicious|Suspicious|Benign|False positive|Inconclusive|Needs review) — /
+
+function ClosedRows({ fold, phase, shown }: { fold: RunFold | null; phase: Phase; shown: string[] }) {
   if (phase === 'loading') return <p className="muted">Loading the run…</p>
   if (phase === 'error') return <p className="muted">The run could not be read.</p>
-  const rows = strongestRows(fold)
-  if (rows.length === 0) return <p className="muted">No findings yet.</p>
+  const all = strongestRows(fold)
+  if (all.length === 0) return <p className="muted">No findings yet.</p>
+  // A step-less row is the run's summary under its verdict word; the report or banner already says it.
+  const said = shown.map(flat).filter(Boolean)
+  const rows = all.filter((row) => {
+    if (row.step !== '—') return true
+    const text = flat(row.text.replace(VERDICT_PREFIX, ''))
+    // Short answers ("No", "Benign") appear in any report; only a whole repeated summary is dropped.
+    return text.length < 40 || !said.some((one) => one.includes(text))
+  })
+  if (rows.length === 0) return null
   return (
     <ul className="case-closed-rows">
       {rows.map((row, i) => (

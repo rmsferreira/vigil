@@ -60,20 +60,29 @@ export interface CaseLinkedFinding {
 /** Matches ``CaseRepository`` page size. */
 export const CASE_PAGE_LIMIT = 100
 
+export const CLOSED_BY_VALUES = ['agent', 'person', 'draw'] as const
+export type ClosedByFilter = (typeof CLOSED_BY_VALUES)[number]
+
+export function isClosedBy(value: string | null): value is ClosedByFilter {
+  return value !== null && (CLOSED_BY_VALUES as readonly string[]).includes(value)
+}
+
 export interface CaseFilters {
   query: string
   state: string
   needsYou: boolean
   // open cases that do not need you
   working: boolean
-  // with state 'closed': who closed it
-  closedBy: '' | 'agent' | 'person'
+  // with state 'closed': who closed it. `draw` is a sampled dismissal still on the agent channel.
+  closedBy: '' | ClosedByFilter
   // cases holding an alert created in that span
   alertsFrom: '' | 'today' | 'all'
   kind: string
   priority: string
   sla: '' | 'risk'
   assignee: string
+  // cases with no owner, alongside any assignee
+  unassigned: boolean
   workflow: string
   dataSource: string
   limit: number
@@ -91,6 +100,7 @@ export const INITIAL_CASE_FILTERS: CaseFilters = {
   priority: 'any',
   sla: '',
   assignee: '',
+  unassigned: false,
   workflow: '',
   dataSource: '',
   limit: CASE_PAGE_LIMIT,
@@ -103,6 +113,7 @@ interface CaseStrip {
   closed_today: number
   agent_closure_share: number
   needs_you: number
+  waiting: number
 }
 
 export const EMPTY_STRIP: CaseStrip = {
@@ -111,9 +122,10 @@ export const EMPTY_STRIP: CaseStrip = {
   closed_today: 0,
   agent_closure_share: 0,
   needs_you: 0,
+  waiting: 0,
 }
 
-function toParams(f: CaseFilters) {
+function toParams(f: CaseFilters, teamIds: string[]) {
   const params: NonNullable<Parameters<typeof casesApi.getAll>[0]> = {
     limit: f.limit,
     offset: f.offset,
@@ -127,10 +139,13 @@ function toParams(f: CaseFilters) {
   if (f.kind) params.kind = f.kind
   if (f.priority && f.priority !== 'any') params.priority = f.priority
   if (f.sla === 'risk') params.sla_at_risk = true
-  if (f.assignee.trim()) params.assignee = f.assignee.trim()
+  // exact, as stored: the value comes from the owner list or a ?owner= link
+  if (f.assignee.trim()) params.assignee = f.assignee
+  if (f.unassigned) params.unassigned = true
   if (f.workflow.trim()) params.workflow = f.workflow.trim()
   if (f.dataSource.trim()) params.data_source = f.dataSource.trim()
   if (f.query.trim()) params.query = f.query.trim()
+  if (teamIds.length) params.team = teamIds
   return params
 }
 
@@ -139,9 +154,11 @@ export const CASES_CHANGED = 'vigil:cases-changed'
 /** Tells any mounted case list to reload, e.g. after an edit made in the drawer over it. */
 export const notifyCasesChanged = () => window.dispatchEvent(new Event(CASES_CHANGED))
 
-export function useCases(filters: CaseFilters) {
+export function useCases(filters: CaseFilters, teamIds: string[] | null) {
   const [rows, setRows] = useState<CaseRow[]>([])
   const [total, setTotal] = useState(0)
+  // restricted cases matching the filters that this reader can't see
+  const [hidden, setHidden] = useState(0)
   const [strip, setStrip] = useState<CaseStrip>(EMPTY_STRIP)
   const [phase, setPhase] = useState<Phase>('loading')
   const [error, setError] = useState<string | null>(null)
@@ -154,20 +171,23 @@ export function useCases(filters: CaseFilters) {
   }, [reload])
 
   useEffect(() => {
+    if (teamIds === null) return
     let cancelled = false
     setPhase('loading')
     setError(null)
     casesApi
-      .getAll(toParams(filters))
+      .getAll(toParams(filters, teamIds))
       .then((res) => {
         if (cancelled) return
         const data = res.data as typeof res.data & {
           strip?: CaseStrip
           total?: number
+          restricted_not_counted?: number
         }
         const cases = data.cases ?? []
         setRows(cases.map((c) => mapQueueCase(c)))
         setTotal(data.total ?? cases.length)
+        setHidden(data.restricted_not_counted ?? 0)
         setStrip(data.strip ?? EMPTY_STRIP)
         setPhase('ready')
       })
@@ -179,9 +199,9 @@ export function useCases(filters: CaseFilters) {
     return () => {
       cancelled = true
     }
-  }, [filters, reloadKey])
+  }, [filters, teamIds, reloadKey])
 
-  return { rows, total, strip, phase, error, reload }
+  return { rows, total, hidden, strip, phase, error, reload }
 }
 
 function asInvestigations(raw: unknown): CaseInvestigationRef[] {
@@ -237,11 +257,31 @@ function asClosure(raw: unknown): CaseClosureView | null {
   }
 }
 
+export interface RecheckMark {
+  source: string
+  closed_at: string
+  run_id: string
+}
+
+function asRecheck(raw: unknown): RecheckMark | null {
+  if (!raw || typeof raw !== 'object') return null
+  const o = raw as Record<string, unknown>
+  if (typeof o.run_id !== 'string' || !o.run_id) return null
+  return {
+    source: typeof o.source === 'string' ? o.source : '',
+    closed_at: typeof o.closed_at === 'string' ? o.closed_at : '',
+    run_id: o.run_id,
+  }
+}
+
 type CaseDetailBody = Parameters<typeof mapApiCase>[0] & {
   combined_state?: unknown
   investigations?: unknown
   closure?: unknown
   linked_findings?: unknown
+  opened_from?: unknown
+  recheck?: unknown
+  reviewers_differ?: unknown
 }
 
 export function useCaseDetail(id: string | null) {
@@ -251,6 +291,9 @@ export function useCaseDetail(id: string | null) {
   const [investigations, setInvestigations] = useState<CaseInvestigationRef[]>([])
   const [closure, setClosure] = useState<CaseClosureView | null>(null)
   const [linkedFindings, setLinkedFindings] = useState<CaseLinkedFinding[]>([])
+  const [openedFrom, setOpenedFrom] = useState<string | null>(null)
+  const [recheck, setRecheck] = useState<RecheckMark | null>(null)
+  const [reviewersDiffer, setReviewersDiffer] = useState(false)
   const [phase, setPhase] = useState<Phase>('loading')
   const [error, setError] = useState<string | null>(null)
   const [reloadKey, setReloadKey] = useState(0)
@@ -265,6 +308,9 @@ export function useCaseDetail(id: string | null) {
     setInvestigations(asInvestigations(data.investigations))
     setClosure(asClosure(data.closure))
     setLinkedFindings(asLinkedFindings(data.linked_findings))
+    setOpenedFrom(typeof data.opened_from === 'string' && data.opened_from ? data.opened_from : null)
+    setRecheck(asRecheck(data.recheck))
+    setReviewersDiffer(data.reviewers_differ === true)
     setCreated(utcDayClock(data.created_at) ?? '—')
   }, [])
 
@@ -278,6 +324,9 @@ export function useCaseDetail(id: string | null) {
     setInvestigations([])
     setClosure(null)
     setLinkedFindings([])
+    setOpenedFrom(null)
+    setRecheck(null)
+    setReviewersDiffer(false)
     casesApi
       .getById(id)
       .then((res) => {
@@ -305,5 +354,8 @@ export function useCaseDetail(id: string | null) {
       .catch(() => undefined)
   }, [id, apply])
 
-  return { row, created, combinedState, investigations, closure, linkedFindings, phase, error, reload, refresh }
+  return {
+    row, created, combinedState, investigations, closure, linkedFindings, openedFrom,
+    recheck, reviewersDiffer, phase, error, reload, refresh,
+  }
 }

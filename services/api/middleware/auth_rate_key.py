@@ -76,6 +76,11 @@ def login_rate_key(request: Request) -> str:
     return f"login:missing:{client_host(request)}"
 
 
+def sso_rate_key(request: Request) -> str:
+    """Single sign-on start and callback carry no account until the provider answers."""
+    return f"sso:{client_host(request)}"
+
+
 def refresh_rate_key(request: Request) -> str:
     token = request.cookies.get(REFRESH_COOKIE_NAME) or ""
     if not token:
@@ -102,12 +107,28 @@ def reset_request_rate_key(request: Request) -> str:
     return f"reset-request:missing:{client_host(request)}"
 
 
+def confirm_email_rate_key(request: Request) -> str:
+    token = _body(request).get("token")
+    if isinstance(token, str) and token.strip():
+        digest = hashlib.sha256(token.strip().encode()).hexdigest()
+        return f"email-confirm:{digest}"
+    return f"email-confirm:missing:{client_host(request)}"
+
+
 def reset_confirm_rate_key(request: Request) -> str:
     token = _body(request).get("token")
     if isinstance(token, str) and token.strip():
         digest = hashlib.sha256(token.strip().encode()).hexdigest()
         return f"reset-confirm:{digest}"
     return f"reset-confirm:missing:{client_host(request)}"
+
+
+def invite_rate_key(request: Request) -> str:
+    """One bucket per invite link: its token is in the body, or the GET's header."""
+    token = request.headers.get("x-invite-token") or _body(request).get("token")
+    if isinstance(token, str) and token.strip():
+        return f"invite:{hashlib.sha256(token.strip().encode()).hexdigest()}"
+    return f"invite:missing:{client_host(request)}"
 
 
 def bootstrap_rate_key(request: Request) -> str:

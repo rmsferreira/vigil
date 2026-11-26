@@ -36,6 +36,10 @@ interface User {
   mfa_setup_required?: boolean;
   /** Whether this install offers security keys, and why not when it doesn't. */
   security_keys?: { available: boolean; reason?: string | null };
+  /** Signs in only through SSO: a method change asks to confirm at the provider, not for a password. */
+  sso_only?: boolean;
+  /** The provider's host, for "Confirm at …". */
+  sso_provider?: string | null;
   last_login: string | null;
   login_count: number;
   permissions?: Record<string, boolean>;
@@ -52,6 +56,8 @@ export interface MfaOffer {
   methods: string[];
   securityKey: { options: Record<string, unknown>; challenge: string } | null;
   detail: string;
+  /** A break-glass account: the code goes with a reason, in the same request. */
+  breakGlass: boolean;
 }
 
 export interface LoginResult {
@@ -72,7 +78,9 @@ interface AuthContextType {
   /** Re-reads /auth/me in place, without the loading screen that unmounts the console. */
   refreshUser: () => Promise<void>;
   /** Resolves to fresh recovery codes when the sign-in replaced an old set (show them once), and whether a recovery code removed the person's methods (setup comes next). */
-  login: (usernameOrEmail: string, password: string, mfaCode?: string, key?: KeyAnswer) => Promise<LoginResult>;
+  login: (usernameOrEmail: string, password: string, mfaCode?: string, key?: KeyAnswer, reason?: string) => Promise<LoginResult>;
+  /** The second step after the SSO provider (#4757): no answer yet throws MFA_REQUIRED with the offer, as login's first call does. */
+  finishSso: (mfaCode?: string, key?: KeyAnswer) => Promise<LoginResult>;
   logout: () => Promise<void>;
   hasPermission: (permission: string) => boolean;
 }
@@ -166,7 +174,13 @@ export function AuthProvider({ children }: AuthProviderProps) {
   // person, so re-read who they are and the console moves to setup.
   useEffect(() => onMfaSetupRequired(() => void refreshUser()), [refreshUser]);
 
-  const login = async (usernameOrEmail: string, password: string, mfaCode?: string, key?: KeyAnswer): Promise<LoginResult> => {
+  const login = async (
+    usernameOrEmail: string,
+    password: string,
+    mfaCode?: string,
+    key?: KeyAnswer,
+    reason?: string,
+  ): Promise<LoginResult> => {
     if (DEV_MODE) {
       console.log('DEV_MODE: Bypassing login, using mock user');
       retainChatCache(DEV_USER.user_id);
@@ -174,15 +188,23 @@ export function AuthProvider({ children }: AuthProviderProps) {
       return {};
     }
 
+    return signIn('/auth/login', {
+      username_or_email: usernameOrEmail,
+      password,
+      mfa_code: mfaCode,
+      webauthn: key?.assertion,
+      webauthn_challenge: key?.challenge,
+      reason,
+    });
+  };
+
+  const finishSso = (mfaCode?: string, key?: KeyAnswer) =>
+    signIn('/auth/sso/finish', { mfa_code: mfaCode, webauthn: key?.assertion, webauthn_challenge: key?.challenge });
+
+  const signIn = async (url: string, body: Record<string, unknown>): Promise<LoginResult> => {
     // the backend sets the HttpOnly cookies; only the user comes back in the body
     try {
-      const response = await api.post('/auth/login', {
-        username_or_email: usernameOrEmail,
-        password,
-        mfa_code: mfaCode,
-        webauthn: key?.assertion,
-        webauthn_challenge: key?.challenge,
-      });
+      const response = await api.post(url, body);
 
       if (response.data.user?.user_id) retainChatCache(response.data.user.user_id);
       setSignedOut(null);
@@ -201,6 +223,7 @@ export function AuthProvider({ children }: AuthProviderProps) {
           methods: body?.methods ?? ['authenticator_app'],
           securityKey: body?.security_key ?? null,
           detail: body?.detail ?? '',
+          breakGlass: !!body?.break_glass,
         };
         throw Object.assign(new Error('MFA_REQUIRED', { cause: error }), { offer });
       }
@@ -254,6 +277,7 @@ export function AuthProvider({ children }: AuthProviderProps) {
     retryLoadUser,
     refreshUser,
     login,
+    finishSso,
     logout,
     hasPermission,
   };

@@ -1,4 +1,4 @@
-import { Fragment, createContext, useCallback, useContext, useEffect, useRef, useState } from 'react'
+import { Fragment, createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react'
 import { Link, useNavigate, useSearchParams } from 'react-router-dom'
 import { Icon } from '../../shared/icons'
 import { InfoTip } from '../../shared/InfoTip'
@@ -9,15 +9,19 @@ import { Markdown } from '../../shared/Markdown'
 import { type Workflow, type AgentTemplate, type Skill, prettyHandle, skillUsageText } from '../../data/appData'
 import { useWorkflows, useAgents, useAgentMeta, AgentRowsProvider, useSkills, workflowsOffered, modelSource, type Phase } from './useWorkflowsData'
 import { TITLES } from '../../data/data'
-import { approvalsApi, workflowApi, agentsApi, findingsApi, casesApi, type GeneratedDraft, type ReplayReport } from '../../services/api'
+import { approvalsApi, configApi, workflowApi, type InsiderLeads, agentsApi, findingsApi, casesApi, detectionEngineeringApi, type GeneratedDraft, type HuntDetections as HuntDetectionsRead, type ReplayReport } from '../../services/api'
+import { HuntDetections } from './HuntDetections'
 import DescribeDialog from './DescribeDialog'
 import WorkflowReaderPane from './WorkflowReaderPane'
 import { AgentDrawer } from './AgentDrawer'
 import { SkillDeleteModal, SkillDrawer } from './SkillDrawer'
-import { skillsApi } from '../../services/skillsApi'
+import { SkillLibraryPanel } from './SkillLibraryPanel'
+import { SkillImportDialog } from './SkillImportDialog'
+import { skillsApi, skillsManagedText } from '../../services/skillsApi'
 import { useAuth } from '../../contexts/AuthContext'
+import { ReaderPicker, useReaderNames } from '../cases/RestrictCase'
 import type { ConsoleScreenProps } from '../../shared/types'
-import { Cost } from '../../shared/cost'
+import { Cost, fmtOver } from '../../shared/cost'
 import { STOP_CAUSES, stopCauseOf } from '../../shared/stopCause'
 import { StopLine } from '../../shared/StopLine'
 import { COMMANDS, LIVE_COMMANDS } from '../../shell/commandBarModel'
@@ -27,6 +31,7 @@ import { openSections, shortLabel, type OpenItem, type V3OpenRef, type V3Questio
 import { explanationColor, explanationWord } from '../cases/caseFold'
 import { HypothesisWord, KeepGoing, OpenCheckpoint, bearings, liveGap, provenanceTag, type Bearing } from './huntParts'
 import { pickId } from './runTarget'
+import { ENTITY_TYPES } from './entityTypes'
 import {
   IN_FLIGHT, callLine, errMsg, fmtDuration, investigationOf, runStatusColor, useInvestigateReplay, useRunDetail, verdictOf,
   type HuntCheckpoint, type HuntEvidence, type HuntGap, type HuntHandoff, type HuntMove,
@@ -73,7 +78,7 @@ function useOpenItem(key: 'workflow' | 'agent' | 'skill', tab: WfTab): [string |
   return [params.get(key), set]
 }
 
-export default function WorkflowsScreen({ goSettings }: ConsoleScreenProps) {
+export default function WorkflowsScreen({ goSettings, openChat }: ConsoleScreenProps) {
   // ?tab= picks the opening tab, e.g. Home's "Add a custom skill" step
   const [searchParams, setSearchParams] = useSearchParams()
   const [tab, setTab] = useState<WfTab>(() => tabFrom(searchParams.get('tab')))
@@ -128,7 +133,7 @@ export default function WorkflowsScreen({ goSettings }: ConsoleScreenProps) {
       </div>
       {tab === 'workflows' && drafted && <WorkflowReaderPane draft={drafted.draft} grants={agents.grants} onBack={() => setDrafted(null)} onSave={saveDraft} onChangeDescription={() => setDescribing(drafted.description)} />}
       {tab === 'workflows' && !drafted && (runId ? <RunView key={runId} runId={runId} onBack={backToCatalog} /> : <WorkflowCatalog feed={workflows} onCreate={() => setDescribing('')} goSettings={goSettings} />)}
-      {tab === 'agents' && <AgentsTab feed={agents} onToggled={workflows.reload} />}
+      {tab === 'agents' && <AgentsTab feed={agents} onToggled={workflows.reload} openChat={openChat} />}
       {tab === 'skills' && <SkillsTab feed={skills} workflows={workflows} agents={agents} />}
       {tab === 'commands' && <CommandsTab />}
       {describing !== null && <DescribeDialog initial={describing} onClose={() => setDescribing(null)} onDrafted={(description, draft) => { setDescribing(null); setTab('workflows'); setDrafted({ description, draft }) }} />}
@@ -352,7 +357,9 @@ function WorkflowCatalog({ feed, onCreate, goSettings }: { feed: Feed<Workflow>;
                 onEdit={() => setModal({ kind: 'edit', wf: shown })}
                 onDelete={() => setModal({ kind: 'delete', wf: shown })}
                 onToggled={reload}
-              />
+              >
+                {shown.id === 'threat-hunt' && <InsiderLeadsPanel />}
+              </WorkflowReaderPane>
             </div>
           )}
         </div>
@@ -367,6 +374,75 @@ function WorkflowCatalog({ feed, onCreate, goSettings }: { feed: Feed<Workflow>;
         </div>
       )}
     </>
+  )
+}
+
+const lines = (text: string) => text.split('\n').map((l) => l.trim()).filter(Boolean)
+const EMPTY_LEADS: InsiderLeads = { sources: [], rule_names: [], readers: [], teams: [] }
+
+/** The threat-hunt workflow's insider lead list (#4778): which findings are leads and who reads the
+ *  cases they open. Anyone who can read workflows sees it; automation.write edits it. */
+function InsiderLeadsPanel() {
+  const canWrite = useAuth().hasPermission('automation.write')
+  const { names } = useReaderNames()
+  const [saved, setSaved] = useState<InsiderLeads | null>(null)
+  const [draft, setDraft] = useState<{ sources: string; rule_names: string; readers: string[]; teams: string[] }>({ sources: '', rule_names: '', readers: [], teams: [] })
+  const [loadErr, setLoadErr] = useState<string | null>(null)
+  const [err, setErr] = useState<string | null>(null)
+  const [busy, setBusy] = useState(false)
+  const take = (l: InsiderLeads) => {
+    setSaved(l)
+    setDraft({ sources: l.sources.join('\n'), rule_names: l.rule_names.join('\n'), readers: l.readers, teams: l.teams })
+  }
+  const load = () => {
+    setLoadErr(null)
+    workflowApi.insiderLeads().then((r) => take(r.data), (e) => setLoadErr(errMsg(e)))
+  }
+  useEffect(load, [])
+  const body: InsiderLeads = { sources: lines(draft.sources), rule_names: lines(draft.rule_names), readers: draft.readers, teams: draft.teams }
+  const on = body.sources.length + body.rule_names.length > 0
+  const save = () => {
+    setBusy(true)
+    setErr(null)
+    workflowApi.setInsiderLeads(body).then((r) => take(r.data), (e) => setErr(errMsg(e))).finally(() => setBusy(false))
+  }
+  const view = saved ?? EMPTY_LEADS
+  const text = (list: string[]) => (list.length ? list.join(', ') : 'None')
+  return (
+    <section className="flex flex-col gap-3 rounded-[14px] border border-line bg-bg-1 px-[18px] py-4" aria-label="Insider leads">
+      <div className="flex flex-col gap-1">
+        <h3 className="m-0 text-[13px] leading-[1.35] text-tx" style={{ fontWeight: 650 }}>Insider leads</h3>
+        <p className="m-0 text-[12px] leading-[1.45] text-tx-3">
+          Which findings count as insider leads, and who reads the restricted cases they open. With no sources or rule names, automatic start is off.
+          A restricted hunt started by hand opens its case to you and these readers. Hunt memory on a restricted case stays with the case’s readers.
+        </p>
+      </div>
+      {loadErr && <p role="alert" className="m-0 text-[12px] text-[var(--poor)]">Couldn’t load the lead list: {loadErr} <button className="btn ghost" onClick={load}>Retry</button></p>}
+      {!loadErr && !saved && <p className="m-0 text-[12px] text-tx-3">Loading…</p>}
+      {saved && !canWrite && (
+        <dl className="m-0 grid gap-x-4 gap-y-2 text-[12.5px] [grid-template-columns:max-content_minmax(0,1fr)]">
+          <dt className="text-tx-3">Sources</dt><dd className="m-0 min-w-0 break-words text-tx">{text(view.sources)}</dd>
+          <dt className="text-tx-3">Rule names</dt><dd className="m-0 min-w-0 break-words text-tx">{text(view.rule_names)}</dd>
+          <dt className="text-tx-3">Readers and teams</dt><dd className="m-0 min-w-0 break-words text-tx">{text(names(view.readers, view.teams))}</dd>
+          <dd className="m-0 text-tx-3 [grid-column:1/-1]">Changing this needs automation.write.</dd>
+        </dl>
+      )}
+      {saved && canWrite && (
+        <>
+          <Field label="Sources" textarea mono rows={3} value={draft.sources} onChange={(v) => setDraft((d) => ({ ...d, sources: v }))} placeholder="One per line" hint="A finding whose data source is exactly one of these is a lead." />
+          <Field label="Rule names" textarea rows={3} value={draft.rule_names} onChange={(v) => setDraft((d) => ({ ...d, rule_names: v }))} placeholder="One per line" hint="A finding titled one of these, in any letter case, is a lead." />
+          <div className="flex flex-col gap-1.5">
+            <span className="text-[11px] uppercase tracking-[0.06em] text-tx-3">Who reads the cases</span>
+            <ReaderPicker readers={draft.readers} readerTeams={draft.teams} onReaders={(readers) => setDraft((d) => ({ ...d, readers }))} onTeams={(teams) => setDraft((d) => ({ ...d, teams }))} />
+            <span className="text-[11px] text-tx-3">{on ? 'Needs at least one person or team.' : 'Kept for when a source or rule name is added.'}</span>
+          </div>
+          {err && <p role="alert" className="m-0 text-[12px] text-[var(--poor)]">{err}</p>}
+          <div className="flex justify-end">
+            <button className="btn primary" disabled={busy} onClick={save}>{busy ? 'Saving…' : 'Save lead list'}</button>
+          </div>
+        </>
+      )}
+    </section>
   )
 }
 
@@ -393,6 +469,29 @@ function Field({ label, value, onChange, placeholder, textarea, mono, hint, rows
         <input className={cls} value={value} placeholder={placeholder} onChange={(e) => onChange(e.target.value)} />
       )}
       {hint && <span className="text-[11px] text-tx-3">{hint}</span>}
+    </label>
+  )
+}
+
+/** A declared zone to hunt on, or the whole estate. Shown only when the site declares one. */
+function ZoneField({ zones, value, onChange }: {
+  zones: { name: string; selectors: string[]; description?: string | null }[]
+  value: string
+  onChange: (v: string) => void
+}) {
+  const picked = zones.find((z) => z.name === value)
+  return (
+    <label className="flex flex-col gap-1.5">
+      <span className="text-[11px] uppercase tracking-[0.06em] text-tx-3">Zone</span>
+      <select className={INPUT_CLS} value={value} onChange={(e) => onChange(e.target.value)}>
+        <option value="">No zone: the hunt scopes itself from its hypotheses</option>
+        {zones.map((z) => <option key={z.name} value={z.name}>{z.name}</option>)}
+      </select>
+      <span className="text-[11px] text-tx-3 leading-[1.5] break-words">
+        {picked
+          ? <>Scoped to <span className="font-mono break-all">{picked.selectors.join(', ')}</span>{picked.description ? ` — ${picked.description}` : ''}. Declared blind spots there open as gaps.</>
+          : 'A zone from the site files. The hunt queries what its selectors name.'}
+      </span>
     </label>
   )
 }
@@ -501,7 +600,9 @@ function StartedPreview({ detail }: { detail: WfRunDetail | null }) {
 interface WfLimits {
   /** absent: optional needs nothing answers. The run goes without them and records no gap. */
   capabilities?: { bound: string[]; unbound: string[]; absent?: string[] }
-  budgets?: { max_iterations: number; max_cost_usd: number }
+  budgets?: { max_iterations?: number; max_cost_usd?: number; max_wall_ms?: number }
+  /** Set when WORKFLOW_DEFAULT_WALL_SECONDS is a number outside 60–86400. */
+  wall_note?: string | null
   /** set when a phase's agent is turned off: the server will refuse the run. */
   roles_note?: string | null
   /** exact, zero or unknown — how confidently the model's rate resolved. */
@@ -516,6 +617,22 @@ function turnsHint(asked: string, cost: string, limits: WfLimits | null): string
   const where = cap === undefined || !Number.isFinite(cap) ? '' : ` It stops at $${cap.toFixed(2)} whatever happens.`
   if (turns === undefined) return 'Turns the hunt may take before it stops and reports.'
   return `${turns} turn(s): each is a lead decision, the workers it dispatches and the pass that argues against them.${where}`
+}
+
+/** Working time. The cost ceiling is the one this run will actually use. */
+function wallHint(bad: boolean, ceiling: number | undefined, hunt: boolean, investigate: boolean): string {
+  if (bad) return 'A whole number of minutes from 1 to 1440.'
+  const amount = ceiling !== undefined && Number.isFinite(ceiling) ? ` ($${ceiling.toFixed(2)})` : ''
+  const lines = [
+    'The limit counts working time, and waits on a person are excused.',
+    `The run's cost ceiling${amount} ends the run first if it's reached first.`,
+  ]
+  if (investigate) lines.push('The agent also stops at 24 turns.')
+  if (hunt) {
+    lines.push('Keep going may extend it up to twice that limit or 3 hours, whichever is more.')
+    lines.push('A limit under 90 minutes shortens the hunt\'s starting wall.')
+  }
+  return lines.join(' ')
 }
 
 /** What the run will not be able to look at, said before it costs anything.
@@ -557,13 +674,6 @@ function parsedHypotheses(text: string): string[] {
 function looksUnfinished(line: string): boolean {
   return line.endsWith(':') || /^[a-z]/.test(line)
 }
-
-/** The ten kinds a key can carry, held to the hunt's own closed set by the spec
- *  loader, which refuses anything else rather than coercing it. Spelled here so
- *  the operator is told before submitting, and kept in step with
- *  `plugins/hunt/types.ts` — a list that drifts tells them a key is fine that
- *  no reader will ever query. */
-const ENTITY_TYPES = ['ip', 'domain', 'host', 'url', 'email', 'hash', 'arn', 'aws_key', 'user', 'process']
 
 /** `type:value`, comma separated — the form the hunt already writes an entity in.
  *  Split on the first colon, because a url value carries its own. */
@@ -879,17 +989,29 @@ export function RunModal({ wf, agent = false, onStarted, onWatch, onClose }: {
   const [hypothesis, setHypothesis] = useState('')
   const [subjects, setSubjects] = useState<Record<string, string>>({})
   const [approve, setApprove] = useState(false)
+  const [restricted, setRestricted] = useState(false)
+  const [leadNote, setLeadNote] = useState<string | null>(null) // why the finding gave no proposal
+  const [leading, setLeading] = useState(false)
   const [iterations, setIterations] = useState('')
   const [maxCost, setMaxCost] = useState('')
+  const [maxWall, setMaxWall] = useState('')
   const [starting, setStarting] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [startedId, setStartedId] = useState<string | null>(null) // watched in place, rather than closing
   const [limits, setLimits] = useState<WfLimits | null>(null)
   const [findingOpts, setFindingOpts] = useState<{ id: string; label: string }[]>([])
   const [caseOpts, setCaseOpts] = useState<{ id: string; label: string }[]>([])
+  // The applied site's zones (#5212): a hunt may take one's selectors as its scope.
+  const [zones, setZones] = useState<{ name: string; selectors: string[]; description?: string | null }[]>([])
+  const [zone, setZone] = useState('')
 
   useEffect(() => {
     let cancelled = false
+    if (wf.runKind === 'hunt') {
+      configApi.getSite().then((r) => {
+        if (!cancelled && r.data.declared) setZones(r.data.zones ?? [])
+      }).catch(() => {})
+    }
     findingsApi.getAll({ limit: 50 }).then((r) => {
       if (cancelled) return
       const list = (r.data?.findings || []) as { finding_id: string; title?: string; severity?: string }[]
@@ -918,6 +1040,8 @@ export function RunModal({ wf, agent = false, onStarted, onWatch, onClose }: {
   const turnsBad = iterations.trim() !== '' && (!Number.isInteger(turns) || turns < 1 || turns > 40)
   const cost = Number(maxCost)
   const costBad = maxCost.trim() !== '' && (!Number.isFinite(cost) || cost <= 0 || cost > 100)
+  const wall = Number(maxWall)
+  const wallBad = maxWall.trim() !== '' && (!Number.isInteger(wall) || wall < 1 || wall > 1440)
 
   const params = {
     ...(findingId.trim() && { finding_id: findingId.trim() }),
@@ -933,11 +1057,14 @@ export function RunModal({ wf, agent = false, onStarted, onWatch, onClose }: {
     ...(isHuntLike && Object.keys(asked).length > 0 && { hypothesis_subjects: asked }),
     ...(isHuntLike && !turnsBad && iterations.trim() && { iterations: turns }),
     ...(isHuntLike && !costBad && maxCost.trim() && { max_cost_usd: cost }),
+    ...(!wallBad && maxWall.trim() && { max_wall_minutes: wall }),
     ...(isHuntLike && approve && { approve_hypotheses: true }),
+    ...(isHuntLike && restricted && { restricted: true }),
+    ...(zones.length > 0 && zone && { zone }),
   }
   // Checked on Run, not per keystroke: a button dead through a sentence reads as an argument.
   const needsHypothesis = isHuntLike && hypothesis.trim() === ''
-  const canRun = Object.keys(params).length > 0 && !turnsBad && !costBad && !starting
+  const canRun = Object.keys(params).length > 0 && !turnsBad && !costBad && !wallBad && !starting
 
   // The proposal is an execute body already; it lands in the same three fields the
   // operator would have typed, so Run sends it through the same withTurns build.
@@ -945,6 +1072,28 @@ export function RunModal({ wf, agent = false, onStarted, onWatch, onClose }: {
     setHypothesis(p.hypothesis)
     setSubjects(Object.fromEntries(Object.entries(p.hypothesis_subjects).map(([line, keys]) => [line, keys.join(', ')])))
     setApprove(p.approve_hypotheses === true)
+  }
+
+  // The chosen finding's accounts as hypotheses, on a restricted case. A finding that
+  // names no account gets the server's reason beside the button.
+  const takeLead = async () => {
+    const fid = pickId(findingId, findingOpts)
+    setLeadNote(null)
+    if (!fid) {
+      setLeadNote(fid === null ? `“${findingId.trim()}” is not one alert. Pick it from the list, or paste its ID.` : 'Pick a finding first.')
+      return
+    }
+    setLeading(true)
+    try {
+      const { proposal } = (await workflowApi.leadProposal(fid)).data
+      setFindingId(fid)
+      takeProposal(proposal)
+      setRestricted(proposal.restricted === true)
+    } catch (e) {
+      setLeadNote(errMsg(e))
+    } finally {
+      setLeading(false)
+    }
   }
 
   const run = async () => {
@@ -1022,12 +1171,23 @@ export function RunModal({ wf, agent = false, onStarted, onWatch, onClose }: {
           <Blindness unbound={limits?.capabilities?.unbound ?? []} investigation={isInvestigate} />
         )}
         {isHuntLike && <Absent absent={limits?.capabilities?.absent ?? []} />}
-        <ComboField label="Finding ID" value={findingId} onChange={setFindingId} placeholder="f-20260614-3b5c585e" options={findingOpts} hint={findingOpts.length ? `${findingOpts.length} recent findings — start typing to filter.` : undefined} />
+        <ComboField label="Finding ID" value={findingId} onChange={(v) => { setFindingId(v); setLeadNote(null) }} placeholder="f-20260614-3b5c585e" options={findingOpts} hint={findingOpts.length ? `${findingOpts.length} recent findings — start typing to filter.` : undefined} />
+        {isHuntLike && (
+          <div className="flex flex-wrap items-center gap-2.5">
+            <button className="btn ghost" disabled={leading || !findingId.trim()} onClick={takeLead}>
+              {leading ? 'Reading…' : "From finding's account"}
+            </button>
+            <span className="text-[12px] leading-[1.5]" style={{ color: leadNote ? 'var(--high)' : 'var(--tx-3)' }} data-testid="lead-note">
+              {leadNote ?? 'Fills Hypothesis with the data movement of each account the finding names, and restricts the case.'}
+            </span>
+          </div>
+        )}
         <ComboField label="Case ID" value={caseId} onChange={setCaseId} placeholder="case-2026-0142" options={caseOpts} />
         <Field label="Context" value={context} onChange={setContext} placeholder="Active ransomware on HOST-42…" textarea />
         {isHuntLike && (
           <CoveragePanel entityKeys={Object.values(asked).flat()} onError={setError} onProposal={takeProposal} />
         )}
+        {zones.length > 0 && <ZoneField zones={zones} value={zone} onChange={setZone} />}
         {!agent && <Field
           label="Hypothesis"
           value={hypothesis}
@@ -1062,8 +1222,33 @@ export function RunModal({ wf, agent = false, onStarted, onWatch, onClose }: {
             placeholder={(limits?.budgets?.max_cost_usd ?? 15).toFixed(2)}
             hint={costBad
               ? 'A dollar amount above 0 and no more than 100.'
-              : 'Dollars this run may spend before it stops and reports on what it has. The turn count above is the other ceiling; whichever it reaches first ends the run.'}
+              : "Checked before each model call, so a run can end above it by the cost of the call it was making (which can include retries). Calls that couldn't be priced (up to 3), calls whose usage had to be estimated, and requests a provider billed but Vigil recorded as nothing aren't fully counted. The allowance starts again when a run resumes. The turn count above is the other ceiling; whichever it reaches first ends the run."}
           />
+        )}
+        {limits?.wall_note && (
+          <div className="text-[12.5px] leading-[1.5]" style={{ color: 'var(--high)' }}>{limits.wall_note}</div>
+        )}
+        <Field
+          label="Time limit"
+          value={maxWall}
+          onChange={setMaxWall}
+          placeholder={String(limits?.budgets?.max_wall_ms != null ? Math.round(limits.budgets.max_wall_ms / 60000) : (isHuntLike || wf.runKind === 'root_cause' ? 90 : 30))}
+          hint={wallHint(
+            wallBad,
+            isHuntLike && !costBad && maxCost.trim() ? cost : limits?.budgets?.max_cost_usd,
+            isHuntLike,
+            isInvestigate,
+          )}
+        />
+        {isHuntLike && (
+          <label className="flex items-start gap-2 text-[12.5px] leading-[1.5] text-tx-2 cursor-pointer">
+            <input type="checkbox" className="mt-0.5" checked={restricted} onChange={(e) => setRestricted(e.target.checked)} />
+            <span>
+              Restricted case. Runs on a new case only you can read, or on the restricted
+              case you name — never on the open case that already holds the alert. What the
+              hunt remembers stays with the case's readers.
+            </span>
+          </label>
         )}
         {isHuntLike && (
           <label className="flex items-start gap-2 text-[12.5px] leading-[1.5] text-tx-2 cursor-pointer">
@@ -1110,8 +1295,14 @@ function fmtStarted(iso?: string | null): string {
   return Number.isNaN(d.getTime()) ? '—' : d.toLocaleString()
 }
 
+function hiddenRunsNote(n: number): string {
+  return `${n.toLocaleString()} hidden: ${n === 1 ? 'a run' : 'runs'} on a restricted case you can't read`
+}
+
 export function HistoryModal({ wf, onClose }: { wf: Workflow; onClose: () => void }) {
   const [runs, setRuns] = useState<WfRun[]>([])
+  // runs on a restricted case you can't read: left out, and counted
+  const [hidden, setHidden] = useState(0)
   const [phase, setPhase] = useState<'loading' | 'ready' | 'error'>('loading')
   const [error, setError] = useState<string | null>(null)
 
@@ -1124,6 +1315,7 @@ export function HistoryModal({ wf, onClose }: { wf: Workflow; onClose: () => voi
       .then((res) => {
         if (cancelled) return
         setRuns((res.data?.runs || []) as WfRun[])
+        setHidden(Number(res.data?.hidden) || 0)
         setPhase('ready')
       })
       .catch((e) => {
@@ -1140,7 +1332,10 @@ export function HistoryModal({ wf, onClose }: { wf: Workflow; onClose: () => voi
     <Popup open onClose={onClose} title={`History · ${wf.name}`} width="min(1400px, 94vw)">
       {phase === 'loading' && <EmptyState loading compact icon="clock" title="Loading run history…" />}
       {phase === 'error' && <EmptyState error compact icon="alert" title="Couldn’t load history" body={error} primary={{ label: 'Retry', onClick: load, icon: 'refresh' }} />}
-      {phase === 'ready' && runs.length === 0 && <EmptyState compact icon="clock" title="No runs yet" body="Run this workflow to capture execution history, duration, trigger, and cost." />}
+      {phase === 'ready' && runs.length === 0 && hidden === 0 && <EmptyState compact icon="clock" title="No runs yet" body="Run this workflow to capture execution history, duration, trigger, and cost." />}
+      {phase === 'ready' && hidden > 0 && (
+        <div className="muted text-[12.5px] mb-2">{hiddenRunsNote(hidden)}</div>
+      )}
       {phase === 'ready' && runs.length > 0 && (
         <div className="table-wrap">
           <table className="tbl">
@@ -1632,6 +1827,7 @@ function RunBar({ d, hunt, trace, onSteered }: { d: WfRunDetail; hunt: HuntView 
   const spent = typeof cost === 'number' && ceiling !== undefined && ceiling > 0
     ? Math.min(100, (cost / ceiling) * 100)
     : null
+  const over = typeof cost === 'number' ? fmtOver(cost, ceiling) : ''
   const verdict = verdictOf(d, trace?.reason ?? null)
   const cause = stopCauseOf(d.stop_cause)
   return (
@@ -1646,10 +1842,10 @@ function RunBar({ d, hunt, trace, onSteered }: { d: WfRunDetail; hunt: HuntView 
         <span className="flex-1" />
         <div className="meta">
           {hunt && <span>Iteration <b>{hunt.iteration}</b>{budgets && ` of ${budgets.max_iterations}`}</span>}
-          <span><b><Cost usd={cost} /></b>{typeof cost === 'number' && ceiling !== undefined && ` of $${ceiling.toFixed(2)}`}</span>
+          <span><b><Cost usd={cost} /></b>{typeof cost === 'number' && ceiling !== undefined && ` of $${ceiling.toFixed(2)}${fmtOver(cost, ceiling)}`}</span>
           {spent !== null && (
-            <div className="budget-track" title={`${spent.toFixed(0)}% of the cost ceiling`}>
-              <div className="budget-fill" style={{ width: `${spent}%` }} />
+            <div className="budget-track" title={over ? `Over the cost ceiling${over}` : `${spent.toFixed(0)}% of the cost ceiling`}>
+              <div className="budget-fill" style={{ width: `${spent}%`, ...(over && { background: 'var(--poor)' }) }} />
             </div>
           )}
         </div>
@@ -2413,7 +2609,7 @@ function StopRun({ runId, onStopped }: { runId: string; onStopped: () => void })
   )
 }
 
-type HuntTab = 'memory' | 'hyp' | 'evidence' | 'moves' | 'frontier' | 'gaps' | 'esc' | 'report' | 'next'
+type HuntTab = 'memory' | 'hyp' | 'evidence' | 'moves' | 'frontier' | 'gaps' | 'esc' | 'detections' | 'report' | 'next'
 
 /** Views of one run as tabs rather than stacked tables. A view with nothing in it
  *  is not offered rather than offered empty. */
@@ -2430,6 +2626,8 @@ function HuntTabs({ d, hunt, onReload }: { d: WfRunDetail; hunt: HuntView; onRel
   const steps = hunt.narrative?.next_steps ?? []
   const memory = hunt.recall ?? null
   const remembered = memory === null ? null : recalledCount(memory)
+  const detections = useHuntDetections(d.run_id, !IN_FLIGHT.includes(d.status))
+  const led = detections === null ? 0 : detections.proposals.length + detections.without.length
   const tabs: [HuntTab, string, number | null][] = [
     ['hyp', 'Hypotheses', hunt.hypotheses.length],
     ...(hunt.evidence_count > 0 ? ([['evidence', 'Evidence', hunt.evidence_count]] as [HuntTab, string, number][]) : []),
@@ -2442,6 +2640,8 @@ function HuntTabs({ d, hunt, onReload }: { d: WfRunDetail; hunt: HuntView; onRel
     ...(frontier.length > 0 ? ([['frontier', 'Frontier', frontier.length]] as [HuntTab, string, number][]) : []),
     ...(gaps.length > 0 ? ([['gaps', 'Gaps', gaps.length]] as [HuntTab, string, number][]) : []),
     ...(supervision > 0 ? ([['esc', 'Escalations & checkpoints', supervision]] as [HuntTab, string, number][]) : []),
+    // A concluded hunt's proposals and rules, or why a proven hypothesis got none.
+    ...(led > 0 ? ([['detections', 'Detections', led]] as [HuntTab, string, number][]) : []),
     ['report', 'Report', null],
     ...(steps.length > 0 ? ([['next', 'Next steps', steps.length]] as [HuntTab, string, number][]) : []),
   ]
@@ -2469,6 +2669,7 @@ function HuntTabs({ d, hunt, onReload }: { d: WfRunDetail; hunt: HuntView; onRel
           <HuntCheckpoints checkpoints={checkpoints} />
         </>
       )}
+      {shown === 'detections' && detections !== null && <HuntDetections read={detections} hyp={(id) => <Hyp id={id} />} />}
       {shown === 'report' && (report === ''
         ? <div className="muted text-[12.5px] py-3">The report is written when the hunt reaches a terminal state — completed, cancelled, or stopped at its budget.</div>
         : (
@@ -2485,6 +2686,21 @@ function HuntTabs({ d, hunt, onReload }: { d: WfRunDetail; hunt: HuntView; onRel
       {shown === 'next' && <HuntActions hunt={hunt} />}
     </HypLabels.Provider>
   )
+}
+
+/** What a concluded run led to for detection, once; null while in flight, unread, or not
+ *  readable (no detections.read, or the read failed): the tab is then not offered. */
+export function useHuntDetections(runId: string, concluded: boolean): HuntDetectionsRead | null {
+  const [read, setRead] = useState<HuntDetectionsRead | null>(null)
+  useEffect(() => {
+    if (!concluded) return
+    let live = true
+    detectionEngineeringApi.hunt(runId)
+      .then((res) => { if (live) setRead(res.data) })
+      .catch(() => { if (live) setRead(null) })
+    return () => { live = false }
+  }, [runId, concluded])
+  return concluded ? read : null
 }
 
 /** The account, laid out — what happened, with the tabs carrying the evidence and
@@ -3009,6 +3225,8 @@ interface GateApproval {
   title?: string
   description?: string
   reason?: string
+  restricted?: boolean
+  waiting?: string | null
 }
 
 /** Approve / Reject for a phase the playbook marked approval_required. Same calls
@@ -3068,14 +3286,15 @@ function PhaseGate({ runId, onAnswered }: { runId: string; onAnswered: () => voi
             <div className="muted text-[12px] mt-1">{action.description}</div>
           )}
           {action.reason && <div className="text-[12.5px] mt-1">{action.reason}</div>}
-          <div className="flex gap-2 items-center flex-wrap mt-2">
+          {action.waiting && <div className="muted text-[12px] mt-1">{action.waiting}</div>}
+          {!action.restricted && <div className="flex gap-2 items-center flex-wrap mt-2">
             <button className="btn primary" disabled={busy} onClick={() => settle(action.action_id, approvalsApi.approve(action.action_id))}>
               <Icon name="check2" /> Approve
             </button>
             <button className="btn danger" disabled={busy} onClick={() => setRejectFor(action)}>
               <Icon name="x2" /> Reject
             </button>
-          </div>
+          </div>}
         </div>
       ))}
       {failed && <div className="text-[11.5px] mt-2" style={{ color: 'var(--crit)' }}>{failed}</div>}
@@ -3287,7 +3506,7 @@ function ReportBody({ md }: { md: string }) {
 
 /** queued for the worker holding the ledger, so nothing here is instant — the
  *  panel re-reads rather than claiming the run obeyed */
-function Steer({ runId, hunt, onSteered }: { runId: string; hunt: boolean; onSteered: () => void }) {
+export function Steer({ runId, hunt, onSteered }: { runId: string; hunt: boolean; onSteered: () => void }) {
   const [note, setNote] = useState('')
   const [entity, setEntity] = useState('')
   const [busy, setBusy] = useState<string | null>(null)
@@ -3517,7 +3736,12 @@ function droppedNote(recall: HuntRecall): string | null {
     if (rows.per_key_cap > 0) held.push(`${rows.per_key_cap} ${kind} past one entity's share`)
     if (rows.overall_cap > 0) held.push(`${rows.overall_cap} ${kind} past the read's own limit`)
   }
-  return held.length === 0 ? null : `Some history was not carried: ${held.join(', ')}.`
+  // Not lost: each burst's newest close says how many it stands for on its own row.
+  const collapsed = dropped.verdicts.collapsed ?? 0
+  const lines: string[] = []
+  if (held.length > 0) lines.push(`Some history was not carried: ${held.join(', ')}.`)
+  if (collapsed > 0) lines.push(`${collapsed} verdicts were folded into the newest close of their burst.`)
+  return lines.length === 0 ? null : lines.join(' ')
 }
 
 /** What the hunt was shown before its first decision. Rendered from the payload the
@@ -3604,6 +3828,12 @@ function HuntMemory({ recall }: { recall: HuntRecall }) {
                       <div className="muted text-[11px]">
                         activity {fmtWindow(v.window)}{v.window_source === 'asserted' ? ' (asserted)' : ''} · {v.trust}
                       </div>
+                      {v.burst != null && v.burst.count > 1 && (
+                        <div className="muted text-[11px]">
+                          One of {v.burst.count} same-outcome closes on <span className="mono">{v.burst.entity_key}</span>{' '}
+                          between {fmtStarted(v.burst.first_concluded_at)} and {fmtStarted(v.burst.last_concluded_at)}; the newest is shown.
+                        </div>
+                      )}
                     </td>
                     <td className="mono tight text-[11px]">{v.subject_entities.join(', ')}</td>
                     <td className="tight"><RecalledFromCell row={v} /></td>
@@ -3860,7 +4090,7 @@ const SUCCESS_TIP = {
 const ASSIGNMENT_NOTE = 'Workflow runs use the investigation assignment in Settings › AI models.'
 
 /** `onToggled` runs after an agent is switched, so the workflow cards (which say when an agent they need is off) read the new state. */
-function AgentsTab({ feed, onToggled }: { feed: Feed<AgentTemplate>; onToggled: () => void }) {
+function AgentsTab({ feed, onToggled, openChat }: { feed: Feed<AgentTemplate>; onToggled: () => void; openChat: ConsoleScreenProps['openChat'] }) {
   const { rows, phase, error, reload } = feed
   const [editId, setEditId] = useOpenItem('agent', 'agents')
   const [creating, setCreating] = useState<false | 'blank' | 'describe'>(false)
@@ -3878,6 +4108,7 @@ function AgentsTab({ feed, onToggled }: { feed: Feed<AgentTemplate>; onToggled: 
   const ordered = [...builtins, ...rows.filter((a) => a.custom)]
   // by id, not by row: a fresh copy is open before the reloaded list has it
   const builtinOpen = !!editId && !editId.startsWith('custom-')
+  const editOpen = editId ? rows.find((a) => a.handle === editId) : undefined
 
   const setEnabled = (a: AgentTemplate, on: boolean) => {
     setToggleErr(null)
@@ -3936,6 +4167,11 @@ function AgentsTab({ feed, onToggled }: { feed: Feed<AgentTemplate>; onToggled: 
           describe={creating === 'describe'}
           seedFrom={editId ? null : copyOf}
           toolChanges={rows.find((a) => a.handle === editId)?.toolChanges}
+          // offered while the agent is on: chat refuses one that is off
+          onAsk={editOpen && (enabledNow[editOpen.handle] ?? editOpen.enabled) ? () => {
+            setEditId(null)
+            openChat(undefined, { agent: { id: editOpen.handle, name: editOpen.name } })
+          } : undefined}
           onClose={() => { setEditId(null); setCreating(false); setCopyOf(null) }}
           onSaved={(saved) => {
             // a built-in's fork reopens on the new agent; any other save closes
@@ -4062,7 +4298,7 @@ function AgentDeleteModal({ agent, onClose, onDeleted }: { agent: AgentTemplate;
   )
 }
 
-const SKILL_GRANT_INFO = 'Each of these is offered the whole library, not a chosen set. How much each skill is used is on its card.'
+const SKILL_GRANT_INFO = 'Each of these is offered the whole library, not a chosen set. Every workflow run except playbooks is also offered the skills you add, beside the built-in ones its kind uses. How much each skill is used is on its card.'
 const SKILL_USAGE_INFO = 'Reads of the skill body by an agent, counted over the last 7 days. Reads of a supporting file do not count again.'
 
 // The card's usage line (#1560): skill reads are recorded now, so this
@@ -4076,6 +4312,30 @@ function SkillUsage({ skill, align }: { skill: Skill; align: 'start' | 'end' }) 
   )
 }
 
+// Skills installed from one repo folder at one ref share a card; a lone one stays a plain card.
+type SkillCard = { kind: 'skill'; skill: Skill } | { kind: 'library'; key: string; skills: Skill[] }
+
+function groupSkillCards(rows: Skill[]): SkillCard[] {
+  const key = (s: Skill) => (s.library ? JSON.stringify([s.library.label, s.library.ref, s.library.path]) : null)
+  const groups = new Map<string, Skill[]>()
+  for (const s of rows) {
+    const k = key(s)
+    if (k) groups.set(k, [...(groups.get(k) ?? []), s])
+  }
+  const out: SkillCard[] = []
+  const placed = new Set<string>()
+  for (const s of rows) {
+    const k = key(s)
+    const members = k ? groups.get(k)! : []
+    if (!k || members.length < 2) out.push({ kind: 'skill', skill: s })
+    else if (!placed.has(k)) {
+      placed.add(k)
+      out.push({ kind: 'library', key: k, skills: members })
+    }
+  }
+  return out
+}
+
 function SkillsTab({ feed, workflows, agents }: { feed: Feed<Skill>; workflows: Feed<Workflow>; agents: ReturnType<typeof useAgents> }) {
   const { rows, phase, error, reload } = feed
   // Saving, importing and deleting answer 403 without it.
@@ -4083,22 +4343,39 @@ function SkillsTab({ feed, workflows, agents }: { feed: Feed<Skill>; workflows: 
   const [editName, setEditName] = useOpenItem('skill', 'skills')
   const [building, setBuilding] = useState(false)
   const [deleteSkill, setDeleteSkill] = useState<Skill | null>(null)
+  const [deleteLibrary, setDeleteLibrary] = useState<Skill | null>(null)
+  const [libraryKey, setLibraryKey] = useState<string | null>(null)
   const [importing, setImporting] = useState(false)
-  const [importError, setImportError] = useState<string | null>(null)
+  const [importOpen, setImportOpen] = useState(false)
+  // One line under the bar: the import's error, or which skills a zip of several installed
+  // and how many it skipped.
+  const [importNotice, setImportNotice] = useState<{ text: string; error: boolean } | null>(null)
   const fileInput = useRef<HTMLInputElement>(null)
   const offered = workflows.phase === 'ready' && agents.phase === 'ready'
     ? workflowsOffered(workflows.rows, agents.grants)
     : null
   const offeredText = offered === null ? '…' : offered.join(', ')
+  const cards = useMemo(() => groupSkillCards(rows), [rows])
+  // Skills under the declared directory change by commit there; every write control is off with this reason.
+  const managed = rows.find((r) => r.managed)?.managed ?? null
+  const managedText = managed ? skillsManagedText(managed) : undefined
+  const openLibrary = cards.find((c): c is Extract<SkillCard, { kind: 'library' }> => c.kind === 'library' && c.key === libraryKey)
 
   const importFile = (file: File | undefined) => {
     if (!file) return
     setImporting(true)
-    setImportError(null)
+    setImportNotice(null)
     skillsApi
       .upload(file)
-      .then((skill) => { reload(); setEditName(skill.name) })
-      .catch((e) => setImportError(e?.response?.data?.detail || e?.message || 'Could not import the skill'))
+      .then(({ skills, skipped_note }) => {
+        reload()
+        if (skills.length === 1) setEditName(skills[0].name)
+        if (skills.length > 1 || skipped_note) {
+          const names = `Imported ${skills.length} skill${skills.length === 1 ? '' : 's'}: ${skills.map((s) => s.name).join(', ')}`
+          setImportNotice({ text: skipped_note ? `${names}; ${skipped_note}` : names, error: false })
+        }
+      })
+      .catch((e) => setImportNotice({ text: e?.response?.data?.detail || e?.message || 'Could not import the skill', error: true }))
       .finally(() => setImporting(false))
   }
 
@@ -4116,40 +4393,85 @@ function SkillsTab({ feed, workflows, agents }: { feed: Feed<Skill>; workflows: 
         {canWrite && (
           <>
             <input ref={fileInput} type="file" accept=".md,.zip" hidden aria-label="Skill file" onChange={(e) => { importFile(e.target.files?.[0]); e.target.value = '' }} />
-            <button className="btn ghost h-[34px] rounded-[10px] font-semibold shrink-0" disabled={phase !== 'ready' || importing} style={{ borderColor: 'var(--ln2)', color: 'var(--tx0)', opacity: phase === 'ready' && !importing ? 1 : 0.5 }} onClick={() => fileInput.current?.click()}><Icon name="upload" /> {importing ? 'Importing…' : 'Import SKILL.md or zip'}</button>
-            <button className="btn primary h-[34px] rounded-[10px] font-semibold" disabled={phase !== 'ready'} onClick={() => setBuilding(true)}><Icon name="sparkle" /> Build a skill</button>
+            <button className="btn ghost h-[34px] rounded-[10px] font-semibold shrink-0" disabled={phase !== 'ready' || importing || !!managed} title={managedText} style={{ borderColor: 'var(--ln2)', color: 'var(--tx0)', opacity: phase === 'ready' && !importing && !managed ? 1 : 0.5 }} onClick={() => setImportOpen(true)}><Icon name="upload" /> {importing ? 'Importing…' : 'Import'}</button>
+            <button className="btn primary h-[34px] rounded-[10px] font-semibold" disabled={phase !== 'ready' || !!managed} title={managedText} onClick={() => setBuilding(true)}><Icon name="sparkle" /> Build a skill</button>
           </>
         )}
       </div>
-      {importError && <div role="alert" className="px-[22px] pt-2 text-[12.5px]" style={{ color: 'var(--crit)' }}>{importError}</div>}
+      {managed && (
+        <div role="status" className="px-[22px] pt-2 text-[12.5px] text-tx-2 break-words">
+          Managed by <span className="mono break-all">{managed.directory}</span> at <span className="mono break-all">{managed.revision}</span>. Change these skills by committing there; Vigil does not save, import, update or delete them.
+        </div>
+      )}
+      {importNotice && (
+        <div role={importNotice.error ? 'alert' : 'status'} className={`px-[22px] pt-2 text-[12.5px]${importNotice.error ? '' : ' text-tx-2'}`} style={importNotice.error ? { color: 'var(--crit)' } : undefined}>{importNotice.text}</div>
+      )}
       {phase === 'loading' && <StateMsg><EmptyState loading compact icon="sparkle" title="Loading skills…" /></StateMsg>}
       {phase === 'error' && <StateMsg><EmptyState error icon="alert" title="Couldn’t load skills" body={error} primary={{ label: 'Retry', onClick: reload, icon: 'refresh' }} /></StateMsg>}
       {phase === 'ready' && rows.length === 0 && <StateMsg><EmptyState icon="sparkle" title="No skills found" body="Add skill files to the repository or the mounted skills directory and refresh." primary={{ label: 'Refresh', onClick: reload, icon: 'refresh' }} /></StateMsg>}
       {phase === 'ready' && rows.length > 0 && (
         <div className="grid gap-x-5 gap-y-[26px] px-[22px] pt-4 pb-24 [grid-template-columns:repeat(4,minmax(0,1fr))]">
-          {rows.map((s, i) => (
-            <div className={`sk-card${s.bundled ? '' : ' sk-custom'}`} key={s.id}>
-              <button type="button" className="sk-open" aria-label={`Edit ${s.name}`} onClick={() => setEditName(s.name)}>
-                <span className="sk-folder" aria-hidden="true">
-                  <span className="sk-tab" />
-                  <span className="sk-back" />
-                  <span className="sk-paper"><span className="sk-paper-name">SKILL.md</span><i /><i /><i /></span>
-                  <span className="sk-flap"><span className="sk-origin">{s.bundled ? 'Built in' : 'Yours'}</span><span className="sk-files">{s.fileCount} {s.fileCount === 1 ? 'file' : 'files'}</span></span>
-                </span>
-                <span className="sk-text">
-                  <span className="sk-name" title={s.name}>{s.name}</span>
-                  <span className="sk-desc" title={s.desc}>{s.desc}</span>
-                </span>
-              </button>
-              <div className="sk-meta">
-                {/* the last of the four columns opens its popover leftwards to stay on screen */}
-                <SkillUsage skill={s} align={i % 4 === 3 ? 'end' : 'start'} />
-                {s.bundled
-                  ? <span className="sk-ro">Read-only</span>
-                  : canWrite && <button className="btn ghost" onClick={() => setDeleteSkill(s)}>Delete</button>}
+          {cards.map((c, i) => {
+            // the last of the four columns opens its popover leftwards to stay on screen
+            const align = i % 4 === 3 ? 'end' : 'start'
+            if (c.kind === 'library') {
+              const first = c.skills[0]
+              const lib = first.library!
+              const heldCount = c.skills.filter((m) => m.held).length
+              // Agents are counted per skill, so the library shows the busiest skill's count, not a sum.
+              const usage: Skill = { ...first, reads7d: c.skills.reduce((n, m) => n + m.reads7d, 0), agents7d: Math.max(...c.skills.map((m) => m.agents7d)) }
+              const names = c.skills.map((m) => m.name).join(', ')
+              return (
+                <div className="sk-card sk-custom sk-lib" key={c.key}>
+                  <button type="button" className="sk-open" aria-label={`Open ${lib.label}`} onClick={() => setLibraryKey(c.key)}>
+                    <span className="sk-folder" aria-hidden="true">
+                      <span className="sk-ghost g1" />
+                      {c.skills.length >= 3 && <span className="sk-ghost g2" />}
+                      <span className="sk-tab" />
+                      <span className="sk-back" />
+                      <span className="sk-paper"><span className="sk-paper-name">SKILL.md</span><i /><i /><i /></span>
+                      <span className="sk-flap"><span className="sk-origin" title={heldCount > 0 ? 'Held: agents cannot use these skills until their scan clears them or someone approves them. Open the library to see which.' : undefined}>{heldCount > 0 ? `Held · ${heldCount}` : 'Yours'}</span><span className="sk-files">{c.skills.length} skills</span></span>
+                    </span>
+                    <span className="sk-text">
+                      <span className="sk-name" title={lib.label}>{lib.label}</span>
+                      <span className="sk-desc" title={names}>{names}</span>
+                    </span>
+                  </button>
+                  <div className="sk-meta">
+                    <SkillUsage skill={usage} align={align} />
+                    {managed
+                      ? <span className="sk-ro" title={managedText}>Managed</span>
+                      : canWrite && <button className="btn ghost" onClick={() => setDeleteLibrary(first)}>Delete</button>}
+                  </div>
+                </div>
+              )
+            }
+            const s = c.skill
+            return (
+              <div className={`sk-card${s.bundled ? '' : ' sk-custom'}`} key={s.id}>
+                <button type="button" className="sk-open" aria-label={`Edit ${s.name}`} onClick={() => setEditName(s.name)}>
+                  <span className="sk-folder" aria-hidden="true">
+                    <span className="sk-tab" />
+                    <span className="sk-back" />
+                    <span className="sk-paper"><span className="sk-paper-name">SKILL.md</span><i /><i /><i /></span>
+                    <span className="sk-flap"><span className="sk-origin" title={s.held ? 'Held: agents cannot use this skill until its scan clears it or someone approves it. Open it for the scan.' : undefined}>{s.bundled ? 'Built in' : s.held ? 'Held' : 'Yours'}</span><span className="sk-files">{s.fileCount} {s.fileCount === 1 ? 'file' : 'files'}</span></span>
+                  </span>
+                  <span className="sk-text">
+                    <span className="sk-name" title={s.name}>{s.name}</span>
+                    <span className="sk-desc" title={s.desc}>{s.desc}</span>
+                  </span>
+                </button>
+                <div className="sk-meta">
+                  <SkillUsage skill={s} align={align} />
+                  {s.bundled
+                    ? <span className="sk-ro">Read-only</span>
+                    : managed
+                      ? <span className="sk-ro" title={managedText}>Managed</span>
+                      : canWrite && <button className="btn ghost" onClick={() => setDeleteSkill(s)}>Delete</button>}
+                </div>
               </div>
-            </div>
-          ))}
+            )
+          })}
         </div>
       )}
       {(editName || building) && (
@@ -4159,6 +4481,34 @@ function SkillsTab({ feed, workflows, agents }: { feed: Feed<Skill>; workflows: 
           existingNames={rows.map((r) => r.name)}
           onClose={() => { setEditName(null); setBuilding(false) }}
           onSaved={() => { setEditName(null); setBuilding(false); reload() }}
+        />
+      )}
+      {importOpen && (
+        <SkillImportDialog
+          onClose={() => setImportOpen(false)}
+          onChooseFile={() => { setImportOpen(false); fileInput.current?.click() }}
+          onInstalled={({ skills }, label) => {
+            setImportOpen(false)
+            reload()
+            setImportNotice({ text: `Installed ${skills.length} skill${skills.length === 1 ? '' : 's'} from ${label}: ${skills.map((s) => s.name).join(', ')}`, error: false })
+          }}
+        />
+      )}
+      {openLibrary && !editName && (
+        <SkillLibraryPanel
+          skills={openLibrary.skills}
+          canWrite={canWrite}
+          onClose={() => setLibraryKey(null)}
+          onOpenSkill={(name) => { setLibraryKey(null); setEditName(name) }}
+          onChanged={() => { setLibraryKey(null); reload() }}
+        />
+      )}
+      {deleteLibrary && (
+        <SkillDeleteModal
+          skill={deleteLibrary}
+          wholeLibrary
+          onClose={() => setDeleteLibrary(null)}
+          onDeleted={() => { setDeleteLibrary(null); reload() }}
         />
       )}
       {deleteSkill && (

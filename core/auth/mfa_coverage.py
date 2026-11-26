@@ -6,12 +6,21 @@ a live warning for those who manage sessions and a daily entry on the audit trai
 
 from __future__ import annotations
 
+from typing import Optional
+
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
-from core.auth import security_keys, session_policy, trail_events
+from core.auth import (
+    security_keys,
+    session_policy,
+    sign_ins,
+    sso,
+    sso_settings,
+    trail_events,
+)
 from core.platform import notices
-from core.storage.models import Role, SecurityKey, User
+from core.storage.models import Role, SecurityKey, SignIn, User
 from core.storage.unit_of_work import unit_of_work
 
 ACTION = "auth.mfa_coverage_gap"
@@ -21,19 +30,59 @@ LOCK = 4177
 SETTINGS_LINK = "/settings?section=sessions"
 
 
-def without_mfa(session: Session, level: str = "everyone") -> int:
-    """Active accounts ``level`` would cover that have no MFA yet."""
-    users = (
-        session.query(User.service_account, Role.permissions)
-        .outerjoin(Role, Role.role_id == User.role_id)
-        .filter(User.is_active.is_(True), User.mfa_enabled.isnot(True))
+def _latest_sso(session: Session, principal_ids: list[str]) -> dict[str, Optional[str]]:
+    """Each principal's latest SSO sign-in's ``mfa_met``, in one query."""
+    if not principal_ids:
+        return {}
+    rows = (
+        session.query(SignIn.principal_id, SignIn.mfa_met)
+        .filter(
+            SignIn.principal_id.in_(principal_ids),
+            SignIn.auth_method == sign_ins.SSO,
+        )
+        .distinct(SignIn.principal_id)
+        .order_by(SignIn.principal_id, SignIn.started_at.desc())
         .all()
     )
-    return sum(
-        session_policy.mfa_covered(
-            [name for name, on in (perms or {}).items() if on], sa is True, level
+    return dict(rows)
+
+
+def _count(session: Session, level: str, held: tuple[str, ...], *filters) -> int:
+    """Active accounts ``level`` covers that match ``filters``, less those who sign
+    in only through the provider and whose latest SSO sign-in met it with ``held``.
+    No SSO sign-in, or one from before the check, holds nothing (#4758)."""
+    users = [
+        user
+        for user, perms in session.query(User, Role.permissions)
+        .outerjoin(Role, Role.role_id == User.role_id)
+        .filter(User.is_active.is_(True), *filters)
+        .all()
+        if session_policy.mfa_covered(
+            [name for name, on in (perms or {}).items() if on],
+            user.service_account is True,
+            level,
         )
-        for sa, perms in users
+    ]
+    if not users:
+        return 0
+    current = sso_settings.settings()
+    only = [u.principal_id for u in users if sso.sso_only(session, u, current)]
+    latest = _latest_sso(session, only)
+    only = set(only)
+    return sum(
+        u.principal_id not in only or latest.get(u.principal_id) not in held
+        for u in users
+    )
+
+
+def without_mfa(session: Session, level: str = "everyone") -> int:
+    """Active accounts ``level`` would cover that have no MFA yet. A step-down
+    counts: it is how the provider's mfa is recorded while keys are unavailable."""
+    return _count(
+        session,
+        level,
+        (sign_ins.PROVIDER_MFA, sign_ins.PROVIDER_PHR, sign_ins.STEP_DOWN),
+        User.mfa_enabled.isnot(True),
     )
 
 
@@ -43,18 +92,7 @@ def without_key(session: Session, level: str) -> int:
     keyed = session.query(SecurityKey.principal_id).filter(
         SecurityKey.principal_id == User.principal_id
     )
-    users = (
-        session.query(User.service_account, Role.permissions)
-        .outerjoin(Role, Role.role_id == User.role_id)
-        .filter(User.is_active.is_(True), ~keyed.exists())
-        .all()
-    )
-    return sum(
-        session_policy.mfa_covered(
-            [name for name, on in (perms or {}).items() if on], sa is True, level
-        )
-        for sa, perms in users
-    )
+    return _count(session, level, (sign_ins.PROVIDER_PHR,), ~keyed.exists())
 
 
 def _gap() -> int:

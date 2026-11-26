@@ -10,6 +10,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 
+from core.federation.error_kind import kind_of
 from core.integrations._base.proxy import integration_proxy
 from core.integrations._base.tls import tls_verify
 
@@ -57,8 +58,26 @@ _TARGET_FIELDS = """
 """
 
 
+_VERSION = "query { about { version } }"
+# How _query words a GraphQL error (the API answered; the query did not).
+_QUERY_FAILED = "OpenCTI query failed:"
+# A fact OpenCTI refused ("You are not allowed to do this"), in plain words.
+_REFUSED = {
+    "newest_intel": "newest intelligence: the token's role lacks Access knowledge (KNOWLEDGE)",
+    "backlog": "backlog: the token's role lacks Access connectors (MODULES)",
+    "version": (
+        "version: the token's role lacks Manage parameters (SETTINGS_SETPARAMETERS),"
+        " which Vigil does not need"
+    ),
+}
+
+
 class OpenCTIError(Exception):
     """A failed OpenCTI call, with a message safe to show (never the token)."""
+
+    def __init__(self, message: str, *, status_code: Optional[int] = None):
+        super().__init__(message)
+        self.status_code = status_code
 
 
 def _limit(value: Any) -> int:
@@ -141,9 +160,14 @@ class OpenCTIService:
         except OSError as exc:  # tls_verify: an unusable CA path, which it names
             raise OpenCTIError(str(exc)) from exc
         if resp.status_code in (401, 403):
-            raise OpenCTIError("OpenCTI rejected the API token")
+            raise OpenCTIError(
+                "OpenCTI rejected the API token", status_code=resp.status_code
+            )
         if resp.status_code >= 400:
-            raise OpenCTIError(f"OpenCTI request failed (HTTP {resp.status_code})")
+            raise OpenCTIError(
+                f"OpenCTI request failed (HTTP {resp.status_code})",
+                status_code=resp.status_code,
+            )
         try:
             body = resp.json()
         except ValueError as exc:
@@ -158,20 +182,83 @@ class OpenCTIService:
                 (first.get("extensions") or {}).get("code") == "AUTH_REQUIRED"
             ):
                 raise OpenCTIError("OpenCTI rejected the API token")
-            raise OpenCTIError(f"OpenCTI query failed: {message}")
+            raise OpenCTIError(f"{_QUERY_FAILED} {message}")
         data = body.get("data") if isinstance(body, dict) else None
         return data if isinstance(data, dict) else {}
 
     async def test_connection(self) -> Tuple[bool, str]:
-        """``(ok, message)`` for Settings: the version, read with the token."""
+        """``(ok, message)`` for Settings: who the token is, then the version if
+        the role may read it (OpenCTI 7 wants SETTINGS_SETPARAMETERS for that)."""
         try:
-            data = await self._query("query { about { version } }")
+            data = await self._query("query { me { name } }")
         except OpenCTIError as exc:
-            return False, str(exc)
-        version = (data.get("about") or {}).get("version")
-        if not version:
-            return False, "OpenCTI returned no version; is this the platform URL?"
-        return True, f"Connected to OpenCTI {version}"
+            return False, str(exc), kind_of(exc)
+        if not data.get("me"):
+            return False, "OpenCTI returned no user; is this the platform URL?"
+        try:
+            version = ((await self._query(_VERSION)).get("about") or {}).get("version")
+        except OpenCTIError:
+            version = None
+        return True, (
+            f"Connected to OpenCTI {version}" if version else "Connected to OpenCTI"
+        )
+
+    async def read_facts(self) -> Dict[str, Any]:
+        """Newest intelligence, connector backlog and version, each asked for on
+        its own. A fact the role may not read goes into ``missing``; any other
+        error (unreachable, rejected token, a failed query) raises."""
+        facts: Dict[str, Any] = {
+            "version": None,
+            "newest_intel_at": None,
+            "queue_messages_total": None,
+            "connectors": None,
+            "missing": [],
+        }
+
+        async def ask(fact: str, query: str) -> Optional[Dict[str, Any]]:
+            try:
+                return await self._query(query)
+            except OpenCTIError as exc:
+                text = str(exc)
+                if not (text.startswith(_QUERY_FAILED) and "not allowed" in text):
+                    raise  # transport, token or OpenCTI's own error: the read failed
+                facts["missing"].append({"fact": fact, "reason": _REFUSED[fact]})
+                return None
+
+        data = await ask(
+            "newest_intel",
+            "query { stixCoreObjects(first: 1, orderBy: created_at, orderMode: desc)"
+            " { edges { node { created_at } } } }",
+        )
+        if data is not None:
+            nodes = _nodes(data.get("stixCoreObjects"))
+            facts["newest_intel_at"] = nodes[0].get("created_at") if nodes else None
+
+        data = await ask(
+            "backlog",
+            "query { connectors { name active"
+            " connector_queue_details { messages_number } } }",
+        )
+        if data is not None:
+            connectors = [
+                {
+                    "name": c.get("name"),
+                    "active": bool(c.get("active")),
+                    "queue_messages": int(
+                        (c.get("connector_queue_details") or {}).get("messages_number")
+                        or 0
+                    ),
+                }
+                for c in data.get("connectors") or []
+                if isinstance(c, dict)
+            ]
+            facts["connectors"] = connectors
+            facts["queue_messages_total"] = sum(c["queue_messages"] for c in connectors)
+
+        data = await ask("version", _VERSION)
+        if data is not None:
+            facts["version"] = (data.get("about") or {}).get("version")
+        return facts
 
     async def search_observable(self, value: str, limit: Any = 10) -> Dict[str, Any]:
         data = await self._query(
@@ -240,13 +327,18 @@ class OpenCTIService:
     async def get_related(self, entity_id: str, limit: Any = 20) -> Dict[str, Any]:
         if not _ID.match(entity_id or ""):
             raise OpenCTIError(f"Invalid entity id {entity_id!r}")
-        # A container's (report, grouping, case) contents are object refs, not
-        # relationships; ask for both in one round trip.
+        # Both directions, and a container's (report, grouping, case) contents,
+        # which are object refs rather than relationships, in one round trip. A
+        # malware's own relationships say what it uses; who uses it, and the
+        # indicators that point at it, are relationships into it.
         data = await self._query(
             "query($id: String!, $ids: [String], $n: Int) {"
             " stixCoreRelationships(fromId: $ids, first: $n) {"
             " edges { node { relationship_type confidence"
             " to {" + _TARGET_FIELDS + "} } } }"
+            " incoming: stixCoreRelationships(toId: $ids, first: $n) {"
+            " edges { node { relationship_type confidence"
+            " from {" + _TARGET_FIELDS + "} } } }"
             " stixDomainObject(id: $id) { ... on Container { objects(first: $n) {"
             " pageInfo { globalCount }"
             " edges { node {" + _TARGET_FIELDS + "} } } } } }",
@@ -256,10 +348,16 @@ class OpenCTIService:
             {**r, "to": _target(r.get("to") or {})}
             for r in _nodes(data.get("stixCoreRelationships"))
         ]
+        incoming = [
+            {**r, "from": _target(r.get("from") or {})}
+            for r in _nodes(data.get("incoming"))
+        ]
         out: Dict[str, Any] = {
             "id": entity_id,
             "count": len(relationships),
             "relationships": relationships,
+            "incoming_count": len(incoming),
+            "incoming": incoming,
         }
         container = data.get("stixDomainObject") or {}
         if "objects" in container:
