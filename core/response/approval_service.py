@@ -39,7 +39,7 @@ from core.response.config import (
     decision_rule,
     split_decision_rule,
 )
-from core.response.proposal_targets import CONTAINMENT_TOOLS
+from core.response.proposal_targets import DONE_STATE
 from core.storage.connection import get_db_manager
 from core.storage.models import ApprovalAction as ApprovalActionRow
 from core.storage.models import Case, Finding, Investigation, WorkflowRun, case_findings
@@ -53,8 +53,10 @@ _pending_gauge: Any = None
 
 # Rollout acts on these once approved (rollout_approval).
 ROLLOUT_ACTION_TYPES = frozenset({"promote_rule", "deploy_rule"})
-# Kinds the backend carries out on approval through a vendor's tool (#5059).
-CONTAINMENT_TYPES = frozenset(CONTAINMENT_TOOLS)
+# Kinds the backend carries out on approval through a vendor's tool (#5059): each
+# with state words, whether or not a carrier is bound for it (#5313). One with
+# none bound is still resolved, and stays a proposal.
+CONTAINMENT_TYPES = frozenset(DONE_STATE)
 # execution_result.state while the call is out: claimed, so it runs once.
 RUNNING = "running"
 # A claim this old outlived its process: the row may be approved again.
@@ -227,7 +229,9 @@ class PendingAction:
     title: str
     description: str
     target: str  # IP, hostname, username, etc.
-    confidence: float
+    # The step score's value (#5278), None for a row without one. The stored
+    # column held the proposer's claim and is no longer read.
+    confidence: Optional[float]
     reason: str
     evidence: List[str]
     created_at: str
@@ -305,6 +309,27 @@ def four_eyes_refuses(
     return started_by == principal_id
 
 
+def _step_value(parameters: Any) -> Optional[float]:
+    """``parameters.step_score.value``, or None for a row without a score."""
+    score = parameters.get("step_score") if isinstance(parameters, dict) else None
+    value = score.get("value") if isinstance(score, dict) else None
+    return float(value) if isinstance(value, (int, float)) else None
+
+
+def _decider_score(parameters: Any) -> Optional[Dict[str, Any]]:
+    """What the person deciding sees: the quote plus the raise line and factors."""
+    from core.response.step_confidence import quote
+
+    score = parameters.get("step_score") if isinstance(parameters, dict) else None
+    if not isinstance(score, dict) or not score:
+        return None
+    return {
+        **quote(score),
+        "raise": score.get("raise"),
+        "factors": score.get("factors"),
+    }
+
+
 def _row_to_pending(row: ApprovalActionRow) -> PendingAction:
     return PendingAction(
         action_id=row.action_id,
@@ -312,7 +337,7 @@ def _row_to_pending(row: ApprovalActionRow) -> PendingAction:
         title=row.title,
         description=row.description,
         target=row.target,
-        confidence=float(row.confidence or 0),
+        confidence=_step_value(row.parameters),
         reason=row.reason,
         evidence=list(row.evidence or []),
         created_at=_iso_utc(row.created_at) if row.created_at else "",
@@ -351,34 +376,38 @@ def _host_names(*names: Optional[str]) -> List[str]:
     return sorted(folded)
 
 
+def _asks():
+    """Rows that ask for an act, whoever filed them: a run, a person, a playbook or
+    the retired daemon responder. An undo row (``undoes``) asks for the way back,
+    and a run's question (``workflow_run_id``) is answered by resuming that run, so
+    neither is an ask for the act itself."""
+    return (
+        select(ApprovalActionRow)
+        .where(ApprovalActionRow.parameters["undoes"].astext.is_(None))
+        .where(ApprovalActionRow.workflow_run_id.is_(None))
+    )
+
+
 def _isolations_of(names: Sequence[str]):
-    """Isolations of a host named by any of ``names``: the retired daemon
-    responder's (rows remain on installs), which key on the IP when the alert had
-    one and on the hostname when not, and runs' proposals, which name the host as
-    the model did."""
+    """Asks to isolate a host named by any of ``names``: by its IP or its hostname,
+    as the retired responder keyed on either and a run names the host as the model
+    did."""
     target = func.lower(func.trim(ApprovalActionRow.target))
     hostname = func.lower(func.trim(ApprovalActionRow.parameters["hostname"].astext))
     return (
-        select(ApprovalActionRow)
+        _asks()
         .where(ApprovalActionRow.action_type == ActionType.ISOLATE_HOST.value)
-        .where(
-            or_(
-                ApprovalActionRow.idempotency_key.like("isolate_host:%"),
-                ApprovalActionRow.idempotency_key.like("run-proposal:%"),
-            )
-        )
         .where(or_(target.in_(names), hostname.in_(names)))
     )
 
 
 def _same_ask(action_type: str, target: str):
-    """Run proposals of ``action_type`` on ``target``, any status; for an isolation,
-    any isolation of that host."""
+    """Asks for ``action_type`` on ``target``, any status, whoever filed them; for
+    an isolation, any isolation of that host."""
     if action_type == ActionType.ISOLATE_HOST.value:
         return _isolations_of(_host_names(target))
     return (
-        select(ApprovalActionRow)
-        .where(ApprovalActionRow.idempotency_key.like("run-proposal:%"))
+        _asks()
         .where(ApprovalActionRow.action_type == action_type)
         .where(
             func.lower(func.trim(ApprovalActionRow.target)) == target.strip().lower()
@@ -428,7 +457,6 @@ class ApprovalService:
         title: str,
         description: str,
         target: str,
-        confidence: float,
         reason: str,
         evidence: List[str],
         created_by: str = "system",
@@ -449,20 +477,18 @@ class ApprovalService:
 
         ``effect_class`` is the called tool's stored class, None when it is
         unclassified; a row that names no outside tool stays ``reversible``.
-        Every row requires approval. ``human_only`` holds the
-        row for a person whatever ``confidence`` says: for callers whose
-        confidence is their own claim (an agent, a model's reading of alert
-        text) and so cannot be what releases the action. A second call with
-        the same ``idempotency_key`` returns the existing non-failed row.
+        Every row requires approval. ``human_only`` records that the row is
+        a person's call whatever the ceiling allows (an agent's ask, a model's
+        reading of alert text). A second call with the same
+        ``idempotency_key`` returns the existing non-failed row.
         ``annotate_rule=False`` keeps the deciding rule off ``reason`` for rows
-        whose reason is read by an analyst and no confidence was ever compared.
+        whose reason is read by an analyst.
         """
         action, _inserted = self._put_action(
             action_type=action_type,
             title=title,
             description=description,
             target=target,
-            confidence=confidence,
             reason=reason,
             evidence=evidence,
             created_by=created_by,
@@ -483,7 +509,6 @@ class ApprovalService:
         title: str,
         description: str,
         target: str,
-        confidence: float,
         reason: str,
         evidence: List[str],
         created_by: str = "system",
@@ -501,8 +526,9 @@ class ApprovalService:
 
         The bool is True when this call inserted. Isolation uses it so a
         reused approved/pending row is not executed again. ``same_host`` is an
-        isolation's IP and hostname: a non-failed isolation of that host under
-        either name, or proposed by a run, is the existing row whatever its key.
+        isolation's IP and hostname: an isolation of that host under either
+        name, asked for by anyone and in any status but failed (a rejected one
+        included), is the existing row whatever its key.
         """
         key = idempotency_key or None
 
@@ -510,7 +536,7 @@ class ApprovalService:
         # narrative so the row records the rule it was decided by (#917).
         forced = human_only or environment_locks_act()
         requires_approval, rule = approval_requirement(
-            forced, effect_class, confidence, self.config
+            forced, effect_class, self.config
         )
         if human_only:
             rule = decision_rule("approval.human_only", True)
@@ -550,7 +576,6 @@ class ApprovalService:
                     title=title,
                     description=description,
                     target=target,
-                    confidence=float(confidence),
                     reason=reason,
                     evidence=list(evidence or []),
                     created_at=utcnow(),
@@ -569,12 +594,7 @@ class ApprovalService:
                 pending = _row_to_pending(row)
                 if status == ActionStatus.PENDING.value:
                     _trail_request(session, row, effect_class)
-            logger.info(
-                "Created action %s: %s (confidence: %s)",
-                action_id,
-                title,
-                confidence,
-            )
+            logger.info("Created action %s: %s", action_id, title)
             return pending, True
         except IntegrityError:
             if not key:
@@ -994,7 +1014,6 @@ class ApprovalService:
         Raises ``NotUndoable`` unless the original is executed and in its done
         state with no lift of it still open; ``ActionNotFound`` as approving does.
         """
-        from core.response.proposal_targets import DONE_STATE
 
         found = self.get_action(action_id)
         if found is None:
@@ -1038,7 +1057,6 @@ class ApprovalService:
                     title=title,
                     description=f"Undoes {action_id}: {original.title}",
                     target=original.target,
-                    confidence=1.0,
                     reason=f"{approved_by} undid {action_id}"
                     + (f": {reason.strip()}" if (reason or "").strip() else ""),
                     evidence=list(original.evidence or []),
@@ -1160,17 +1178,20 @@ class ApprovalService:
         self, key: str, action_type: str, target: str
     ) -> Optional[PendingAction]:
         """The row a run's proposal would repeat: its own (by ``key``) first, else
-        the newest run proposal of the same action on the same target, any status.
-        An isolation also matches a retired responder's isolation of that host,
-        whether its alert named the host by IP or by hostname."""
+        the newest live ask (pending, approved or executed) for the same action on
+        the same target, else the newest of any status, whoever filed it: another
+        run, a person, or the retired responder. An isolation matches the host by
+        IP or by hostname."""
         db = get_db_manager()
         with db.session_scope() as session:
             own = _nonfailed_by_key(session, key)
             if own is not None:
                 return _row_to_pending(own)
+            # A live ask first: a newer rejected or failed one does not hide it.
+            live = ApprovalActionRow.status.in_(_LIVE)
             row = session.execute(
                 _same_ask(action_type, target)
-                .order_by(ApprovalActionRow.created_at.desc())
+                .order_by(live.desc(), ApprovalActionRow.created_at.desc())
                 .limit(1)
             ).scalar_one_or_none()
             return _row_to_pending(row) if row else None
@@ -1531,7 +1552,7 @@ def _placeholder(action: PendingAction) -> PendingAction:
         title=RESTRICTED_TITLE,
         description="",
         target="",
-        confidence=0.0,
+        confidence=None,
         reason="",
         evidence=[],
         created_at=action.created_at,
@@ -1807,6 +1828,8 @@ def needs_you(case_id: Optional[str] = None) -> Dict[str, Any]:
                 "run_id": action.workflow_run_id,
                 "waiting": action.waiting,
                 "containment": (action.parameters or {}).get("containment"),
+                # The score the person deciding sees (#5278); None when unscored.
+                "step_score": _decider_score(action.parameters),
                 **_checkpoint_fields(action),
             }
         )

@@ -27,8 +27,10 @@ import api, {
   type IngestionJob,
   type IntegrationHealthSource,
   type PlatformDatabaseProxyConfig,
+  type ToolBindingBody,
   type ToolClass,
   type AgentAgreement,
+  type StepScoreTally,
   type WorkflowAgreement,
 } from '../../services/api'
 import type { ApiWorkflow } from '../../data/mappers'
@@ -751,6 +753,8 @@ export interface InvestigateWorkflow {
   id: string
   name: string
   agreement: WorkflowAgreement | undefined
+  /** Its dismissals' step scores and holds over the same 30 days. */
+  steps: StepScoreTally | undefined
 }
 
 /** Investigate-kind workflows, the only ones with their own tier, with their 30-day agreement. */
@@ -762,7 +766,9 @@ export function useInvestigateWorkflows() {
     let cancelled = false
     Promise.all([
       workflowApi.listAll(),
-      analyticsApi.getAgreement('30d').catch((): Pick<AgentAgreement, 'by_workflow'> => ({ by_workflow: [] })),
+      analyticsApi
+        .getAgreement('30d')
+        .catch((): Pick<AgentAgreement, 'by_workflow' | 'step_scores'> => ({ by_workflow: [], step_scores: {} })),
     ])
       .then(([res, agreement]) => {
         if (cancelled) return
@@ -775,6 +781,7 @@ export function useInvestigateWorkflows() {
             id: w.id,
             name: w.name || w.id,
             agreement: agreement.by_workflow.find((row) => row.workflow_id === w.id),
+            steps: agreement.step_scores[w.id],
           })),
         )
         setPhase('ready')
@@ -788,9 +795,11 @@ export function useInvestigateWorkflows() {
   return { workflows, phase }
 }
 
-/** Outside tools nobody has confirmed: stored as read_unverified, or exposed and unclassified. */
-export function useUnverifiedTools() {
+/** Every outside tool, those nobody has confirmed first: withdrawn, then unclassified or stored as
+ * read_unverified. With the capabilities a person may bind one to (#5312). */
+export function useOutsideTools() {
   const [tools, setTools] = useState<ToolClass[] | null>(null)
+  const [capabilities, setCapabilities] = useState<string[]>([])
   const [phase, setPhase] = useState<Phase>('loading')
   const latest = useRef(0)
 
@@ -801,20 +810,36 @@ export function useUnverifiedTools() {
       .tools()
       .then(({ data }) => {
         if (seq !== latest.current) return
-        setTools(data.filter((t) => t.effect_class == null || t.effect_class === 'read_unverified'))
+        const rank = (t: ToolClass) =>
+          t.withdrawn ? 0 : t.effect_class == null || t.effect_class === 'read_unverified' ? 1 : 2
+        setTools([...data].sort((a, b) => rank(a) - rank(b)))
         setPhase('ready')
       })
       .catch(() => seq === latest.current && setPhase('error'))
   }, [])
   useEffect(() => {
     load()
+    autonomyApi.capabilities().then(
+      ({ data }) => setCapabilities(data),
+      () => setCapabilities([]),
+    )
   }, [load])
 
   // refetch after a failure too: a 409 may mean someone stopped meanwhile
   const classify = useCallback(
-    async (name: string, effectClass: EffectClass) => {
+    async (name: string, effectClass: EffectClass, definitionHash?: string | null) => {
       try {
-        await autonomyApi.classifyTool(name, effectClass)
+        await autonomyApi.classifyTool(name, effectClass, definitionHash)
+      } finally {
+        await load()
+      }
+    },
+    [load],
+  )
+  const bind = useCallback(
+    async (name: string, binding: ToolBindingBody | null) => {
+      try {
+        await autonomyApi.bindTool(name, binding)
       } finally {
         await load()
       }
@@ -822,7 +847,7 @@ export function useUnverifiedTools() {
     [load],
   )
 
-  return { tools, phase, classify }
+  return { tools, capabilities, phase, classify, bind }
 }
 
 interface StorageInfo {
@@ -1707,7 +1732,7 @@ export function useIngestionJob(dataType: 'finding' | 'history' = 'finding') {
   return { job, attaching, upload, start }
 }
 
-/** The stored emulators and host list (GET/PUT /api/autonomy/emulation), shared with the tool rows' mark. */
+/** The hosts emulators may run on (GET/PUT /api/autonomy/emulation). */
 export function useEmulation() {
   const [data, setData] = useState<Emulation | null>(null)
   const [failed, setFailed] = useState(false)

@@ -1,7 +1,8 @@
 """An approved containment, carried out on the vendor's own ID (#5059, #5234).
 
-A pending row of a kind in ``CONTAINMENT_TOOLS`` is resolved when it is read:
-each connected server looks the target up, and what it finds is stored on
+A pending row of a kind in ``CONTAINMENT_TYPES`` is resolved when it is read:
+each connected server with a carrier of that kind (``bindings.carriers``,
+docs/acts.md) looks the target up, and what it finds is stored on
 ``parameters.containment`` as candidates. A keyless entry (the target is the
 vendor's key: an address, a domain, an email) needs no lookup, only a target it
 takes. The row's ``reversibility`` becomes the strictest stored class of the
@@ -11,7 +12,7 @@ once through ``_run``, as the approver. The row records what the vendor answered
 in ``execution_result.state``; a ``requested`` state is read again on read.
 
 The way back (#5060): Release or Enable on an executed one inserts a row linked
-by ``parameters.undoes``, approved by the person, carrying the table's undo tool
+by ``parameters.undoes``, approved by the person, carrying the carrier's undo tool
 on the same vendor ID, or on a field of the act's answer (a Cloudflare rule id).
 A carrier with no undo (an Access revoke) has no way back. It runs through ``carry_out`` like any approval; once the
 vendor reports it, the original records ``released`` or ``enabled`` too.
@@ -26,6 +27,7 @@ import time
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
+from core.integrations import bindings
 from core.response.approval_service import (
     CONTAINMENT_TYPES,
     ActionStatus,
@@ -37,7 +39,6 @@ from core.response.approval_service import (
 )
 from core.response.ceiling import IRREVERSIBLE, REVERSIBLE, STOPPED, tool_classes
 from core.response.proposal_targets import (
-    CONTAINMENT_TOOLS,
     DONE_STATE,
     UNDO_VERBS,
     UNDONE_LOOKUP,
@@ -74,13 +75,12 @@ class Unapprovable(ValueError):
 
 
 def _flat(entry: Dict[str, Any], key: str) -> str:
-    return f"{entry['vendor']}_{entry[key]}"
+    return bindings.catalogue_name(entry["server"], entry[key])
 
 
 def _entry(kind: str, vendor: Any) -> Optional[Dict[str, Any]]:
-    return next(
-        (e for e in CONTAINMENT_TOOLS.get(kind, ()) if e["vendor"] == vendor), None
-    )
+    # A server carries at most one carrier per kind, so the row's vendor finds it.
+    return next((e for e in bindings.carriers(kind) if e["server"] == vendor), None)
 
 
 def _undoes(action: PendingAction) -> Optional[str]:
@@ -98,12 +98,14 @@ def _as_state(action: PendingAction, state: str) -> str:
 def _lookup_done(action: PendingAction) -> str:
     """The lookup's state word once this row's act holds."""
     if _undoes(action):
-        return UNDONE_LOOKUP[action.action_type]
+        kind = action.action_type
+        return UNDONE_LOOKUP.get(kind) or UNDONE_STATE[kind]
     return DONE_STATE[action.action_type]
 
 
 async def _dial_vendors() -> None:
-    """Connect the containment servers this process has not: a server enabled in
+    """Connect the containment servers this process has not, and the servers of
+    the read-only state lookups: a server enabled in
     another API worker is otherwise not seen here until a restart.
     ``connect_to_server`` skips one that is disabled or has no credentials."""
     from core.integrations.mcp.client import process_mcp_client
@@ -113,7 +115,9 @@ async def _dial_vendors() -> None:
         return
     connected = getattr(client, "tools_cache", None) or {}
     now = time.monotonic()
-    for vendor in {e["vendor"] for kind in CONTAINMENT_TOOLS.values() for e in kind}:
+    servers = {e["server"] for e in bindings.carriers()}
+    servers |= {e["server"] for e in bindings.state_reads()}
+    for vendor in servers:
         if vendor in connected or now - _dialled.get(vendor, -_DIAL_SECONDS) < (
             _DIAL_SECONDS
         ):
@@ -146,8 +150,12 @@ async def _call(
     args: Dict[str, Any],
     action_id: Optional[str] = None,
     timeout_ms: int = _READ_TIMEOUT_MS,
-) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
-    """(the tool's answer, None) or (None, why it failed), through ``_run``."""
+    every_row: bool = False,
+) -> Tuple[Any, Optional[str]]:
+    """(the tool's answer, None) or (None, why it failed), through ``_run``. The
+    answer is its first row, or with ``every_row`` the list of its rows. An MCP
+    tool's envelope (``{"results": [...]}``) may arrive as one of those rows, or
+    already unwrapped to one row per record (``_state_records`` reads both)."""
     from core.agents.attribution import TrailWriteError
     from core.agents.mcp_tools import MCPFailure, row_error
     from core.agents.tools_router import (
@@ -166,7 +174,7 @@ async def _call(
         action_id=action_id,
     )
     try:
-        result, handled, _source = await _run(body, registry)
+        result, handled, _source, _definition = await _run(body, registry)
     except Denied as exc:
         return None, str(exc)
     except MCPFailure as exc:
@@ -184,6 +192,8 @@ async def _call(
     error = _errored(result) or row_error(rows)
     if error:
         return None, error
+    if every_row:
+        return [r for r in rows if isinstance(r, dict)], None
     answer = next((r for r in rows if isinstance(r, dict)), {})
     return answer, None
 
@@ -192,12 +202,13 @@ async def _call(
 
 
 def _offered(kind: str, registry) -> List[Dict[str, Any]]:
-    """Entries whose tools are connected: a keyless one needs only its act."""
+    """Carriers whose tools are connected: a keyless one needs only its act."""
     names = set(registry.get_tool_names())
     return [
         e
-        for e in CONTAINMENT_TOOLS.get(kind, ())
-        if (not e["lookup"] or _flat(e, "lookup") in names) and _flat(e, "act") in names
+        for e in bindings.carriers(kind)
+        if (not e["lookup"] or _flat(e, "lookup") in names)
+        and _flat(e, "tool") in names
     ]
 
 
@@ -205,16 +216,16 @@ def _candidate(
     entry: Dict[str, Any], action: PendingAction, vendor_id: Any, name: Any, state
 ) -> Dict[str, Any]:
     return {
-        "id": f"{entry['vendor']}:{vendor_id}",
-        "vendor": entry["vendor"],
-        "carrier": entry.get("carrier"),
-        "tool": _flat(entry, "act"),
+        "id": f"{entry['server']}:{vendor_id}",
+        "vendor": entry["server"],
+        "carrier": entry["carrier"],
+        "tool": _flat(entry, "tool"),
         "args": {entry["id_arg"]: vendor_id, entry["note_arg"]: _note(action)},
         "vendor_id": vendor_id,
         "name": name,
         "state": state,
         # Whether Vigil can undo the act: the carrier has an undo (#5234).
-        "undoable": bool(entry.get("undo")),
+        "undoable": bool(entry["undo"]),
     }
 
 
@@ -237,7 +248,13 @@ def _due(action: PendingAction, offered: List[Dict[str, Any]]) -> bool:
     stored = (action.parameters or {}).get("containment")
     if not isinstance(stored, dict):
         return True
-    if {e["vendor"] for e in offered} - set(stored.get("servers") or []):
+    if {e["server"] for e in offered} - set(stored.get("servers") or []):
+        return True
+    # A candidate whose carrier is no longer offered is resolved again; an undo
+    # row's candidate is the undo tool, never re-resolved.
+    tools = {_flat(e, "tool") for e in offered}
+    candidates = stored.get("candidates") or []
+    if not _undoes(action) and any(c.get("tool") not in tools for c in candidates):
         return True
     if stored.get("candidates"):
         return False
@@ -282,7 +299,7 @@ async def resolve(action: PendingAction, registry) -> PendingAction:
     for entry in offered:
         if not entry["lookup"]:
             # The target is the vendor's key: one candidate, if the act takes it.
-            refusal = entry.get("takes") and entry["takes"](action.target)
+            refusal = bindings.refusal(entry, action.target)
             if refusal:
                 refusals.append(refusal)
             else:
@@ -292,7 +309,7 @@ async def resolve(action: PendingAction, registry) -> PendingAction:
             continue
         lookup = _flat(entry, "lookup")
         answer, error = await _call(
-            registry, lookup, entry["lookup_args"](action.target)
+            registry, lookup, bindings.lookup_args(entry, action.target)
         )
         if error:
             problems.append(f"{lookup}: {error}")
@@ -310,18 +327,20 @@ async def resolve(action: PendingAction, registry) -> PendingAction:
                     action,
                     vendor_id,
                     record.get(entry["name"]) or action.target,
-                    entry["state"](record),
+                    bindings.read(entry["state"], record),
                 )
             )
     missing = None
     if not offered:
         tools = [
-            _flat(e, "lookup" if e["lookup"] else "act")
-            for e in CONTAINMENT_TOOLS[action.action_type]
+            _flat(e, "lookup" if e["lookup"] else "tool")
+            for e in bindings.carriers(action.action_type)
         ]
         missing = (
             "No connected integration can carry this: none offers "
             f"{' or '.join(tools)}"
+            if tools
+            else f"No integration carries {action.action_type}: none is bound"
         )
     elif not candidates:
         found_nothing = " or ".join(_flat(e, "lookup") for e in offered if e["lookup"])
@@ -330,7 +349,7 @@ async def resolve(action: PendingAction, registry) -> PendingAction:
         )
     stored = {
         "candidates": candidates,
-        "servers": [e["vendor"] for e in offered],
+        "servers": [e["server"] for e in offered],
         "missing": missing,
         "resolved_at": utcnow().isoformat(),
     }
@@ -343,6 +362,90 @@ async def resolve(action: PendingAction, registry) -> PendingAction:
         reversibility=reversibility,
     )
     return updated or action
+
+
+def _state_records(
+    entry: Dict[str, Any], answer: Dict[str, Any]
+) -> List[Dict[str, Any]]:
+    """The records in one row of a lookup's answer. An MCP answer arrives as its
+    envelope (``{"results": [...]}``, named by ``rows``) or, where the tool layer
+    has already unwrapped it, as one record per row: both read the same."""
+    listed = answer.get(entry["rows"]) if entry["rows"] else None
+    if isinstance(listed, list):
+        return [one for one in listed if isinstance(one, dict)]
+    return [] if answer.get("found") is False else [answer]
+
+
+def _stated(reading: Dict[str, Any], record: Dict[str, Any]) -> bool:
+    """Whether ``record`` carries any field its state reading reads: a record that
+    carries none reads as the reading's default, which says nothing about it."""
+    for entry in reading["read"]:
+        value: Any = record
+        for step in entry["field"].split("."):
+            value = value.get(step) if isinstance(value, dict) else None
+        if value is not None:
+            return True
+    return False
+
+
+def _state_lookups(action_type: str, registry) -> List[Dict[str, Any]]:
+    """The connected lookups that read this act's state: each carrier's that has
+    one, then each read-only state lookup (``bindings.state_reads``) on a server
+    that carries none of this act."""
+    names = set(registry.get_tool_names())
+    carried = [
+        e for e in _offered(action_type, registry) if e["lookup"] and e.get("state")
+    ]
+    servers = {e["server"] for e in bindings.carriers(action_type)}
+    reads = [
+        e
+        for e in bindings.state_reads()
+        if e["act"] == action_type
+        and e["server"] not in servers
+        and _flat(e, "lookup") in names
+    ]
+    return carried + reads
+
+
+async def in_force(action_type: str, target: str, registry) -> Optional[Dict[str, Any]]:
+    """What the connected vendors' lookups say about ``target`` for this act,
+    done outside Vigil or in it: ``holds`` True when every record found reads as
+    the state the act puts it in (a host contained, an account disabled), False
+    when every record states its state and one is not that, with the vendor,
+    the name it found and the state word of the first record that decided it.
+
+    None when nothing can be told: no connected lookup reads this act's state (a
+    carrier's, or a read-only one in ``state_reads.yaml``; a keyless carrier has
+    none), a lookup failed or found nothing, or a record carries none of the
+    fields its state is read from."""
+    done = DONE_STATE.get(action_type)
+    if done is None or action_type not in CONTAINMENT_TYPES:
+        return None
+    seen: List[Dict[str, Any]] = []
+    for entry in _state_lookups(action_type, registry):
+        answers, error = await _call(
+            registry,
+            _flat(entry, "lookup"),
+            bindings.lookup_args(entry, target),
+            every_row=True,
+        )
+        if error:
+            return None
+        records = [one for answer in answers for one in _state_records(entry, answer)]
+        for record in records:
+            if not _stated(entry["state"], record):
+                return None
+            seen.append(
+                {
+                    "vendor": entry["server"],
+                    "name": record.get(entry["name"]) or target,
+                    "state": bindings.read(entry["state"], record),
+                }
+            )
+    if not seen:
+        return None
+    not_done = next((one for one in seen if one["state"] != done), None)
+    return {**(not_done or seen[0]), "holds": not_done is None}
 
 
 def choose(action: PendingAction, candidate: Optional[str]) -> Tuple[str, str]:
@@ -444,7 +547,7 @@ async def _carry_out(
         )
     else:
         entry = _entry(action.action_type, vendor)
-        state = entry["act_state"](answer or {}) if entry else REQUESTED
+        state = bindings.read(entry["act_state"], answer or {}) if entry else REQUESTED
         # A vendor that answers the act at once (Defender's machine action).
         state = _as_state(action, state) if entry else state
         result = {**base, "state": state, "answer": answer}
@@ -503,18 +606,20 @@ async def read_state(action: PendingAction, registry) -> PendingAction:
     _last_read[action.action_id] = now
     state: Optional[str] = None
     if entry["state_read"]:
-        tool, arg = entry["state_read"]
+        tool, arg = entry["state_read"]["tool"], entry["state_read"]["arg"]
         key = (result.get("answer") or {}).get(arg)
         if not key:
             return action
-        answer, error = await _call(registry, f"{entry['vendor']}_{tool}", {arg: key})
+        answer, error = await _call(
+            registry, bindings.catalogue_name(entry["server"], tool), {arg: key}
+        )
         if error:
             logger.info("state of %s not read: %s", action.action_id, error)
             return action
-        state = _as_state(action, entry["read_state"](answer or {}))
+        state = _as_state(action, bindings.read(entry["read_state"], answer or {}))
     else:
         answer, error = await _call(
-            registry, _flat(entry, "lookup"), entry["lookup_args"](action.target)
+            registry, _flat(entry, "lookup"), bindings.lookup_args(entry, action.target)
         )
         if error:
             logger.info("state of %s not read: %s", action.action_id, error)
@@ -527,7 +632,9 @@ async def read_state(action: PendingAction, registry) -> PendingAction:
             ),
             None,
         )
-        if record is not None and entry["state"](record) == _lookup_done(action):
+        if record is not None and bindings.read(entry["state"], record) == _lookup_done(
+            action
+        ):
             state = _as_state(action, DONE_STATE[action.action_type])
     if state is None or state == REQUESTED:
         return action
@@ -536,7 +643,7 @@ async def read_state(action: PendingAction, registry) -> PendingAction:
         updated = await asyncio.to_thread(
             service.mark_failed,
             action.action_id,
-            f"{entry['vendor']} reports the act failed: {json.dumps(answer)[:500]}",
+            f"{entry['server']} reports the act failed: {json.dumps(answer)[:500]}",
             {**result, "state": FAILED, "read": answer},
         )
     else:
@@ -617,8 +724,8 @@ def _lift(original: PendingAction, offered: set) -> Any:
     entry = _entry(original.action_type, vendor)
     if entry is None or vendor_id in (None, ""):
         return f"{original.action_id} records no vendor ID to undo"
-    if not entry.get("undo"):
-        return f"{entry.get('carrier') or vendor} has no undo: Vigil cannot undo this"
+    if not entry["undo"]:
+        return f"{entry['carrier'] or vendor} has no undo: Vigil cannot undo this"
     tool = _flat(entry, "undo")
     if tool not in offered:
         return f"No connected server offers {tool}"
@@ -652,7 +759,7 @@ def _lift(original: PendingAction, offered: set) -> Any:
         "args": args,
         "vendor_id": vendor_id,
         "name": name,
-        "carrier": entry.get("carrier"),
+        "carrier": entry["carrier"],
         "state": DONE_STATE[original.action_type],
     }
     return f"{verb} {name}", {
@@ -728,7 +835,12 @@ async def release_under_ceiling(
 async def _release(action: PendingAction, claims, registry) -> PendingAction:
     from core.auth.principals import SYSTEM_PRINCIPAL_ID
     from core.auth.tool_principal import bound_claims
-    from core.response.ceiling import read_ceiling, unattended_refusal
+    from core.response.ceiling import (
+        bar_held,
+        read_ceiling,
+        unattended_refusal,
+        workflow_of,
+    )
     from core.response.reversals import PersonHold
 
     registry = await live_registry(registry)
@@ -761,6 +873,15 @@ async def _release(action: PendingAction, claims, registry) -> PendingAction:
             logger.info("%s waits for a person: %s", action.action_id, why)
             if isinstance(why, PersonHold):
                 await asyncio.to_thread(_note_held, action, why, claims.run_id)
+            return action
+        # The workflow's bar, after every other reason (#5276). A row filed with
+        # no score (the create_approval_action door) holds as unknown.
+        workflow_id = await asyncio.to_thread(workflow_of, claims.run_id)
+        score = ((action.parameters or {}).get("step_score") or {}).get("value")
+        why = bar_held(ceiling, workflow_id, score)
+        if why:
+            logger.info("%s waits for a person: %s", action.action_id, why)
+            await asyncio.to_thread(_note_bar_hold, action, why, claims.run_id)
             return action
         # Last, so the case names the cap only when nothing else held the act.
         released = await asyncio.to_thread(released_last_hour)
@@ -804,6 +925,21 @@ def _note_held(action: PendingAction, why: str, run_id: str) -> None:
             )
     except Exception:  # noqa: BLE001 — the row waits either way
         logger.exception("hold of %s not noted on its case", action.action_id)
+
+
+def _note_bar_hold(action: PendingAction, why: str, run_id: str) -> None:
+    """One trail entry and a case activity for a row the bar holds (#5276)."""
+    from core.response.approval_service import case_ids_for
+    from core.response.ceiling import record_bar_hold
+    from core.response.step_confidence import CONTAINMENT
+
+    try:
+        case_id = next(iter(case_ids_for(action)), None)
+    except Exception:  # noqa: BLE001 — the row waits either way
+        logger.exception("cases of %s not read", action.action_id)
+        case_id = None
+    record_bar_hold(why, CONTAINMENT, case_id, run_id)
+    _note_held(action, why, run_id)
 
 
 def _note_released(action: PendingAction, run_id: str) -> None:

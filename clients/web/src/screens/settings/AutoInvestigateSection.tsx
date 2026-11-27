@@ -1,12 +1,13 @@
 // Changes save automatically, and take ~60s to apply (runtime-config TTL).
 import { useEffect, useRef, useState, type ReactNode } from 'react'
+import { parse as parseYaml, stringify as yamlText } from 'yaml'
 import { Link } from 'react-router-dom'
 import { useAuth } from '../../contexts/AuthContext'
 import { DurationPicker } from '../../shared/DurationPicker'
 import { formatDuration } from '../../shared/duration'
 import { Icon } from '../../shared/icons'
 import { ScrubField } from '../../shared/ScrubField'
-import { ConfirmDialog, Field, NumberInput, SettingsCard, TextInput, Toggle } from '../../shared/ui'
+import { ConfirmDialog, Field, NumberInput, Select, SettingsCard, TextInput, Toggle } from '../../shared/ui'
 import { NotMeasured } from '../../shared/NotMeasured'
 import { utcDayClock } from '../../shared/utc'
 import { agreementText, dropWhy, falseCloseText, modelsInOrder, workflowTier, type WorkflowTier } from '../../shared/autonomy'
@@ -16,7 +17,7 @@ import {
   useEmulation,
   useInvestigateWorkflows,
   useOrchestrator,
-  useUnverifiedTools,
+  useOutsideTools,
   type InvestigateWorkflow,
   type InvestigationProfileValues,
   type OrchestratorBound,
@@ -32,10 +33,13 @@ import {
   approvalsApi,
   configApi,
   detectionRulesApi,
+  type AfterHold,
   type Ceiling,
   type InvestigationReplayResponse,
+  type StepScoreTally,
   type EffectClass,
   type OverlayOnlyRule,
+  type ToolBindingBody,
   type ToolClass,
 } from '../../services/api'
 import { errorText } from '../../shared/errorText'
@@ -59,7 +63,11 @@ type PendingSave =
   | { kind: 'act' }
   | { kind: 'irreversible' }
   | { kind: 'stop' }
-  | { kind: 'tool'; name: string; to: EffectClass }
+  | { kind: 'tool'; name: string; to: EffectClass; hash?: string | null }
+  // a capability, or null to put the shipped binding back
+  | { kind: 'bind'; name: string; capability: string | null; shippedAct?: string }
+  // an act carrier entered in the declared form (docs/acts.md)
+  | { kind: 'carrier'; name: string; act: string; body: ToolBindingBody }
   | { kind: 'workflow'; workflow: InvestigateWorkflow }
 
 // Tighter last, as in core/response/ceiling.py; an unclassified tool loosens to anything
@@ -83,6 +91,146 @@ const splitTool = (name: string) => {
   return at > 0 ? { server: name.slice(0, at), tool: name.slice(at + 1) } : { server: '', tool: name }
 }
 const STOPPED_LOOSEN = 'Stopped: resume first'
+const CLASS_TAG: Record<EffectClass, string> = {
+  read: 'Read',
+  read_unverified: 'Runs as a read, unconfirmed',
+  reversible: 'Reversible',
+  irreversible: 'Cannot be undone',
+}
+// The capability select's values beside the capability names (#5312)
+const BIND_NOTHING = ''
+const BIND_SHIPPED = ':shipped'
+const BIND_ACT = ':act'
+// A tool bound to emulation is an emulator (#5315), held to the host list under Emulators
+const EMULATION = 'emulation'
+const capLabel = (c: string) => (c === EMULATION ? 'Emulator' : c)
+const answers = (c: string) => (c === EMULATION ? 'Runs as an emulator' : `Answers ${c}`)
+const bindValue = (t: ToolClass) =>
+  t.binding_source === 'file' ? BIND_SHIPPED : t.binding?.act ? BIND_ACT : (t.binding?.capability ?? BIND_NOTHING)
+// An act tool's binding is its carrier (#5313): it carries the act, answering nothing
+const said = (b: NonNullable<ToolClass['binding']>) => (b.act ? `Carries ${b.act}` : answers(b.capability ?? ''))
+// What the tool answers or carries, and whose binding that is
+const bindingNote = (t: ToolClass) => {
+  const shipped = t.shipped_binding
+  if (t.binding_source === 'file' && shipped) return `${said(shipped)}, as shipped`
+  if (t.binding_source !== 'person') return null
+  const was = shipped ? ` (shipped: ${shipped.act ?? capLabel(shipped.capability ?? '')})` : ''
+  // set in Vigil: a person binds; a person or a machine may unbind
+  return t.binding ? `${said(t.binding)}, bound here${was}` : `${shipped?.act ? 'Carries' : 'Answers'} nothing, unbound here${was}`
+}
+
+// The carrier editor's text: the row's own carrier, else the shipped one, else a template (docs/acts.md)
+const UNDO_HINT = /release|unisolate|undo|lift|restore|enable|unblock/
+const LOOKUP_HINT = /find|search|lookup|get/
+const carrierText = (t: ToolClass, tools: ToolClass[]) => {
+  const own = (t.binding?.act ? t.binding : t.shipped_binding?.act ? t.shipped_binding : null)?.carrier
+  if (own) {
+    // stored with its server and every unset part; the form takes neither
+    return yamlText(Object.fromEntries(Object.entries(own).filter(([k, v]) => k !== 'server' && v != null)))
+  }
+  // No binding names the server yet: the flattened name's prefix, only to word the template; the server checks it.
+  const { server, tool } = splitTool(t.name)
+  const others = tools.map((x) => x.name).filter((n) => n !== t.name && n.startsWith(`${server}_`)).map((n) => n.slice(server.length + 1))
+  const lookup = others.find((n) => LOOKUP_HINT.test(n) && !UNDO_HINT.test(n)) ?? 'find_host'
+  const undo = others.find((n) => UNDO_HINT.test(n)) ?? 'release_host'
+  return [
+    `# ${tool} on ${server || 'its server'} as a carrier (docs/acts.md). Every tool named here is a`,
+    `# bare name of ${server || 'that server'}${others.length ? `: ${others.join(', ')}` : ''}.`,
+    'act: isolate_host',
+    'id_arg: machine_id',
+    'note_arg: comment',
+    `lookup: ${lookup}`,
+    'lookup_arg: hostname',
+    'id: machine_id',
+    'name: name',
+    'state:',
+    '  read: [{field: isolation.state, map: {isolated: contained}}]',
+    '  default: not_contained',
+    'act_state:',
+    '  default: requested',
+    `undo: ${undo}`,
+    '',
+  ].join('\n')
+}
+// BindingBody's carrier parts: the server ignores any other key, so a misspelt optional part would vanish
+const CARRIER_KEYS = new Set([
+  'act', 'carrier', 'id_arg', 'note_arg', 'lookup', 'lookup_arg', 'address_arg', 'rows', 'id', 'name',
+  'state', 'takes', 'act_state', 'state_read', 'read_state', 'undo', 'undo_from',
+])
+// A 422's detail: the carrier check's sentence, or pydantic's list of wrong-typed fields
+const refusal = (err: unknown) => {
+  const detail = (err as { response?: { data?: { detail?: unknown } } })?.response?.data?.detail
+  if (Array.isArray(detail))
+    return detail
+      .map((d: { loc?: unknown[]; msg?: string }) => `${(d.loc ?? []).slice(-1)[0] ?? 'carrier'}: ${d.msg ?? 'invalid'}`)
+      .join('; ')
+  return errorText(err, 'Failed to save the carrier.')
+}
+// The tools an act binding names, by row name, with their role in it
+const roleMarks = (tools: ToolClass[]) => {
+  const marks: Record<string, string[]> = {}
+  for (const t of tools) {
+    const b = t.binding
+    const c = b?.carrier as { carrier?: string; lookup?: string; undo?: string; state_read?: { tool?: string } } | undefined
+    if (!b?.act || !b.server || !c) continue
+    const label = c.carrier || b.server
+    const roles: [string, string | undefined][] = [
+      ['Lookup', c.lookup],
+      ['State read', c.state_read?.tool],
+      ['Undo', c.undo],
+    ]
+    for (const [role, bare] of roles)
+      if (bare) (marks[`${b.server}_${bare}`] ??= []).push(`${role} for ${b.act} · ${label}`)
+  }
+  return marks
+}
+
+// A tool as its server lists it (#5300): the description, the input schema collapsed.
+type ToolDef = NonNullable<ToolClass['definition']>
+// Keys sorted, as the hash reads them: the stored pin comes back from JSONB reordered.
+const sortedJson = (v: unknown): string =>
+  JSON.stringify(
+    v,
+    (_, x) =>
+      x && typeof x === 'object' && !Array.isArray(x)
+        ? Object.fromEntries(Object.entries(x).sort(([a], [b]) => (a < b ? -1 : 1)))
+        : x,
+    2,
+  )
+const ToolDefinition = ({ label, def }: { label?: string; def: ToolDef }) => (
+  <div className="lim-tool-def">
+    {label && <b>{label}</b>}
+    <p>{def.description || 'No description'}</p>
+    <details>
+      <summary>Input schema</summary>
+      <pre>{sortedJson(def.inputSchema ?? {})}</pre>
+    </details>
+  </div>
+)
+
+type ManagedSwitch = { declared: unknown; file?: string | null; line?: number | null }
+// The step-score factors (#5277): each on counts in a dismissal's and a containment's score.
+const SCORE_FACTORS = [
+  {
+    key: 'confidence.precedent',
+    attr: 'confidence_precedent',
+    label: 'Score: precedent',
+    hint: 'How people judged earlier alerts of the same kind.',
+  },
+  {
+    key: 'confidence.blind_spots',
+    attr: 'confidence_blind_spots',
+    label: 'Score: blind spots',
+    hint: 'Tool calls the run’s estate failed and never served.',
+  },
+  {
+    key: 'confidence.run_quality',
+    attr: 'confidence_run_quality',
+    label: 'Score: run quality',
+    hint: 'The run hit its turn cap, cited nothing, or was not grounded.',
+  },
+] as const
+const ON_TIGHTER_KEYS: string[] = ['act.hold_crown_jewels', ...SCORE_FACTORS.map((f) => f.key)]
 type HeldRow = Ceiling['held'][number]
 const CAP_MAX = 1000
 
@@ -168,6 +316,110 @@ function ReleaseCap({
   )
 }
 
+const barText = (bar: number) => bar.toFixed(2)
+
+/** One workflow's bar: set or raise it tightens; lower or clear it loosens, as the API judges it. */
+function WorkflowBar({
+  name,
+  stored,
+  canRaise,
+  machine,
+  stopped,
+  managed,
+  save,
+}: {
+  name: string
+  stored: number | null
+  canRaise: boolean
+  machine: boolean
+  stopped: boolean
+  // A declared INTENT.md bar and where it is declared; a value under it is refused.
+  managed?: { bar: number; where: string }
+  save: (bar: number | null) => Promise<boolean>
+}) {
+  const [draft, setDraft] = useState(stored == null ? '' : barText(stored))
+  // Every read of the ceiling, a refused save's refresh included, resets the field.
+  useEffect(() => setDraft(stored == null ? '' : barText(stored)), [stored])
+  const next = draft.trim() === '' ? null : Number(draft)
+  // Why the server would refuse ``to``, said before anyone saves.
+  const refusal = (to: number | null): string | null => {
+    if (to != null && !(to >= 0 && to <= 1)) return 'A bar is a number from 0 to 1.'
+    if (managed && (to == null || to < managed.bar))
+      return `Managed by ${managed.where}, declared bar ${barText(managed.bar)}: a lower or cleared bar is refused. Change it in the declared directory.`
+    if (stored == null || (to != null && to >= stored)) return null
+    if (machine) return 'A service account cannot lower or clear a bar.'
+    if (!canRaise) return 'Your role can raise the bar. Lowering or clearing it needs permission to loosen autonomy.'
+    if (stopped) return `${STOPPED_LOOSEN}: a lower bar is refused; a higher one saves.`
+    return null
+  }
+  const changed = next !== stored
+  const why = changed ? refusal(next) : null
+  const commit = (to: number | null) => {
+    if (refusal(to)) return
+    void save(to).then((ok) => ok || setDraft(stored == null ? '' : barText(stored)))
+  }
+  const id = `lim-bar-${name.replace(/\W+/g, '-')}`
+  return (
+    <span className="lim-wf-bar">
+      <span className="lim-wf-bar-row">
+        <label htmlFor={id}>Bar</label>
+        <NumberInput
+          id={id}
+          aria-label={`Bar of ${name}`}
+          style={{ width: 76 }}
+          min={0}
+          max={1}
+          step={0.05}
+          placeholder="none"
+          value={draft}
+          onChange={(e) => setDraft(e.target.value)}
+          onKeyDown={(e) => e.key === 'Enter' && changed && commit(next)}
+        />
+        <button type="button" className="btn ghost" disabled={!changed || !!why} onClick={() => commit(next)}>
+          Save
+        </button>
+        {stored != null && (
+          <button type="button" className="btn ghost" disabled={!!refusal(null)} title={refusal(null) ?? undefined} onClick={() => commit(null)}>
+            Clear
+          </button>
+        )}
+      </span>
+      {why && (
+        <span className="lim-class-note">
+          <Icon name="alert" size={13} className="shrink-0" /> {why}
+        </span>
+      )}
+    </span>
+  )
+}
+
+const HELD_AFTER: [keyof AfterHold, string][] = [
+  ['not_real', 'closed by a person as not real'],
+  ['real', 'closed by a person as real'],
+  ['no_determination', 'closed by a person without a determination'],
+  ['by_agent', 'closed by an agent'],
+  ['open', 'still open'],
+]
+
+/** "Held by the bar 2: 1 closed by a person as not real, 1 still open"; null when none were held. */
+function heldLine(label: string, n: number, after: AfterHold): string | null {
+  if (!n) return null
+  const parts = HELD_AFTER.filter(([k]) => after[k]).map(([k, said]) => `${after[k]} ${said}`)
+  return `${label} ${n}: ${parts.join(', ')}`
+}
+
+/** The workflow's 30 days of dismissals: scores by band, then what each hold left for people. */
+function stepLines(steps: StepScoreTally | undefined): string[] {
+  if (!steps) return []
+  const { high, medium, low, unknown } = steps.bands
+  return [
+    `Dismissals in 30 days · ${high} high · ${medium} medium · ${low} low · ${unknown} unscored`,
+    steps.passed_bar || steps.held_by_bar ? `Passed the bar ${steps.passed_bar}` : null,
+    heldLine('Held by the bar', steps.held_by_bar, steps.after_hold.bar),
+    heldLine('Held by autonomy', steps.held_by_autonomy, steps.after_hold.autonomy),
+  ].filter((line): line is string => line != null)
+}
+
 /** The ceiling stores a naive UTC stamp; without an offset a browser reads it as local. */
 function utcStamp(iso: string | null | undefined): string | null {
   if (!iso) return null
@@ -186,7 +438,7 @@ function stoppedBanner(ceil: Ceiling): string {
 
 type WorkflowChoice = 'fleet' | 'act' | 'assist'
 /** A workflow INTENT.md manages: its declared entry and where it is declared. */
-type ManagedFlow = { declared: { tier: 'act' | 'assist'; floor?: number }; file: string; line: number; revision: string }
+type ManagedFlow = { declared: { tier: 'act' | 'assist'; floor?: number; bar?: number }; file: string; line: number; revision: string }
 const WORKFLOW_CHOICES: { to: WorkflowChoice; label: string }[] = [
   { to: 'fleet', label: 'Follows fleet' },
   { to: 'act', label: 'Act' },
@@ -271,6 +523,31 @@ const pendingCopy = (pending: PendingSave): { title: string; body: string } => {
         }; ${close}. Below the floor, Vigil puts it back on Assist.`,
       }
     }
+    case 'carrier':
+      return {
+        title: `Make ${pending.name} carry ${pending.act}?`,
+        body: `Once a person or the ceiling approves ${pending.act}, Vigil carries it out through ${pending.name} and the tools its carrier names.`,
+      }
+    case 'bind':
+      return pending.capability == null && pending.shippedAct
+        ? {
+            title: `Put ${pending.name} back on its shipped carrier?`,
+            body: `Approved ${pending.shippedAct} is carried through it again as shipped.`,
+          }
+        : pending.capability == null
+        ? {
+            title: `Put ${pending.name} back on its shipped binding?`,
+            body: 'Runs that need what it is shipped to answer hold it again from their next run.',
+          }
+        : pending.capability === EMULATION
+          ? {
+              title: `Bind ${pending.name} as an emulator?`,
+              body: 'Vigil will refuse its calls on any host not listed under Emulators, send it the list, and keep it out of chat. The red team loop holds it from its next run.',
+            }
+          : {
+              title: `Bind ${pending.name} to ${pending.capability}?`,
+              body: `The next hunt, investigation or root-cause trace that needs ${pending.capability} holds it and may call it.`,
+            }
     case 'tool':
       return pending.to === 'read'
         ? {
@@ -315,7 +592,7 @@ const FLEET_ROWS: LimitRow[] = [
   { field: 'max_total_hourly_cost', title: 'Spend per hour, whole fleet', hint: 'Intake pauses when the last hour reaches this', label: 'Hourly cap', prefix: '$', unit: 'per hour' },
 ]
 
-export default function AutoInvestigateSection({ notify }: SectionProps) {
+export default function AutoInvestigateSection({ notify, openChat }: SectionProps) {
   const { config, setConfig, defaults, bounds, profiles, phase, reload, save } = useOrchestrator()
   const ceiling = useCeiling()
   const investigate = useInvestigateWorkflows()
@@ -325,10 +602,11 @@ export default function AutoInvestigateSection({ notify }: SectionProps) {
     aiConfigApi.getInvestigationReplay().then((r) => setReplay(r.data), () => setReplay(null))
   }, [])
   const [floor, setFloor] = useState('')
-  const unverified = useUnverifiedTools()
+  const outsideTools = useOutsideTools()
   const emulation = useEmulation()
   const [allTools, setAllTools] = useState(false)
-  const { hasPermission } = useAuth()
+  const { hasPermission, user } = useAuth()
+  const machine = Boolean(user?.service_account)
   // write raises, resumes and switches four-eyes; stop stops and lowers
   const canRaise = hasPermission('ai_autonomy.write')
   const canLower = canRaise || hasPermission('ai_autonomy.stop')
@@ -343,12 +621,16 @@ export default function AutoInvestigateSection({ notify }: SectionProps) {
   const [advanced, setAdvanced] = useState(false)
   const [intentRevision, setIntentRevision] = useState(0)
   const [pending, setPending] = useState<PendingSave | null>(null)
+  // The one carrier being edited: its text, kept through a refusal, and the refusal
+  const [carrierEdit, setCarrierEdit] = useState<{ name: string; text: string; error: string | null } | null>(null)
+  const editing = useRef(carrierEdit)
+  editing.current = carrierEdit
   // Live rules only Vigil runs: Stop halts their detection, so the Stop prompt names them
   const [overlayOnly, setOverlayOnly] = useState<OverlayOnlyRule[]>([])
   const [deploying, setDeploying] = useState<number[] | 'all' | null>(null)
   const stopping = pending?.kind === 'stop'
-  // The declared directory's act.hold_crown_jewels, when it manages that key: the API refuses a turn-off below it.
-  const [holdManaged, setHoldManaged] = useState<{ declared: unknown; file?: string | null; line?: number | null } | null>(null)
+  // The declared directory's on-is-tighter keys it manages (the crown-jewel hold, the score factors), by key: the API refuses a turn-off below a declared on.
+  const [onManaged, setOnManaged] = useState<Record<string, ManagedSwitch>>({})
   // Workflows the declared directory manages, by id: the API refuses a raise past the declared entry.
   const [flowManaged, setFlowManaged] = useState<Record<string, ManagedFlow>>({})
   useEffect(() => {
@@ -356,7 +638,8 @@ export default function AutoInvestigateSection({ notify }: SectionProps) {
     configApi
       .getIntent()
       .then((r) => {
-        const row = r.data.rows?.find((x) => x.key === 'act.hold_crown_jewels' && x.managed)
+        const switches: Record<string, ManagedSwitch> = {}
+        for (const x of r.data.rows ?? []) if (x.managed && ON_TIGHTER_KEYS.includes(x.key)) switches[x.key] = x
         const flows: Record<string, ManagedFlow> = {}
         for (const x of r.data.rows ?? []) {
           if (x.managed && x.key.startsWith('workflows.'))
@@ -368,12 +651,12 @@ export default function AutoInvestigateSection({ notify }: SectionProps) {
             }
         }
         if (cancelled) return
-        setHoldManaged(row ?? null)
+        setOnManaged(switches)
         setFlowManaged(flows)
       })
       .catch(() => {
         if (cancelled) return
-        setHoldManaged(null) // unread: the API still refuses
+        setOnManaged({}) // unread: the API still refuses
         setFlowManaged({})
       })
     return () => {
@@ -514,6 +797,15 @@ export default function AutoInvestigateSection({ notify }: SectionProps) {
     if (JSON.stringify(config) !== JSON.stringify(lastSaved.current)) commitConfig(config)
   }
 
+  // Why switching an on-is-tighter key off would be refused, said before anyone tries.
+  const offRefusal = (key: string, on: boolean, stopped: boolean): string | null => {
+    if (!on) return null
+    const m = onManaged[key]
+    if (m?.declared === true)
+      return `Managed by ${m.file ?? 'INTENT.md'}:${m.line ?? 1}, declared on. Change it in the declared directory.`
+    return stopped ? STOPPED_LOOSEN : null
+  }
+
   const saveCeiling = async (patch: Parameters<typeof ceiling.save>[0]) => {
     try {
       await ceiling.save(patch)
@@ -545,23 +837,46 @@ export default function AutoInvestigateSection({ notify }: SectionProps) {
     }
   }
 
-  const classifyTool = async (name: string, to: EffectClass) => {
+  // Always sends the hash of the definition shown; a 409 reloads the list with the current one, never retries.
+  const classifyTool = async (name: string, to: EffectClass, hash?: string | null) => {
     try {
-      await unverified.classify(name, to)
+      await outsideTools.classify(name, to, hash)
       notify('ok', `${name} is now ${CLASS_PHRASE[to]}.`)
     } catch (err) {
-      notify('err', errorText(err, 'Failed to save the tool’s class.'))
+      const changed = (err as { response?: { data?: { detail?: { definition?: unknown } } } })?.response?.data?.detail
+      if (changed && typeof changed === 'object' && 'definition' in changed)
+        notify('err', `${name}’s definition changed since it was shown. Review it below and classify it again.`)
+      else notify('err', errorText(err, 'Failed to save the tool’s class.'))
       ceiling.refresh() // a 409 means someone stopped meanwhile
     }
   }
 
+  // A raise to Act on a managed workflow also lifts its bar to the declared one, or the server refuses it as a loosening.
+  const declaredBarLift = (w: InvestigateWorkflow): number | null => {
+    const want = flowManaged[w.id]?.declared.bar
+    const have = workflowTier(ceil, w.id)?.bar
+    return want != null && (have == null || have < want) ? want : null
+  }
+
   const setWorkflow = async (w: InvestigateWorkflow, to: WorkflowChoice, floorPct?: number) => {
+    const lift = to === 'act' ? declaredBarLift(w) : null
     try {
-      await ceiling.setWorkflow(w.id, { tier: to === 'fleet' ? null : to, floor: floorPct ?? null })
+      await ceiling.setWorkflow(w.id, { tier: to === 'fleet' ? null : to, floor: floorPct ?? null, ...(lift != null ? { bar: lift } : {}) })
       notify('ok', `${w.name} ${to === 'fleet' ? 'follows the fleet' : to === 'act' ? 'acts on its own' : 'asks first'}.`)
       setIntentRevision((n) => n + 1) // a managed workflow's narrowing shows as drift
     } catch (err) {
       notify('err', errorText(err, 'Failed to save the workflow’s autonomy.'))
+    }
+  }
+
+  const setBar = async (w: InvestigateWorkflow, bar: number | null): Promise<boolean> => {
+    try {
+      await ceiling.setWorkflow(w.id, { bar })
+      notify('ok', bar == null ? `${w.name} has no bar.` : `${w.name}’s bar is ${barText(bar)}.`)
+      return true
+    } catch (err) {
+      notify('err', errorText(err, 'Failed to save the bar.'))
+      return false
     }
   }
 
@@ -589,7 +904,13 @@ export default function AutoInvestigateSection({ notify }: SectionProps) {
         stopAll()
         return
       case 'tool':
-        classifyTool(current.name, current.to)
+        classifyTool(current.name, current.to, current.hash)
+        return
+      case 'bind':
+        bindTool(current.name, current.capability)
+        return
+      case 'carrier':
+        saveCarrier(current.name, current.act, current.body)
         return
       case 'workflow':
         setWorkflow(current.workflow, 'act', floorValue)
@@ -707,34 +1028,191 @@ export default function AutoInvestigateSection({ notify }: SectionProps) {
   }
 
   // write may loosen (confirm first, refused while stopped); stop may only tighten
-  const toolRow = (t: ToolClass, stopped: boolean) => {
+  // Binding nothing saves at once for anyone who can lower; binding one, or the shipped one back, confirms first.
+  const bindTool = async (name: string, capability: string | null) => {
+    try {
+      await outsideTools.bind(name, capability === BIND_NOTHING ? {} : capability == null ? null : { capability })
+      setCarrierEdit((e) => (e?.name === name ? null : e))
+      notify(
+        'ok',
+        capability == null
+          ? `${name} is back on its shipped binding.`
+          : capability === EMULATION
+            ? `${name} is now an emulator.`
+            : capability
+              ? `${name} now answers ${capability}.`
+              : `${name} is bound to nothing.`,
+      )
+    } catch (err) {
+      notify('err', errorText(err, 'Failed to save the tool’s capability.'))
+      ceiling.refresh() // a 409 means someone stopped meanwhile
+    }
+  }
+
+  // A refusal (a missing part, a second carrier of the act on the server) shows under the text, which stays.
+  const saveCarrier = async (name: string, act: string, body: ToolBindingBody) => {
+    try {
+      await outsideTools.bind(name, body)
+      setCarrierEdit((e) => (e?.name === name ? null : e))
+      notify('ok', `${name} now carries ${act}.`)
+    } catch (err) {
+      const why = refusal(err)
+      // inline under its own editor; a toast once that editor is closed or moved on
+      if (editing.current?.name === name) setCarrierEdit((e) => (e?.name === name ? { ...e, error: why } : e))
+      else notify('err', `${name}: ${why}`)
+      ceiling.refresh()
+    }
+  }
+
+  // Parsed in the field; the server judges the parts once confirmed.
+  const submitCarrier = () => {
+    if (!carrierEdit) return
+    let body: unknown
+    try {
+      body = parseYaml(carrierEdit.text)
+    } catch (err) {
+      setCarrierEdit({ ...carrierEdit, error: `Not YAML: ${(err as Error).message.split('\n')[0].replace(/:$/, '')}` })
+      return
+    }
+    if (!body || typeof body !== 'object' || Array.isArray(body) || typeof (body as { act?: unknown }).act !== 'string') {
+      setCarrierEdit({ ...carrierEdit, error: 'A carrier is a mapping that starts with act, such as act: isolate_host.' })
+      return
+    }
+    const unknown = Object.keys(body).filter((k) => !CARRIER_KEYS.has(k))
+    if (unknown.length) {
+      setCarrierEdit({ ...carrierEdit, error: `Not a part of a carrier: ${unknown.join(', ')}. See docs/acts.md.` })
+      return
+    }
+    setCarrierEdit({ ...carrierEdit, error: null })
+    const carrier = body as ToolBindingBody & { act: string }
+    setPending({ kind: 'carrier', name: carrierEdit.name, act: carrier.act, body: carrier })
+  }
+
+  const carrierEditor = (t: ToolClass, mayBind: boolean) => {
+    if (carrierEdit?.name !== t.name) return null
+    const id = `lim-carrier-${t.name}`
+    return (
+      <div className="lim-carrier">
+        <label className="field-label" htmlFor={id}>
+          Carrier for {t.name}, in the form docs/acts.md describes
+        </label>
+        <textarea
+          id={id}
+          className="field-input lim-carrier-text"
+          rows={Math.min(18, carrierEdit.text.split('\n').length + 1)}
+          spellCheck={false}
+          value={carrierEdit.text}
+          aria-invalid={carrierEdit.error != null}
+          aria-describedby={`${id}-why`}
+          onChange={(e) => setCarrierEdit({ ...carrierEdit, text: e.target.value })}
+        />
+        {carrierEdit.error ? (
+          <span className="field-hint err" id={`${id}-why`} role="alert">
+            {carrierEdit.error}
+          </span>
+        ) : (
+          <span className="field-hint" id={`${id}-why`}>
+            Tools are bare names of the act tool’s own server. A server carries one carrier per act kind.
+          </span>
+        )}
+        <div className="lim-carrier-ctl">
+          {!mayBind && <span className="lim-class-note">{machine ? 'A service account cannot bind a carrier.' : STOPPED_LOOSEN}</span>}
+          <button type="button" className="btn ghost" onClick={() => setCarrierEdit(null)}>
+            Cancel
+          </button>
+          <button type="button" className="btn primary" disabled={!mayBind} onClick={submitCarrier}>
+            Save carrier
+          </button>
+        </div>
+      </div>
+    )
+  }
+
+  // Changing what a tool answers loosens unless it binds nothing; a machine never binds.
+  const bindSelect = (t: ToolClass, stopped: boolean) => {
+    const current = bindValue(t)
+    const shipped = t.shipped_binding?.capability
+    const shippedAct = t.shipped_binding?.act ?? undefined
+    const mayBind = canRaise && !machine && !stopped
+    const options = [
+      ...(shipped || shippedAct ? [{ value: BIND_SHIPPED, label: `${shipped ? capLabel(shipped) : shippedAct} · shipped` }] : []),
+      { value: BIND_NOTHING, label: 'Nothing' },
+      // any tool may carry an act, a tool Vigil has never named included
+      { value: BIND_ACT, label: current === BIND_ACT ? `${t.binding?.act} · edit carrier…` : 'Act…' },
+      // the shipped capability once, unless a person bound it again by name
+      ...outsideTools.capabilities.filter((c) => c !== shipped || c === current).map((c) => ({ value: c, label: capLabel(c) })),
+    ].filter((o) => o.value === current || (o.value === BIND_NOTHING ? canLower : mayBind))
+    // the server binds only a classified tool
+    if (!canLower || t.effect_class == null || options.length < 2) return null
+    const pick = (value: string) => {
+      // the editor opens again on its own choice, to change the carrier in force
+      if (value === BIND_ACT) {
+        // an editor already open on this row keeps its text
+        if (mayBind && carrierEdit?.name !== t.name)
+          setCarrierEdit({ name: t.name, text: carrierText(t, outsideTools.tools ?? []), error: null })
+        return
+      }
+      if (value === current) return
+      if (value === BIND_NOTHING) bindTool(t.name, BIND_NOTHING)
+      else setPending({ kind: 'bind', name: t.name, capability: value === BIND_SHIPPED ? null : value, shippedAct })
+    }
+    return (
+      <span className="lim-bind">
+        <span>{t.binding?.act ? 'Carries' : 'Answers'}</span>
+        <Select label={`Capability of ${t.name}`} value={current} options={options} onSelect={pick} />
+      </span>
+    )
+  }
+
+  const toolRow = (t: ToolClass, stopped: boolean, roles: string[] = []) => {
     const { server, tool } = splitTool(t.name)
     const choices = CHOICES.filter((c) => canRaise || (canLower && !loosens(t.effect_class, c.to)))
     return (
-      <div className="lim-row" key={t.name}>
-        <span className="lim-row-title">
+      <div className="lim-row lim-tool" key={t.name}>
+        <div className="lim-row-title">
           <span className="lim-tool-name" title={t.name}>{tool}</span>
           <span title={server}>{server || 'Unknown server'}</span>
+          {/* a withdrawn tool: what was classified, then what its server lists now */}
+          {t.withdrawn && t.pinned_definition && <ToolDefinition label="Classified" def={t.pinned_definition} />}
+          {t.definition && <ToolDefinition label={t.withdrawn ? 'Now' : undefined} def={t.definition} />}
+        </div>
+        <span className={`lim-row-tag${t.effect_class && t.effect_class !== 'read_unverified' ? '' : ' fair'}`}>
+          {t.binding?.emulation && <span className="lim-emu-mark">Emulator</span>}{' '}
+          {t.withdrawn
+            ? 'Withdrawn: its definition changed since it was classified. Agents are not offered it until a person classifies it again'
+            : t.effect_class
+              ? CLASS_TAG[t.effect_class]
+              : 'Unclassified, waits for a person'}
+          {t.remote && !t.withdrawn && (
+            <span className="lim-tool-pin">Classifying pins the definition shown; a change withdraws it</span>
+          )}
+          {bindingNote(t) && <span className="lim-tool-bound">{bindingNote(t)}</span>}
+          {roles.map((r) => (
+            <span className="lim-tool-role" key={r}>
+              {r}
+            </span>
+          ))}
         </span>
-        <span className={`lim-row-tag${t.effect_class ? '' : ' fair'}`}>
-          {emulation.data?.tools.includes(t.name) && <span className="lim-emu-mark">Emulator</span>}{' '}
-          {t.effect_class ? 'Runs as a read, unconfirmed' : 'Unclassified, waits for a person'}
-        </span>
-        <span className="lim-row-ctl">
+        <span className="lim-row-ctl lim-tool-ctl">
           {choices.length > 0 && (
             <div className="lim-seg" role="group" aria-label={`Class of ${t.name}`}>
               {choices.map((c) => {
                 const loosen = loosens(t.effect_class, c.to)
                 const blocked = loosen && stopped
+                const on = t.effect_class === c.to
                 return (
                   <button
                     key={c.to}
                     type="button"
-                    aria-pressed={false}
+                    aria-pressed={on}
                     disabled={blocked}
                     title={blocked ? STOPPED_LOOSEN : undefined}
                     onClick={() =>
-                      loosen ? setPending({ kind: 'tool', name: t.name, to: c.to }) : classifyTool(t.name, c.to)
+                      on
+                        ? undefined
+                        : loosen
+                        ? setPending({ kind: 'tool', name: t.name, to: c.to, hash: t.definition_hash })
+                        : classifyTool(t.name, c.to, t.definition_hash)
                     }
                   >
                     {c.label}
@@ -743,7 +1221,9 @@ export default function AutoInvestigateSection({ notify }: SectionProps) {
               })}
             </div>
           )}
+          {bindSelect(t, stopped)}
         </span>
+        {carrierEditor(t, canRaise && !machine && !stopped)}
       </div>
     )
   }
@@ -753,7 +1233,10 @@ export default function AutoInvestigateSection({ notify }: SectionProps) {
     const entry = workflowTier(ceil, w.id)
     const current: WorkflowChoice = entry?.tier ?? 'fleet'
     const fleetActs = Boolean(ceil?.act_reversible || ceil?.act_irreversible)
-    const raises = (to: WorkflowChoice) => to === 'act' || (to === 'fleet' && current === 'assist' && fleetActs)
+    const bar = entry?.bar ?? null
+    // Following the fleet drops the bar, which loosens as a raise does.
+    const raises = (to: WorkflowChoice) =>
+      to === 'act' || (to === 'fleet' && ((current === 'assist' && fleetActs) || bar != null))
     const managed = flowManaged[w.id]
     const where = managed && `${managed.file}:${managed.line} @ ${managed.revision}`
     // As the server judges it: past an Assist declaration, Act or a fleet that acts is a raise.
@@ -765,6 +1248,7 @@ export default function AutoInvestigateSection({ notify }: SectionProps) {
     const change = lastChange(entry)
     const unattributed = w.agreement?.unattributed ?? 0
     const replayed = replayLine(replay, w.id)
+    const steps = stepLines(w.steps)
     return (
       <div className={`lim-row lim-wf${choices.length < 2 ? ' lim-wf-static' : ''}`} key={w.id}>
         <span className="lim-row-title">
@@ -795,15 +1279,25 @@ export default function AutoInvestigateSection({ notify }: SectionProps) {
             </span>
           )}
           {replayed && <span className="lim-wf-model">{replayed}</span>}
+          {steps.map((line) => (
+            <span className="lim-wf-model" key={line}>
+              {line}
+            </span>
+          ))}
         </span>
         <span className="lim-wf-tag">
           <span>
             {entry?.floor ? `Floor ${entry.floor}%` : 'No floor'}
+            {bar != null ? ` · Bar ${barText(bar)}` : ' · no bar set'}
             {entry?.model && ` · on ${entry.model}`}
           </span>
           {change && <span title={change}>{change}</span>}
           {managed && (
-            <span title={`Declared ${managed.declared.tier === 'act' ? `Act · floor ${managed.declared.floor}` : 'Assist'}`}>
+            <span
+              title={`Declared ${managed.declared.tier === 'act' ? `Act · floor ${managed.declared.floor}` : 'Assist'}${
+                managed.declared.bar != null ? ` · bar ${barText(managed.declared.bar)}` : ''
+              }`}
+            >
               Managed by {where}
             </span>
           )}
@@ -847,6 +1341,23 @@ export default function AutoInvestigateSection({ notify }: SectionProps) {
               })}
             </div>
           )}
+          {/* a workflow that follows the fleet has no entry, so no bar to set */}
+          {entry && canLower && (
+            <WorkflowBar
+              name={w.name}
+              stored={bar}
+              canRaise={canRaise}
+              machine={machine}
+              stopped={stopped}
+              // Only under Act on both sides does the server judge the bar against the declared one.
+              managed={
+                where && current === 'act' && managed.declared.tier === 'act' && managed.declared.bar != null
+                  ? { bar: managed.declared.bar, where }
+                  : undefined
+              }
+              save={(to) => setBar(w, to)}
+            />
+          )}
         </span>
       </div>
     )
@@ -875,22 +1386,31 @@ export default function AutoInvestigateSection({ notify }: SectionProps) {
   )
 
   const toolList = (stopped: boolean) => {
-    const tools = (unverified.phase === 'ready' && unverified.tools) || []
+    const tools = (outsideTools.phase === 'ready' && outsideTools.tools) || []
+    const unconfirmed = tools.filter((t) => t.withdrawn || t.effect_class == null || t.effect_class === 'read_unverified')
     const shown = allTools ? tools : tools.slice(0, TOOLS_SHOWN)
+    const marks = roleMarks(tools)
     return (
       <div className="lim-tools mt-3">
         <div className="lim-tools-head">
           <h4>
-            Tools nobody has confirmed{' '}
-            {unverified.phase === 'ready' && <span className="lim-tools-count">{tools.length}</span>}
+            Outside tools{' '}
+            {outsideTools.phase === 'ready' && (
+              <span className="lim-tools-count" title="Nobody has confirmed these">
+                {unconfirmed.length} unconfirmed
+              </span>
+            )}
           </h4>
           <span>
-            Each outside tool’s class decides when it may act on its own. These were guessed to be reads, or have
-            no class yet.
+            Each outside tool’s class decides when it may act on its own; what it answers decides which hunts,
+            investigations and root-cause traces hold it. Tools guessed to be reads, or with no class yet, come first.
           </span>
           {!canLower && tools.length > 0 && <span>Your role can see these but not change them.</span>}
           {canLower && !canRaise && tools.length > 0 && (
-            <span>Your role can mark a tool reversible or cannot be undone. Confirming a read, or classing a new tool, needs permission to loosen autonomy.</span>
+            <span>
+              Your role can mark a tool reversible or cannot be undone, or make it answer nothing. Confirming a read,
+              classing a new tool, or binding one to a capability needs permission to loosen autonomy.
+            </span>
           )}
           {stopped && canRaise && tools.length > 0 && (
             <span className="lim-class-note">
@@ -898,14 +1418,14 @@ export default function AutoInvestigateSection({ notify }: SectionProps) {
             </span>
           )}
         </div>
-        {unverified.phase === 'loading' && <span className="text-xs text-tx-3">Loading tools…</span>}
-        {unverified.phase === 'error' && (
+        {outsideTools.phase === 'loading' && <span className="text-xs text-tx-3">Loading tools…</span>}
+        {outsideTools.phase === 'error' && (
           <span className="text-xs text-tx-3">Could not load the tools. Reload to try again.</span>
         )}
-        {unverified.phase === 'ready' && tools.length === 0 && (
-          <span className="text-xs text-tx-3">Every outside tool has a confirmed class.</span>
+        {outsideTools.phase === 'ready' && tools.length === 0 && (
+          <span className="text-xs text-tx-3">No outside tool is connected.</span>
         )}
-        {shown.map((t) => toolRow(t, stopped))}
+        {shown.map((t) => toolRow(t, stopped, marks[t.name]))}
         {tools.length > TOOLS_SHOWN && (
           <button type="button" className="btn ghost mt-2" onClick={() => setAllTools((a) => !a)}>
             {allTools ? 'Show fewer' : `Show all ${tools.length}`}
@@ -1237,15 +1757,8 @@ export default function AutoInvestigateSection({ notify }: SectionProps) {
             {(() => {
               const on = ceil.hold_crown_jewels
               const n = ceil.crown_jewels
-              const managedOn = holdManaged?.declared === true
-              // Why a turn-off would be refused, said before anyone tries.
-              const refusal = !on
-                ? null
-                : managedOn
-                  ? `Managed by ${holdManaged?.file ?? 'INTENT.md'}:${holdManaged?.line ?? 1}, declared on. Change it in the declared directory.`
-                  : ceil.stopped
-                    ? STOPPED_LOOSEN
-                    : null
+              const managedOn = onManaged['act.hold_crown_jewels']?.declared === true
+              const refusal = offRefusal('act.hold_crown_jewels', on, ceil.stopped)
               return (
                 <div className="lim-switch">
                   <div className="toggle-row-text">
@@ -1283,6 +1796,40 @@ export default function AutoInvestigateSection({ notify }: SectionProps) {
                 </div>
               )
             })()}
+            {SCORE_FACTORS.map((f) => {
+              const on = ceil[f.attr]
+              const managedOn = onManaged[f.key]?.declared === true
+              const refusal = offRefusal(f.key, on, ceil.stopped)
+              return (
+                <div className="lim-switch" key={f.key}>
+                  <div className="toggle-row-text">
+                    <span className="toggle-row-label">{f.label}</span>
+                    <span className="toggle-row-hint">{f.hint}</span>
+                    {refusal && canRaise && (
+                      <span className="lim-class-note">
+                        <Icon name={managedOn ? 'lock' : 'alert'} size={13} className="shrink-0" /> {refusal}
+                      </span>
+                    )}
+                  </div>
+                  {canRaise ? (
+                    <Toggle
+                      label={f.label}
+                      checked={on}
+                      disabled={refusal != null}
+                      title={refusal ?? undefined}
+                      onChange={(v) => saveCeiling({ [f.attr]: v })}
+                    />
+                  ) : canLower && !on ? (
+                    <Toggle label={f.label} checked={false} onChange={() => saveCeiling({ [f.attr]: true })} />
+                  ) : (
+                    <span className="text-sm text-tx-2">{on ? 'On' : 'Off'}</span>
+                  )}
+                </div>
+              )
+            })}
+            {SCORE_FACTORS.every((f) => !ceil[f.attr]) && (
+              <span className="toggle-row-hint">No factors in force: every step score reads “no factors in force” and holds nothing.</span>
+            )}
             {heldList(ceil)}
             {workflowList(ceil.stopped)}
             {toolList(ceil.stopped)}
@@ -1361,7 +1908,7 @@ export default function AutoInvestigateSection({ notify }: SectionProps) {
             />
             {canReadSite && (
               <div id="declared-site">
-                <SiteContextCard reloadKey={intentRevision} />
+                <SiteContextCard reloadKey={intentRevision} notify={notify} openChat={openChat} />
               </div>
             )}
           </div>
@@ -1394,6 +1941,8 @@ export default function AutoInvestigateSection({ notify }: SectionProps) {
               {flowManaged[pending.workflow.id]?.declared.floor && (
                 <p className="text-xs text-tx-3 mt-2">
                   Managed by INTENT.md: at least {flowManaged[pending.workflow.id].declared.floor}%, the declared floor.
+                  {declaredBarLift(pending.workflow) != null &&
+                    ` The bar is raised to the declared ${barText(declaredBarLift(pending.workflow)!)}.`}
                 </p>
               )}
             </>
@@ -1409,7 +1958,7 @@ export default function AutoInvestigateSection({ notify }: SectionProps) {
             ? overlayOnly.length
               ? `Stop · ${overlayOnly.length === 1 ? '1 rule goes' : `${overlayOnly.length} rules go`} dark`
               : 'Stop'
-            : pending?.kind === 'tool'
+            : pending?.kind === 'tool' || pending?.kind === 'bind' || pending?.kind === 'carrier'
               ? 'Confirm'
               : 'Save'
         }

@@ -1634,10 +1634,31 @@ export interface paths {
          * @description Edit the ceiling. The permission depends on the direction.
          *
          *     Only lowering act flags or the hourly cap, or turning the crown-jewel hold
-         *     on, is ``ai_autonomy.stop``. Raising a flag or the cap, changing four-eyes,
-         *     or turning the hold off is ``ai_autonomy.write``.
+         *     or a step-score factor on, is ``ai_autonomy.stop``. Raising a flag or the
+         *     cap, changing four-eyes, or turning the hold or a factor off is
+         *     ``ai_autonomy.write``.
          */
         put: operations["put_api_autonomy"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/autonomy/capabilities": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List Capabilities
+         * @description The capabilities a person may bind an outside tool to.
+         */
+        get: operations["get_api_autonomy_capabilities"];
+        put?: never;
         post?: never;
         delete?: never;
         options?: never;
@@ -1656,12 +1677,12 @@ export interface paths {
         get: operations["get_api_autonomy_emulation"];
         /**
          * Put Emulation
-         * @description Mark or unmark emulators, and edit the hosts they may run on.
+         * @description Edit the hosts emulators may run on.
          *
-         *     Adding a mark or a host lets an emulator act where it could not: a
-         *     person's ``ai_autonomy.write``, refused while stopped, as loosening a
-         *     tool's class is. Removing either is ``ai_autonomy.stop``. One trail entry
-         *     names who changed what.
+         *     Adding a host lets an emulator act where it could not: a person's
+         *     ``ai_autonomy.write``, refused while stopped, as loosening a tool's class
+         *     is. Removing one is ``ai_autonomy.stop``. One trail entry names who
+         *     changed what.
          */
         put: operations["put_api_autonomy_emulation"];
         post?: never;
@@ -1792,7 +1813,8 @@ export interface paths {
         };
         /**
          * List Tool Classes
-         * @description Every stored class, and each unclassified name a connected server exposes.
+         * @description Every stored class, and each unclassified name a connected server exposes,
+         *     with the definition the registry holds for it.
          */
         get: operations["get_api_autonomy_tools"];
         put?: never;
@@ -1813,11 +1835,15 @@ export interface paths {
         get?: never;
         /**
          * Put Tool Class
-         * @description Set one tool's class. The permission depends on the direction.
+         * @description Set one tool's class, its binding, or both. The permission depends on
+         *     the direction.
          *
-         *     Loosening, or classifying an unclassified name, is a person's
-         *     ``ai_autonomy.write`` and is refused while stopped. Tightening is
-         *     ``ai_autonomy.stop``, which a service account may hold.
+         *     Loosening, or classifying an unclassified or withdrawn name, is a person's
+         *     ``ai_autonomy.write`` and is refused while stopped; so is binding a tool to
+         *     a capability or an act, or putting back a shipped binding that binds one. Tightening,
+         *     and binding nothing, is ``ai_autonomy.stop``, which a service account may
+         *     hold. A person's classification of a remote server's tool pins the
+         *     definition held now.
          */
         put: operations["put_api_autonomy_tools_name"];
         post?: never;
@@ -1846,6 +1872,11 @@ export interface paths {
          *     30-day agreement on the workflow beside its floor.
          *     Anything else is ``ai_autonomy.stop``. A workflow a declared INTENT.md
          *     manages is refused (409) anything looser than its declared entry.
+         *
+         *     The bar (#5276) follows the same split: setting or raising it is
+         *     ``ai_autonomy.stop``; lowering or clearing it, clearing the tier under it
+         *     included, is a loosening as a raise is. A bar-only change keeps the rest of
+         *     the entry as it is.
          */
         put: operations["put_api_autonomy_workflows_workflow_id"];
         post?: never;
@@ -3445,6 +3476,10 @@ export interface paths {
          * Set Integrations Config
          * @description Set integrations configuration.
          *
+         *     A new id ``<integration-id>-<label>`` with ``instance_of`` adds an instance
+         *     of a launched integration (#5353), checked before anything is written; a
+         *     person's creation copies its base's tool classes and bindings.
+         *
          *     Secret-typed fields (registered in ``core.integrations.integration_secrets``) are
          *     routed to the encrypted secrets store via ``set_secret`` and stripped
          *     from the dict that lands in the DB / JSON file. Empty strings are
@@ -3465,6 +3500,28 @@ export interface paths {
          */
         post: operations["post_api_config_integrations"];
         delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/config/integrations/{integration_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /**
+         * Delete Integration Instance
+         * @description Remove an integration instance (#5353): its config row, stored
+         *     credentials, enabled state and ``<id>_`` class rows, each with a trail
+         *     entry. Only an instance: an integration's own row is not removed here.
+         */
+        delete: operations["delete_api_config_integrations_integration_id"];
         options?: never;
         head?: never;
         patch?: never;
@@ -3885,6 +3942,49 @@ export interface paths {
          *     refresh unfinished, or another start in progress).
          */
         post: operations["post_api_config_site_proposal_refresh"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/config/sources": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get Sources
+         * @description Declared remote MCP sources (#5302): each one's URL, credential fields
+         *     and where each is set, accepted or pending and what a pending change
+         *     alters, and the rejection if any. Never a header or credential value.
+         */
+        get: operations["get_api_config_sources"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/config/sources/accept": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Accept Sources Pending
+         * @description Accept new or changed declared sources. A person's act, allowed while
+         *     stopped: it widens reach, not autonomy; each new tool still asks first.
+         */
+        post: operations["post_api_config_sources_accept"];
         delete?: never;
         options?: never;
         head?: never;
@@ -6061,11 +6161,17 @@ export interface paths {
          *     * changed spawn config: reconnected on the new config. A stdio child
          *       compares command, args, cwd and declared env; a server in the MCP runner
          *       compares only its declared env and credentials, because the runner
-         *       launches from its own catalog and ignores command, args and cwd;
+         *       launches from its own catalog and ignores command, args and cwd; a
+         *       remote (``url``) entry compares its URL and headers as resolved now;
          *     * unchanged: left alone.
          *
-         *     ``reconnected``, ``disconnected`` and ``failed`` (name → error) report
-         *     what happened; ``success`` is false if any reconnect or disconnect failed.
+         *     Accepted declared sources (``sources/``) are merged into the catalog as
+         *     remote entries, and an enabled one with no session is connected; the same
+         *     apply runs on its own as ``sources.applied`` changes.
+         *
+         *     ``reconnected``, ``disconnected``, ``connected`` and ``failed`` (name →
+         *     error) report what happened; ``success`` is false if any reconnect,
+         *     disconnect or source connect failed.
          */
         post: operations["post_api_mcp_servers_reload"];
         delete?: never;
@@ -9341,10 +9447,31 @@ export interface paths {
          * @description Edit the ceiling. The permission depends on the direction.
          *
          *     Only lowering act flags or the hourly cap, or turning the crown-jewel hold
-         *     on, is ``ai_autonomy.stop``. Raising a flag or the cap, changing four-eyes,
-         *     or turning the hold off is ``ai_autonomy.write``.
+         *     or a step-score factor on, is ``ai_autonomy.stop``. Raising a flag or the
+         *     cap, changing four-eyes, or turning the hold or a factor off is
+         *     ``ai_autonomy.write``.
          */
         put: operations["put_api_v1_autonomy"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/autonomy/capabilities": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List Capabilities
+         * @description The capabilities a person may bind an outside tool to.
+         */
+        get: operations["get_api_v1_autonomy_capabilities"];
+        put?: never;
         post?: never;
         delete?: never;
         options?: never;
@@ -9425,7 +9552,8 @@ export interface paths {
         };
         /**
          * List Tool Classes
-         * @description Every stored class, and each unclassified name a connected server exposes.
+         * @description Every stored class, and each unclassified name a connected server exposes,
+         *     with the definition the registry holds for it.
          */
         get: operations["get_api_v1_autonomy_tools"];
         put?: never;
@@ -9446,11 +9574,15 @@ export interface paths {
         get?: never;
         /**
          * Put Tool Class
-         * @description Set one tool's class. The permission depends on the direction.
+         * @description Set one tool's class, its binding, or both. The permission depends on
+         *     the direction.
          *
-         *     Loosening, or classifying an unclassified name, is a person's
-         *     ``ai_autonomy.write`` and is refused while stopped. Tightening is
-         *     ``ai_autonomy.stop``, which a service account may hold.
+         *     Loosening, or classifying an unclassified or withdrawn name, is a person's
+         *     ``ai_autonomy.write`` and is refused while stopped; so is binding a tool to
+         *     a capability or an act, or putting back a shipped binding that binds one. Tightening,
+         *     and binding nothing, is ``ai_autonomy.stop``, which a service account may
+         *     hold. A person's classification of a remote server's tool pins the
+         *     definition held now.
          */
         put: operations["put_api_v1_autonomy_tools_name"];
         post?: never;
@@ -11537,6 +11669,55 @@ export interface components {
             /** Services */
             services: string[];
         };
+        /** BindingBody */
+        BindingBody: {
+            /** Act */
+            act?: string | null;
+            /** Act State */
+            act_state?: {
+                [key: string]: unknown;
+            } | null;
+            /** Address Arg */
+            address_arg?: string | null;
+            /** Capability */
+            capability?: string | null;
+            /** Carrier */
+            carrier?: string | null;
+            /** Emulation */
+            emulation?: boolean | null;
+            /** Id */
+            id?: string | null;
+            /** Id Arg */
+            id_arg?: string | null;
+            /** Lookup */
+            lookup?: string | null;
+            /** Lookup Arg */
+            lookup_arg?: string | null;
+            /** Name */
+            name?: string | null;
+            /** Note Arg */
+            note_arg?: string | null;
+            /** Read State */
+            read_state?: {
+                [key: string]: unknown;
+            } | null;
+            /** Rows */
+            rows?: string | null;
+            /** State */
+            state?: {
+                [key: string]: unknown;
+            } | null;
+            /** State Read */
+            state_read?: {
+                [key: string]: unknown;
+            } | null;
+            /** Takes */
+            takes?: string[] | null;
+            /** Undo */
+            undo?: string | null;
+            /** Undo From */
+            undo_from?: string | null;
+        };
         /** Body_attach_case_document_api_cases__case_id__attachments_post */
         Body_attach_case_document_api_cases__case_id__attachments_post: {
             /** File */
@@ -13186,6 +13367,12 @@ export interface components {
             act_irreversible?: boolean | null;
             /** Act Reversible */
             act_reversible?: boolean | null;
+            /** Confidence Blind Spots */
+            confidence_blind_spots?: boolean | null;
+            /** Confidence Precedent */
+            confidence_precedent?: boolean | null;
+            /** Confidence Run Quality */
+            confidence_run_quality?: boolean | null;
             /** Four Eyes */
             four_eyes?: boolean | null;
             /** Hold Crown Jewels */
@@ -13199,6 +13386,12 @@ export interface components {
             act_irreversible: boolean;
             /** Act Reversible */
             act_reversible: boolean;
+            /** Confidence Blind Spots */
+            confidence_blind_spots: boolean;
+            /** Confidence Precedent */
+            confidence_precedent: boolean;
+            /** Confidence Run Quality */
+            confidence_run_quality: boolean;
             /** Crown Jewels */
             crown_jewels: number;
             /** Environment Locked */
@@ -14148,20 +14341,21 @@ export interface components {
         };
         /**
          * EmulationBody
-         * @description The marked tools and the host list, each replacing what is stored.
+         * @description The host list, replacing what is stored. A host is one hostname: no
+         *     whitespace and no leading ``-``.
          *
-         *     An omitted field stays as it is. A host is one hostname: no whitespace and
-         *     no leading ``-``.
+         *     ``tools`` is read and ignored (#5315): a tool is an emulator by its binding,
+         *     set on its classify row (``PUT /api/v1/autonomy/tools/{name}``).
          */
         EmulationBody: {
             /** Hosts */
             hosts?: string[] | null;
             /** Tools */
-            tools?: string[] | null;
+            tools?: unknown[] | null;
         };
         /**
          * EmulationResponse
-         * @description Which outside tools are emulators, the hosts they may run on, and the defaults.
+         * @description The hosts emulators may run on, and the defaults.
          */
         EmulationResponse: {
             /** Defaults */
@@ -14170,8 +14364,6 @@ export interface components {
             };
             /** Hosts */
             hosts: string[];
-            /** Tools */
-            tools: string[];
         };
         /**
          * EndSignInsRequest
@@ -16387,6 +16579,13 @@ export interface components {
             run_id?: string | null;
             /** Source Id */
             source_id: string;
+            /**
+             * Step Score
+             * @description A containment an investigation filed: its step score's value, band ('none' when no factor is in force, 'unknown' when value is null), lowest factor, the line on what would raise it, and the factors.
+             */
+            step_score?: {
+                [key: string]: unknown;
+            } | null;
             /** Title */
             title: string;
             /**
@@ -16681,7 +16880,10 @@ export interface components {
             approved_at?: string | null;
             /** Approved By */
             approved_by?: string | null;
-            /** Confidence */
+            /**
+             * Confidence
+             * @description The step score's value (parameters.step_score.value) on a containment an investigation filed; null on a row without one.
+             */
             confidence?: number | null;
             /** Created At */
             created_at?: string | null;
@@ -18157,6 +18359,8 @@ export interface components {
             site_questions?: components["schemas"]["SiteQuestion"][];
             /** State */
             state: string;
+            /** Telemetry */
+            telemetry?: components["schemas"]["SiteTelemetry"][];
             /** Zones */
             zones?: components["schemas"]["SiteZone"][];
         };
@@ -18260,6 +18464,10 @@ export interface components {
             at?: string | null;
             /** Change */
             change: string;
+            /** Conversation Id */
+            conversation_id?: string | null;
+            /** Person */
+            person?: string | null;
             /** Person Id */
             person_id?: string | null;
             /** Ref */
@@ -18329,6 +18537,17 @@ export interface components {
             name?: string | null;
             /** Question */
             question: string;
+        };
+        /** SiteTelemetry */
+        SiteTelemetry: {
+            /** Covers */
+            covers: string;
+            /** File */
+            file: string;
+            /** Line */
+            line: number;
+            /** Name */
+            name: string;
         };
         /** SiteZone */
         SiteZone: {
@@ -18792,6 +19011,18 @@ export interface components {
              * @constant
              */
             version: 1;
+        };
+        /**
+         * SourcesAcceptBody
+         * @description The revision, hash and sources the person reviewed; a mismatch is a 409.
+         */
+        SourcesAcceptBody: {
+            /** Hash */
+            hash: string;
+            /** Revision */
+            revision: string;
+            /** Sources */
+            sources: string[];
         };
         /**
          * SparedCase
@@ -19317,6 +19548,8 @@ export interface components {
         };
         /** TerminalUpdate */
         TerminalUpdate: {
+            /** Blind Spots */
+            blind_spots?: unknown | null;
             /** Capped */
             capped?: unknown | null;
             /** Citation Count */
@@ -19349,6 +19582,8 @@ export interface components {
             summary: string;
             /** Title */
             title?: string | null;
+            /** Unserved Tools */
+            unserved_tools?: unknown | null;
         };
         /**
          * ThemeConfig
@@ -19476,25 +19711,84 @@ export interface components {
             /** Text */
             text: string;
         };
+        /** ToolBinding */
+        ToolBinding: {
+            /** Act */
+            act?: string | null;
+            /** Capability */
+            capability?: string | null;
+            /** Carrier */
+            carrier?: {
+                [key: string]: unknown;
+            } | null;
+            /**
+             * Emulation
+             * @default false
+             */
+            emulation: boolean;
+            /** Server */
+            server?: string | null;
+        };
         /** ToolClassBody */
         ToolClassBody: {
-            /**
-             * Effect Class
-             * @enum {string}
-             */
-            effect_class: "read" | "read_unverified" | "reversible" | "irreversible";
+            binding?: components["schemas"]["BindingBody"] | null;
+            /** Definition Hash */
+            definition_hash?: string | null;
+            /** Effect Class */
+            effect_class?: ("read" | "read_unverified" | "reversible" | "irreversible") | null;
         };
         /**
          * ToolClassEntry
-         * @description One outside tool. ``effect_class`` is None while it is unclassified.
+         * @description One outside tool. ``effect_class`` is None while it is unclassified or
+         *     withdrawn.
          */
         ToolClassEntry: {
+            binding?: components["schemas"]["ToolBinding"] | null;
+            /** Binding Source */
+            binding_source?: ("file" | "person") | null;
             /** Classified At */
             classified_at?: string | null;
             /** Classified By */
             classified_by?: string | null;
+            definition?: components["schemas"]["ToolDefinition"] | null;
+            /** Definition Hash */
+            definition_hash?: string | null;
             /** Effect Class */
             effect_class?: ("read" | "read_unverified" | "reversible" | "irreversible") | null;
+            /** Name */
+            name: string;
+            pinned_definition?: components["schemas"]["ToolDefinition"] | null;
+            /** Pinned Hash */
+            pinned_hash?: string | null;
+            /**
+             * Remote
+             * @default false
+             */
+            remote: boolean;
+            shipped_binding?: components["schemas"]["ToolBinding"] | null;
+            /**
+             * Withdrawn
+             * @default false
+             */
+            withdrawn: boolean;
+        };
+        /**
+         * ToolDefinition
+         * @description A tool as its server lists it: what a model reads, and what is pinned.
+         */
+        ToolDefinition: {
+            /**
+             * Description
+             * @default
+             */
+            description: string;
+            /**
+             * Inputschema
+             * @default {}
+             */
+            inputSchema: {
+                [key: string]: unknown;
+            };
             /** Name */
             name: string;
         };
@@ -19829,6 +20123,8 @@ export interface components {
          *     workflow to Assist. There is no evidence field: the server computes it.
          */
         WorkflowAutonomyBody: {
+            /** Bar */
+            bar?: number | null;
             /** Floor */
             floor?: number | null;
             /** Tier */
@@ -22849,6 +23145,37 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["CeilingResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_api_autonomy_capabilities: {
+        parameters: {
+            query?: never;
+            header?: {
+                authorization?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": string[];
                 };
             };
             /** @description Validation Error */
@@ -26186,6 +26513,39 @@ export interface operations {
             };
         };
     };
+    delete_api_config_integrations_integration_id: {
+        parameters: {
+            query?: never;
+            header?: {
+                authorization?: string | null;
+            };
+            path: {
+                integration_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
     post_api_config_integrations_integration_id_test: {
         parameters: {
             query?: never;
@@ -26898,6 +27258,76 @@ export interface operations {
                 };
                 content: {
                     "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_api_config_sources: {
+        parameters: {
+            query?: never;
+            header?: {
+                authorization?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    post_api_config_sources_accept: {
+        parameters: {
+            query?: never;
+            header?: {
+                authorization?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SourcesAcceptBody"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
                 };
             };
             /** @description Validation Error */
@@ -36881,6 +37311,37 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["CeilingResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_api_v1_autonomy_capabilities: {
+        parameters: {
+            query?: never;
+            header?: {
+                authorization?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": string[];
                 };
             };
             /** @description Validation Error */

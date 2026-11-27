@@ -187,8 +187,25 @@ class SOCDaemon:
 
         start("metrics", self._metrics_server, "Metrics server")
 
+        # The daemon's own MCP client re-merges accepted declared sources too.
+        from core.integrations.mcp.client import process_mcp_client
+        from core.integrations.mcp.reload import run_declared_sources
+
+        if process_mcp_client() is not None:
+            task = asyncio.create_task(
+                run_declared_sources(process_mcp_client(), None, self._shutdown_event),
+                name="sources",
+            )
+            task.add_done_callback(lambda t: self._on_task_done("sources", t))
+            tasks.append(task)
+
         # A declared directory (VIGIL_INTENT_DIR): this daemon is its only applier.
-        from services.daemon.intent_apply import clear_site, intent_dir, run_applier
+        from services.daemon.intent_apply import (
+            clear_site,
+            clear_sources,
+            intent_dir,
+            run_applier,
+        )
 
         directory = intent_dir()
         if directory is None:
@@ -196,6 +213,10 @@ class SOCDaemon:
                 await asyncio.to_thread(clear_site)
             except Exception:  # noqa: BLE001 - never stops the daemon
                 logger.exception("site: clearing the declared site failed")
+            try:  # and declared sources, in their own try
+                await asyncio.to_thread(clear_sources)
+            except Exception:  # noqa: BLE001 - never stops the daemon
+                logger.exception("sources: clearing declared sources failed")
         else:
             task = asyncio.create_task(
                 run_applier(directory, self._shutdown_event), name="intent"

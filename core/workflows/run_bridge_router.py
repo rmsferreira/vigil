@@ -118,6 +118,24 @@ class TerminalUpdate(BaseModel):
     capped: Optional[Any] = None
     citation_count: Optional[Any] = None
     grounded: Optional[Any] = None
+    # Calls the estate failed to a required tool that no later call served, and
+    # those tools, for the step score (#5275). Loose like the three above.
+    blind_spots: Optional[Any] = None
+    unserved_tools: Optional[Any] = None
+
+    def standing(self) -> Dict[str, Any]:
+        """The three facts, the blind-spot count and the unserved tools; None where unsaid."""
+        count, tools = self.blind_spots, self.unserved_tools
+        readable = isinstance(count, int) and not isinstance(count, bool) and count >= 0
+        return {
+            **self.facts(),
+            "blind_spots": count if readable else None,
+            "unserved_tools": (
+                [t for t in tools if isinstance(t, str)][:20]
+                if readable and isinstance(tools, list)
+                else []
+            ),
+        }
 
     def facts(self) -> Dict[str, Any]:
         """The three facts as the row stores them; None where unsaid or unreadable."""
@@ -328,6 +346,7 @@ def record_terminal(
                 approvals,
                 registry,
                 _run_claims(run_id, x_vigil_run_principal),
+                update.standing(),
             )
         # Only a run that reached its conclusion can dismiss its case.
         if update.outcome == "completed":
@@ -574,15 +593,10 @@ PROPOSAL_TITLES = {
 
 
 # A proposal or why it was refused, as (code, target_kind). The target must fit
-# its action (core/response/proposal_targets.py) and the confidence be a stated
-# view above zero; neither rule reaches ApprovalService, whose checkpoints and
-# rule deploys pass 0.0 on purpose.
+# its action (core/response/proposal_targets.py). The proposer states no
+# confidence: the step score (#5265) is what the person deciding sees.
 def _proposal(raw: Any) -> Union[Dict[str, Any], Tuple[str, str]]:
-    from core.response.proposal_targets import (
-        check_confidence,
-        check_target,
-        target_kind,
-    )
+    from core.response.proposal_targets import check_target, target_kind
 
     if not isinstance(raw, dict):
         return "action_type_unknown", "missing"
@@ -591,14 +605,12 @@ def _proposal(raw: Any) -> Union[Dict[str, Any], Tuple[str, str]]:
     target, code = check_target(action_type, raw.get("target"))
     if code is None and (not isinstance(reason, str) or not reason.strip()):
         code = "reason_missing"
-    code = code or check_confidence(raw)
     if code:
         return code, kind
     return {
         "action_type": action_type,
         "target": target,
         "reason": reason.strip(),
-        "confidence": float(raw["confidence"]),
     }
 
 
@@ -607,9 +619,10 @@ def _proposal(raw: Any) -> Union[Dict[str, Any], Tuple[str, str]]:
 # re-sent terminal would withdraw it as a question the run left unanswered. The
 # case ids in parameters are what put it on each case's decisions. Keyed per run,
 # action and target, so a terminal that arrives twice files each one once; and
-# asked once across cases, so a second case's run joins a pending ask, or is told
-# it was already decided, instead of asking again. One page per call that files
-# something new.
+# asked once across cases and people, so a run joins a pending ask, or is told it
+# was already decided, instead of asking again. Nor is it asked when a connected
+# vendor already reports the target in the act's state. One page per call that
+# files something new.
 def _propose_actions(
     case_id: str,
     run_id: str,
@@ -617,11 +630,15 @@ def _propose_actions(
     approvals: Optional[ApprovalService],
     registry: Optional[MCPRegistry] = None,
     run_claims: Optional[Claims] = None,
+    standing: Optional[Dict[str, Any]] = None,
 ) -> None:
     from core.response.approval_service import ActionType
+    from core.response.step_confidence import CONTAINMENT, safe_score
 
     service = approvals or ApprovalService()
     proposer = proposer_principal_id(run_id) if proposals else None
+    # Once per terminal, on newly filed rows only (#5275).
+    step_score = safe_score(CONTAINMENT, case_id, standing) if proposals else None
     filed: List[str] = []
     created: List[Tuple[str, str]] = []  # (title, target) newly filed in this call
     for index, raw in enumerate(proposals):
@@ -644,27 +661,52 @@ def _propose_actions(
             if match and match.idempotency_key == key and match.status != "failed":
                 filed.append(match.action_id)  # a re-sent terminal
                 continue
-            if match is not None and _already_asked(
-                service, match, case_id, run_id, title
-            ):
-                continue
             # This run's own ask failed before: a re-sent terminal files it again
             # for a person, not for the ceiling.
             resent = match is not None and match.idempotency_key == key
+            # A pending ask, whoever made it, lists this case too: one ask, one answer.
+            if (
+                match is not None
+                and match.status == "pending"
+                and _already_asked(service, match, case_id, run_id, title)
+            ):
+                continue
+            # What the vendor says now, which also sees what was done outside Vigil.
+            vendor = None if resent else _in_force(action_type, target, registry)
+            if vendor is not None and vendor["holds"]:
+                _note_in_force(case_id, run_id, title, action_type, target, vendor)
+                continue
+            # An executed ask the vendor reports in the act's undone state was lifted
+            # outside Vigil (a host released in the EDR's console): asked again. A
+            # vendor still carrying it out ("requested") has not lifted it.
+            lifted = (
+                match is not None
+                and match.status == "executed"
+                and vendor is not None
+                and vendor["state"] == _undone_word(action_type)
+            )
+            if (
+                match is not None
+                and not lifted
+                and _already_asked(service, match, case_id, run_id, title)
+            ):
+                continue
             action, inserted = service._put_action(
                 action_type=ActionType(action_type),
                 title=title,
                 description=proposal["reason"],
                 target=target,
-                confidence=proposal["confidence"],
                 reason=proposal["reason"],
                 evidence=[run_id],
                 created_by="agent",
                 created_by_principal_id=proposer,
-                parameters={"case_ids": [case_id], "run_id": run_id},
+                parameters={
+                    "case_ids": [case_id],
+                    "run_id": run_id,
+                    "step_score": step_score,
+                },
                 idempotency_key=key,
-                # The confidence is the model's own claim, so it never releases
-                # the action: a person decides each one.
+                # A run's proposal never releases itself: a person decides each one.
                 human_only=True,
             )
         except Exception:  # noqa: BLE001 — the run ended either way
@@ -681,8 +723,8 @@ def _propose_actions(
 
     if filed:
         _record_proposals(case_id, run_id, filed)
-    # Only what this call created: a re-sent terminal, or an ask another run
-    # already made, pages nobody.
+    # Only what this call created: a re-sent terminal, an ask already made, or an
+    # act the vendor says already holds pages nobody.
     if created:
         page_proposed_containment(case_id, run_id, created)
 
@@ -727,10 +769,82 @@ def _release_under_ceiling(
         return action
 
 
-# True when another run's proposal already covers this one: a pending ask now
-# lists this case too, and an approved or executed one is noted here. A rejected
-# or failed one is not an answer to this run's evidence, so it is asked again;
-# nor is an executed one undone since (a released host, an enabled user).
+# What the connected vendors report about the target for this act (see
+# containment.in_force), asked on the app's loop, where the vendor servers'
+# connections live: this route runs in a worker thread. Any failure leaves the
+# ask to a person.
+def _in_force(
+    action_type: str, target: str, registry: Optional[MCPRegistry]
+) -> Optional[Dict[str, Any]]:
+    from anyio import from_thread
+
+    from core.response.approval_service import CONTAINMENT_TYPES
+    from core.response.containment import in_force, live_registry
+
+    if action_type not in CONTAINMENT_TYPES:
+        return None
+
+    async def read() -> Optional[Dict[str, Any]]:
+        return await in_force(action_type, target, await live_registry(registry))
+
+    try:
+        return from_thread.run(read)
+    except Exception:  # noqa: BLE001 — unread, the ask goes to a person
+        logger.exception("could not read whether %s on %s holds", action_type, target)
+        return None
+
+
+# A vendor lookup's word for a target the act no longer holds on: a released
+# host, an enabled account.
+def _undone_word(action_type: str) -> Optional[str]:
+    from core.response.proposal_targets import UNDONE_LOOKUP, UNDONE_STATE
+
+    return UNDONE_LOOKUP.get(action_type) or UNDONE_STATE.get(action_type)
+
+
+# Once per run, act and target, so a re-sent terminal says nothing new. The same
+# kind of system note as an ask already made, with no action id: nothing was filed.
+def _note_in_force(
+    case_id: str,
+    run_id: str,
+    title: str,
+    action_type: str,
+    target: str,
+    held: Dict[str, Any],
+) -> None:
+    from core.storage.database_data_service import DatabaseDataService
+
+    details = {
+        "run_id": run_id,
+        "action_type": action_type,
+        "target": target,
+        "vendor": held["vendor"],
+        "state": held["state"],
+    }
+    try:
+        case = DatabaseDataService().get_case(case_id) or {}
+        if any(
+            a.get("activity_type") == "action_already_requested"
+            and (a.get("details") or {}).get("run_id") == run_id
+            and (a.get("details") or {}).get("action_type") == action_type
+            and (a.get("details") or {}).get("target") == target
+            for a in case.get("activities") or []
+        ):
+            return
+        _add_activity(
+            case_id,
+            "action_already_requested",
+            f"{title}: {held['vendor']} reports it already {held['state']}",
+            details,
+        )
+    except Exception:  # noqa: BLE001 — nothing was filed either way
+        logger.exception("could not note %s on case %s", title, case_id)
+
+
+# True when an earlier ask already covers this one, a run's or a person's: a
+# pending ask now lists this case too, and an approved or executed one is noted
+# here. A rejected or failed one is not an answer to this run's evidence, so it is
+# asked again; nor is an executed one undone since (a released host, an enabled user).
 def _already_asked(
     service: ApprovalService, match: Any, case_id: str, run_id: str, title: str
 ) -> bool:
@@ -913,7 +1027,16 @@ def _close_dismissed(case_id: str, run_id: str, update: TerminalUpdate) -> None:
     from core.cases.agent_closure import service_session
     from core.cases.case_workflow_service import CaseWorkflowService
     from core.cases.closure import DISMISSAL_CAUSES, ClosureCategory
-    from core.response.ceiling import close_held, finding_keys
+    from core.response.ceiling import (
+        BarHeld,
+        close_held,
+        finding_keys,
+        read_ceiling,
+        record_bar_hold,
+        workflow_bar,
+        workflow_of,
+    )
+    from core.response.step_confidence import DISMISSAL, quote, safe_score
     from core.storage.models import Case
 
     disposition = (update.disposition or "").strip().lower()
@@ -924,16 +1047,43 @@ def _close_dismissed(case_id: str, run_id: str, update: TerminalUpdate) -> None:
     # with nothing said about leaving it open.
     if _already_closed(case_id):
         return
+    # Scored whatever the tier (#5275); the workflow's bar reads it last (#5276).
+    step_score = safe_score(DISMISSAL, case_id, update.standing())
+    quoted = quote(step_score)
     # Closing is a reversible act; under Assist a person decides.
-    if held := close_held(run_id, lambda: finding_keys(case_id=case_id)):
+    held = close_held(
+        run_id,
+        lambda: finding_keys(case_id=case_id),
+        (step_score or {}).get("value"),
+    )
+    if isinstance(held, BarHeld):
+        _store_step_score(
+            run_id,
+            step_score,
+            {"check": "held_by_bar", "reason": held, "bar": held.bar},
+        )
+        record_bar_hold(held, DISMISSAL, case_id, run_id)
+    elif held:
+        _store_step_score(run_id, step_score, {"check": "held", "reason": held})
+    if held:
         _add_activity(
             case_id,
             "agent_run_left_open",
             f"Left open for a person: the investigation concluded {disposition}, "
             f"and {held}",
-            {"run_id": run_id, "disposition": disposition, "reason": held},
+            {
+                "run_id": run_id,
+                "disposition": disposition,
+                "reason": held,
+                "step_score": quoted,
+            },
         )
         return
+    # The bar the close passed, if any, beside the score on the run row.
+    try:
+        passed = workflow_bar(read_ceiling(), workflow_of(run_id))
+    except Exception:  # noqa: BLE001 — close_held read it a moment ago
+        passed = None
     try:
         with service_session() as session:
             case = session.query(Case).filter(Case.case_id == case_id).first()
@@ -949,8 +1099,10 @@ def _close_dismissed(case_id: str, run_id: str, update: TerminalUpdate) -> None:
                 closed_by=run_id,
                 closure_notes=update.summary or None,
                 by_model=True,
+                step_score=quoted,
                 **({"false_positive_cause": cause.value} if cause else {}),
             )
+        _store_step_score(run_id, step_score, {"check": "closed", "bar": passed})
         recorded = "expected activity" if cause else "a false positive"
         _add_activity(
             case_id,
@@ -961,12 +1113,26 @@ def _close_dismissed(case_id: str, run_id: str, update: TerminalUpdate) -> None:
                 "disposition": disposition,
                 "closure_category": ClosureCategory.FALSE_POSITIVE.value,
                 "false_positive_cause": cause.value if cause else None,
+                "step_score": quoted,
             },
         )
     except Exception:  # noqa: BLE001 — the run ended either way
         logger.exception(
             "could not close case %s on the disposition of %s", case_id, run_id
         )
+
+
+# The dismissal's score and what the close check did, once on the run's row. A
+# score that could not be worked out is stored as null beside the check.
+def _store_step_score(
+    run_id: str, step_score: Optional[Dict[str, Any]], check: Dict[str, Any]
+) -> None:
+    try:
+        WorkflowRunService().set_step_score(
+            run_id, {**(step_score or {"value": None, "unscored": True}), **check}
+        )
+    except Exception:  # noqa: BLE001 — the close stands either way
+        logger.exception("could not store the step score of %s", run_id)
 
 
 # The Vigil case a handoff opens (see handoff_cases), so the run page can name it too.

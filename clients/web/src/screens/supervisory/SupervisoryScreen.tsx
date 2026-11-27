@@ -28,8 +28,31 @@ const STATE_WORD: Record<SupervisorStatus['state'], [string, 'good' | 'fair' | n
   unknown: ['Not on schedule', 'fair'],
 }
 
-function StatusCard({ status, openMedic }: { status: SupervisorStatus; openMedic: () => void }) {
+/** What each part of the scheduled check is called on the page. */
+const PART_WORD: Record<string, string> = {
+  review_threshold: 'review threshold check',
+  investigation_limits: 'investigation limits check',
+  run_judge: 'model judge check',
+  medic_hold: 'Medic read',
+  follow_up: 'follow-up',
+}
+
+/** "Failed: Medic read and model judge check" */
+function failedWords(failed: string[]): string {
+  const words = failed.map((f) => PART_WORD[f] ?? f)
+  const list = words.length < 2 ? words.join('') : `${words.slice(0, -1).join(', ')} and ${words[words.length - 1]}`
+  return `Failed: ${list}`
+}
+
+function StatusCard({ status, openMedic, refreshFailed, retry }: {
+  status: SupervisorStatus
+  openMedic: () => void
+  /** The last read failed; the page still shows the one before it. */
+  refreshFailed: boolean
+  retry: () => void
+}) {
   const [word, level] = STATE_WORD[status.state]
+  const failed = status.failed ?? []
   return (
     <section className="spv-card spv-status" aria-label="Supervisory model status">
       <div className="spv-status-head">
@@ -37,7 +60,7 @@ function StatusCard({ status, openMedic }: { status: SupervisorStatus; openMedic
         <InfoTip
           label="How status is worked out"
           source="The supervisory model runs as a scheduled job, about once an hour."
-          calculation="Running while checks happen on schedule; On hold while a related Medic incident is open, when it suggests nothing; Off when it is not switched on; Not on schedule when no check has run yet, or the last one is more than two intervals old."
+          calculation="Running while checks happen on schedule; On hold while a related Medic incident is open, when it suggests nothing; Off when it is not switched on; Not on schedule when no check has run yet, or the last one is more than two intervals old. The last check line names any part of that check that failed; the rest still ran."
           limit="It reads Medic's incidents; it runs no health checks of its own."
           align="start"
         />
@@ -46,9 +69,14 @@ function StatusCard({ status, openMedic }: { status: SupervisorStatus; openMedic
         <p>
           Last check {utcClock(status.last_check_at)} ({ago(status.last_check_at)})
           {status.next_check_at && <> · next {utcClock(status.next_check_at)}</>}
+          {failed.length > 0 && <span className="spv-status-warn">{failedWords(failed)}</span>}
+          {refreshFailed && <RefreshFailed retry={retry} />}
         </p>
       ) : (
-        <p>No check yet</p>
+        <p>
+          No check yet
+          {refreshFailed && <RefreshFailed retry={retry} />}
+        </p>
       )}
       {status.state === 'off'
         ? <p>Its scheduled checks aren't running on this install, so it makes no suggestions yet.</p>
@@ -62,6 +90,15 @@ function StatusCard({ status, openMedic }: { status: SupervisorStatus; openMedic
         </button>
       </p>
     </section>
+  )
+}
+
+function RefreshFailed({ retry }: { retry: () => void }) {
+  return (
+    <span className="spv-status-warn" role="alert">
+      Couldn't refresh ·{' '}
+      <button type="button" className="spv-link" onClick={retry}>Retry</button>
+    </span>
   )
 }
 
@@ -140,7 +177,7 @@ export default function SupervisoryScreen({ go, openCase }: ConsoleScreenProps) 
   if (!data) {
     return (
       <div className="spv-page">
-        {error || data
+        {error
           ? <EmptyState error icon="alert" title="Couldn't load the supervisory model" body="Vigil could not read its suggestions. Try again in a moment." primary={{ label: 'Retry', onClick: reload, icon: 'refresh' }} />
           : <EmptyState loading icon="clock" title="Loading the supervisory model…" />}
       </div>
@@ -159,7 +196,7 @@ export default function SupervisoryScreen({ go, openCase }: ConsoleScreenProps) 
   return (
     <div className="spv-page">
       <div className="spv-top">
-        <StatusCard status={status} openMedic={() => openMedic()} />
+        <StatusCard status={status} openMedic={() => openMedic()} refreshFailed={error !== null} retry={reload} />
         <section className="spv-tiles" aria-label="Evidence per function">
           {functions.map((f) => <FunctionTile key={f.fn} f={f} />)}
         </section>

@@ -16,14 +16,21 @@ def check_catalog(root: Path) -> dict:
     from core.integrations.mcp.service import MCPService
 
     entries = json.loads((root / "mcp-config.json").read_text())["mcpServers"]
-    expected = {name for name, value in entries.items() if isinstance(value, dict)}
+    # A url entry is reached over HTTP by the backend: nothing to install.
+    expected = {
+        name
+        for name, value in entries.items()
+        if isinstance(value, dict) and "url" not in value
+    }
     if not expected:
         raise RuntimeError("Packaged connector catalog is empty")
     service = MCPService(
         project_root=root,
         integration_bridge=SimpleNamespace(derive_remote_mcp_env=lambda: {}),
         detection_rules=SimpleNamespace(get_mcp_env_vars=lambda: {}),
+        declared_sources=lambda: {},
     )
+    service.servers = {n: s for n, s in service.servers.items() if not s.url}
     actual = set(service.list_servers())
     if actual != expected:
         raise RuntimeError(

@@ -6,19 +6,21 @@ import logging
 import os
 import re
 from contextlib import contextmanager
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, Iterable, List, Optional, Union
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, Field, create_model
 from sqlalchemy import exists, select, text
+from sqlalchemy.orm import Session
+from starlette.concurrency import run_in_threadpool
 
 from core import site_proposal
 from core.api.v1.findings_router import data_service as findings_data_service
 from core.audit.feed import INTEGRATION_ID as AUDIT_FEED_INTEGRATION_ID
 from core.auth import tool_principal
 from core.auth.current_user import is_machine_request
-from core.auth.permissions import permission_gate
+from core.auth.permissions import deny_unless, permission_gate
 from core.config import (
     _load_json_config,
     get_settings,
@@ -40,7 +42,15 @@ from core.integrations._base.descriptor import iter_descriptors
 from core.integrations.credential_check import NotChecked, check_credentials, has_check
 from core.integrations.darktrace.darktrace_webhook_router import darktrace_enabled
 from core.integrations.extension import session_service as extension_sessions
-from core.integrations.integration_bridge_service import IntegrationBridgeService
+from core.integrations.integration_bridge_service import (
+    INSTANCE_OF,
+    MAX_TOOL_NAME,
+    IntegrationBridgeService,
+    base_of,
+    instance_refusal,
+    instances,
+    instances_allowed,
+)
 from core.integrations.integration_secrets import (
     credentials_to_resupply,
     redact_secrets,
@@ -54,7 +64,12 @@ from core.llm.defaults import DEFAULT_MODEL
 from core.llm.security import MAX_SYSTEM_PROMPT_BYTES
 from core.llm.system_prompt import OPERATOR_INSTRUCTIONS_KEY, validate_system_prompt
 from core.platform.process_health import ProcessHealth
-from core.response.ceiling import CeilingRefusal, CeilingWriteError, read_ceiling
+from core.response.ceiling import (
+    CeilingRefusal,
+    CeilingWriteError,
+    delete_tool_classes,
+    read_ceiling,
+)
 from core.response.config import applied_intent, managed_widening, settle_pending
 from core.routing import Auth, RouterMeta, UnitOfWorkSession
 from core.secrets import (
@@ -72,6 +87,7 @@ from core.skills.skill_library import (
     operator_skills_root,
     skill_roots,
 )
+from core.sources import SourcesRefused, accept_sources, applied_sources, sources_view
 from core.storage.config_service import get_config_service, write_config_audit
 from core.storage.models import (
     AIModelConfig,
@@ -1084,6 +1100,220 @@ def _last_tests(integrations: dict) -> dict:
     return out
 
 
+def _copy_classes(
+    session, instance_id: str, base: str, tools: Iterable[str], actor: str
+) -> Dict[str, int]:
+    """Copy each base tool's class row and binding to the instance's tool, in
+    the caller's transaction, each with a trail entry naming ``actor``.
+
+    Once, when a person creates the instance; afterwards the rows are its own.
+    A withdrawn base row is not copied, and a binding needs its class row.
+    """
+    from core.integrations import bindings
+    from core.response.ceiling import (
+        store_tool_binding,
+        store_tool_class,
+        stored_classes,
+    )
+    from core.storage.models import ToolEffectClass
+
+    base_bound = {n: b for n, b in bindings.merged().items() if b.server == base}
+    names = {f"{base}_{t}" for t in tools} | set(base_bound)
+    copied = bound = 0
+    for name, effect in sorted(stored_classes(session, sorted(names)).items()):
+        target = f"{instance_id}_{name[len(base) + 1 :]}"
+        if len(target) > MAX_TOOL_NAME:
+            continue
+        source = session.get(ToolEffectClass, name)
+        existing = session.get(ToolEffectClass, target)
+        store_tool_class(
+            session,
+            target,
+            existing.effect_class if existing is not None else None,
+            effect,
+            actor,
+            pin=source.pinned_definition if source is not None else None,
+        )
+        copied += 1
+        binding = base_bound.get(name)
+        if binding is None:
+            continue
+        after = (
+            {**bindings.stored_carrier(binding.carrier), "server": instance_id}
+            if binding.carrier
+            else bindings.stored_form(binding.capability or "", instance_id)
+        )
+        before = existing.binding if existing is not None else None
+        store_tool_binding(session, target, before, after, actor)
+        bound += 1
+    return {"classes": copied, "bindings": bound}
+
+
+def _remove_instance(session, instance_id: str, actor: str, user_id: str) -> List[str]:
+    """Delete an instance's config row and class rows, and record its stored
+    credentials' deletes, in the caller's transaction; each with a trail entry.
+
+    Returns the credential keys for the caller to delete (``core.sources.
+    delete_stored``) once every entry is in, then its enabled state.
+    """
+    from core.sources import record_credential_deletes
+    from core.storage.models import IntegrationConfig
+
+    row = session.get(IntegrationConfig, instance_id)
+    if row is not None:
+        write_config_audit(
+            session,
+            config_type="integration",
+            config_key=instance_id,
+            action="delete",
+            old_value={**(row.config or {}), "enabled": bool(row.enabled)},
+            new_value=None,
+            changed_by=user_id,
+            change_reason="instance removed",
+        )
+        session.delete(row)
+    delete_tool_classes(session, f"{instance_id}_", actor)
+    # Only what the store holds: a value from the environment is not the instance's.
+    store = get_secrets_manager().write_backend
+    keys = [k for k in secret_fields_for(instance_id).values() if store.get(k)]
+    return record_credential_deletes(
+        session, instance_id, actor, "instance removed", keys=keys
+    )
+
+
+def _instances_allowed() -> Dict[str, Dict[str, Any]]:
+    """Each integration's ``{allowed, reason}``: whether it offers a second
+    instance, and why not when it doesn't."""
+    out: Dict[str, Dict[str, Any]] = {}
+    for descriptor in iter_descriptors():
+        allowed, reason = instances_allowed(descriptor.id)
+        out[descriptor.id] = {"allowed": allowed, "reason": reason}
+    return out
+
+
+def _base_tools(registry: Any, base: str) -> Optional[List[str]]:
+    """The base server's tool names as connected in this process, or None."""
+    if registry is None or base not in registry.get_active_servers():
+        return None
+    tools = getattr(registry, "_tools_cache", {}).get(base) or []
+    return [t["name"] for t in tools if t.get("name")]
+
+
+def _new_instances(
+    config: "IntegrationsConfig", stored: Dict[str, Any], registry: Any
+) -> Dict[str, str]:
+    """The instances this save creates, id -> base; 400 naming why when one
+    cannot be. A saved instance keeps its ``instance_of``."""
+    saved = instances(stored)
+    try:
+        taken = list((applied_sources().get("sources") or {}))
+    except Exception:  # noqa: BLE001 - the catalog merge refuses a clash too
+        taken = []
+    created: Dict[str, str] = {}
+    for integration_id, raw in list(config.integrations.items()):
+        raw = dict(raw or {})
+        asked = raw.get(INSTANCE_OF)
+        if integration_id in saved:
+            if asked not in (None, saved[integration_id]):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Integration '{integration_id}' is an instance of "
+                    f"{saved[integration_id]}; that cannot change",
+                )
+            raw[INSTANCE_OF] = saved[integration_id]
+            config.integrations[integration_id] = raw
+            continue
+        if asked is None and base_of(integration_id) is None:
+            continue
+        refused = (
+            f"{integration_id} is taken: an integration has this id"
+            if integration_id in stored
+            else instance_refusal(
+                integration_id,
+                asked,
+                base_tools=(
+                    _base_tools(registry, asked) if isinstance(asked, str) else None
+                ),
+                taken=taken,
+                other_instances=[*saved, *created],
+            )
+        )
+        if refused:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Integration '{integration_id}' cannot be added as an "
+                f"instance: {refused}",
+            )
+        created[integration_id] = str(asked)
+    return created
+
+
+def _no_copy_reason(current_user: User) -> Optional[str]:
+    """Why a new instance's classes and bindings would not be copied: the rule
+    for loosening a tool's class (PUT /api/v1/autonomy/tools/{name})."""
+    from core.auth.permissions import missing_permission
+
+    if is_machine_request(current_user):
+        return "a service account or API token created it"
+    if missing_permission(str(current_user.user_id), "ai_autonomy.write"):
+        return "its creator does not hold ai_autonomy.write"
+    try:
+        return "autonomy is stopped" if read_ceiling().stopped else None
+    except Exception:  # noqa: BLE001
+        return "the autonomy ceiling could not be read"
+
+
+def _refuse_uncopied_emulators(created: Dict[str, str], why: Optional[str]) -> None:
+    """400 when an instance whose base runs emulations would start unbound:
+    only an emulator binding holds its tools to the Emulators host list."""
+    from core.integrations import bindings
+
+    if not created or not why:
+        return
+    emulating = {
+        b.server
+        for b in bindings.merged().values()
+        if b.capability == bindings.EMULATION
+    }
+    for instance_id, base in created.items():
+        if base in emulating:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Integration '{instance_id}' cannot be added as an instance: "
+                f"{base} runs emulations, and its tools would not be bound as "
+                f"emulators because {why}",
+            )
+
+
+def _copy_instance_classes(
+    created: Dict[str, str], registry: Any, current_user: User, why: Optional[str]
+) -> Dict[str, Any]:
+    """Copy each new instance's base classes and bindings, unless ``why``
+    says they are not copied; then its tools ask first."""
+    out: Dict[str, Any] = {}
+    for instance_id, base in created.items():
+        if why:
+            out[instance_id] = {"classes": 0, "bindings": 0, "not_copied": why}
+            continue
+        try:
+            with unit_of_work() as session:
+                out[instance_id] = _copy_classes(
+                    session,
+                    instance_id,
+                    base,
+                    _base_tools(registry, base) or [],
+                    current_user.principal_id,
+                )
+        except Exception as exc:
+            logger.exception("Classes of %s not copied", instance_id)
+            raise HTTPException(
+                status_code=500,
+                detail=f"Instance '{instance_id}' was saved, but its tool classes "
+                f"were not copied ({type(exc).__name__})",
+            ) from exc
+    return out
+
+
 @router.get("/integrations", dependencies=_INTEGRATIONS_READ)
 def get_integrations_config():
     """
@@ -1120,6 +1350,9 @@ def get_integrations_config():
                 if iid != AUDIT_FEED_INTEGRATION_ID
             ],
             "integrations": redacted,
+            # Each saved instance -> the integration it is an instance of (#5353).
+            "instances": instances(redacted),
+            "instances_allowed": _instances_allowed(),
             "secrets_set": _secrets_set_map(redacted),
             # {id: {at, success, error}} from POST .../test; untested ids absent
             "last_test": _last_tests(redacted),
@@ -1140,9 +1373,14 @@ def set_integrations_config(
     config: IntegrationsConfig,
     current_user: User = Depends(get_current_active_user),
     bridge: IntegrationBridgeService = Depends(provide_integration_bridge),
+    registry: Any = Depends(provide_mcp_registry),
 ):
     """
     Set integrations configuration.
+
+    A new id ``<integration-id>-<label>`` with ``instance_of`` adds an instance
+    of a launched integration (#5353), checked before anything is written; a
+    person's creation copies its base's tool classes and bindings.
 
     Secret-typed fields (registered in ``core.integrations.integration_secrets``) are
     routed to the encrypted secrets store via ``set_secret`` and stripped
@@ -1163,6 +1401,27 @@ def set_integrations_config(
         Success status
     """
     config_service = _for_user(current_user)
+
+    # A declared source keeps only its declared credentials (#5302): anything
+    # else would land in plaintext, and a source not accepted stores nothing.
+    for integration_id in list(config.integrations):
+        if integration_id.startswith("source-"):
+            declared = secret_fields_for(integration_id)
+            kept = {
+                f: v
+                for f, v in (config.integrations[integration_id] or {}).items()
+                if f in declared
+            }
+            if kept:
+                config.integrations[integration_id] = kept
+            else:
+                del config.integrations[integration_id]
+
+    created = _new_instances(
+        config, load_integrations_config(config_service)["integrations"], registry
+    )
+    no_copy = _no_copy_reason(current_user) if created else None
+    _refuse_uncopied_emulators(created, no_copy)
 
     # A stored credential is sent to whatever destination is saved, so moving
     # one requires the caller to supply the credential again. Checked for every
@@ -1276,7 +1535,85 @@ def set_integrations_config(
     except Exception as e:
         logger.warning(f"Could not derive remote MCP env vars: {e}")
 
-    return {"success": True, "message": "Integrations configuration saved"}
+    result: Dict[str, Any] = {
+        "success": True,
+        "message": "Integrations configuration saved",
+    }
+    if created:
+        # Every process merges it into its catalog on its next sources pass.
+        result["instances_created"] = _copy_instance_classes(
+            created, registry, current_user, no_copy
+        )
+    return result
+
+
+@router.delete("/integrations/{integration_id}", dependencies=_INTEGRATIONS_WRITE)
+async def delete_integration_instance(
+    integration_id: str,
+    current_user: User = Depends(get_current_active_user),
+    mcp_client=Depends(provide_mcp_client),
+    registry: Any = Depends(provide_mcp_registry),
+):
+    """Remove an integration instance (#5353): its config row, stored
+    credentials, enabled state and ``<id>_`` class rows, each with a trail
+    entry. Only an instance: an integration's own row is not removed here."""
+    from core.integrations.mcp.reload import apply_catalog
+    from core.integrations.mcp.runner import RunnerServer, runner_url
+    from core.integrations.mcp.service import MCPService
+    from core.sources import delete_stored
+
+    saved = await run_in_threadpool(instances)
+    if integration_id not in saved:
+        raise HTTPException(
+            status_code=404 if base_of(integration_id) else 400,
+            detail=f"'{integration_id}' is not an integration instance; only an "
+            "instance can be removed",
+        )
+    svc = getattr(mcp_client, "mcp_service", None)
+
+    def remove() -> None:
+        with unit_of_work() as session:
+            keys = _remove_instance(
+                session,
+                integration_id,
+                current_user.principal_id,
+                str(current_user.user_id),
+            )
+            write_config_audit(
+                session,
+                config_type="mcp",
+                config_key=f"mcp.server:{integration_id}",
+                action="delete",
+                old_value={"enabled": MCPService.is_server_enabled(integration_id)},
+                new_value=None,
+                changed_by=str(current_user.user_id),
+                change_reason="instance removed",
+            )
+            try:
+                delete_stored(keys)  # last, after every trail entry is in
+            except SourcesRefused as exc:
+                raise HTTPException(exc.status_code, exc.detail) from exc
+            state = MCPService.enabled_state()
+            if state.pop(integration_id, None) is not None:
+                MCPService._save_enabled_state(svc or MCPService, state)  # type: ignore[arg-type]
+
+    await run_in_threadpool(remove)
+
+    # This process drops it now; the others on their next sources pass.
+    if svc is not None and mcp_client is not None:
+        try:
+            catalog = await run_in_threadpool(svc.load_catalog)
+            await apply_catalog(svc, mcp_client, registry, catalog)
+        except Exception as exc:  # noqa: BLE001 - removed either way
+            logger.warning(
+                "Catalog not reapplied after removing %s: %s", integration_id, exc
+            )
+    if url := runner_url(integration_id):
+        try:
+            await RunnerServer(url, integration_id, dict, lambda: False).stop()
+        except Exception as exc:  # noqa: BLE001 - not running, or the runner is down
+            logger.debug("Runner stop for %s: %s", integration_id, exc)
+    return {"success": True, "removed": integration_id}
 
 
 def _connected_session(mcp_client: Any, server_name: str) -> Any:
@@ -2031,6 +2368,13 @@ class SiteBlindSpot(BaseModel):
     line: int
 
 
+class SiteTelemetry(BaseModel):
+    name: str
+    covers: str
+    file: str
+    line: int
+
+
 class SiteFile(BaseModel):
     file: str
     text: str
@@ -2057,6 +2401,10 @@ class SiteProposalProvenance(BaseModel):
     arguments: Optional[Any] = None
     person_id: Optional[str] = None
     answer: Optional[str] = None
+    # Resolved on read: the person's username, and the conversation the answer
+    # was given in when the reader owns it.
+    person: Optional[str] = None
+    conversation_id: Optional[str] = None
 
 
 class SiteNotEvaluated(BaseModel):
@@ -2115,6 +2463,8 @@ class SiteContextResponse(BaseModel):
     crown_jewels: list[SiteCrownJewel] = Field(default_factory=list)
     owners: list[SiteOwner] = Field(default_factory=list)
     blind_spots: list[SiteBlindSpot] = Field(default_factory=list)
+    # Telemetry the site carries beyond the shipped hunt data domains (#5291).
+    telemetry: list[SiteTelemetry] = Field(default_factory=list)
     files: list[SiteFile] = Field(default_factory=list)
     # The latest Day 1 Report's site checks and evidence; None before one ran.
     report: Optional[Dict[str, Any]] = None
@@ -2124,11 +2474,18 @@ class SiteContextResponse(BaseModel):
 
 
 @router.get("/site", response_model=SiteContextResponse, dependencies=_PLATFORM_READ)
-def get_site_context() -> Dict[str, Any]:
+def get_site_context(
+    current_user: User = Depends(get_current_active_user),
+) -> Dict[str, Any]:
     """The applied site/ revision: state, any refusal with file and line, each
     item with file, line and resolved owner, and the applied files' text; the
     open proposal and the site questions."""
-    return site_view()
+    view = site_view()
+    try:
+        site_proposal.link_answers(view.get("proposal"), current_user.user_id)
+    except Exception as exc:  # noqa: BLE001 - the answers still show, unlinked
+        logger.error("site proposal answers not linked: %s", type(exc).__name__)
+    return view
 
 
 @router.get(
@@ -2201,6 +2558,35 @@ async def refresh_site_proposal(
     return JSONResponse(outcome, status_code=code)
 
 
+def refuse_unreviewed(
+    current_user: User,
+    read: Any,
+    revision: str,
+    digest: Optional[str],
+    *,
+    machine: str,
+    then: Any = None,
+) -> Dict[str, Any]:
+    """The checks every declared-directory accept makes: a person, not a machine
+    (403), then ``then`` (the route's own gate), then the applied revision and
+    hash are the ones the person reviewed (409). Returns what ``read`` read."""
+    if is_machine_request(current_user):
+        raise HTTPException(status_code=403, detail=machine)
+    if then is not None:
+        then()
+    applied = read()
+    if not applied.get("directory"):
+        raise HTTPException(status_code=409, detail="No declared directory is applied")
+    if applied.get("revision") != revision or (
+        digest is not None and digest != applied.get("hash")
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail=f"The applied revision is now {applied.get('revision')}; review it again",
+        )
+    return applied
+
+
 class IntentAcceptBody(BaseModel):
     """The revision (and hash) the person reviewed; a newer one is a 409."""
 
@@ -2220,29 +2606,25 @@ def accept_intent_pending(
     Each key's declared value goes into its store under the person's name,
     with the revision on the audit entry. No timer, and not over /mcp.
     """
-    if is_machine_request(current_user):
-        raise HTTPException(
-            status_code=403,
-            detail="A service account or API token cannot raise autonomy",
-        )
-    try:
-        stopped = read_ceiling().stopped
-    except Exception as exc:
-        raise HTTPException(
-            status_code=503, detail="Could not read the autonomy ceiling"
-        ) from exc
-    if stopped:
-        raise HTTPException(status_code=409, detail="Stopped: resume first")
-    report = intent_body()
-    if not report["directory"]:
-        raise HTTPException(status_code=409, detail="No declared directory is applied")
-    if report["revision"] != body.revision or (
-        body.hash is not None and body.hash != report["hash"]
-    ):
-        raise HTTPException(
-            status_code=409,
-            detail=f"The applied revision is now {report['revision']}; review it again",
-        )
+
+    def not_stopped() -> None:
+        try:
+            stopped = read_ceiling().stopped
+        except Exception as exc:
+            raise HTTPException(
+                status_code=503, detail="Could not read the autonomy ceiling"
+            ) from exc
+        if stopped:
+            raise HTTPException(status_code=409, detail="Stopped: resume first")
+
+    report = refuse_unreviewed(
+        current_user,
+        intent_body,
+        body.revision,
+        body.hash,
+        machine="A service account or API token cannot raise autonomy",
+        then=not_stopped,
+    )
     if not report["pending"]:
         raise HTTPException(status_code=409, detail="Nothing is pending")
     who = current_user.username or str(current_user.user_id)
@@ -2257,6 +2639,52 @@ def accept_intent_pending(
             status_code=500, detail="The pending keys were not all stored"
         ) from exc
     return intent_body()
+
+
+@router.get("/sources", dependencies=_INTEGRATIONS_READ)
+def get_sources() -> Dict[str, Any]:
+    """Declared remote MCP sources (#5302): each one's URL, credential fields
+    and where each is set, accepted or pending and what a pending change
+    alters, and the rejection if any. Never a header or credential value."""
+    return sources_view()
+
+
+class SourcesAcceptBody(BaseModel):
+    """The revision, hash and sources the person reviewed; a mismatch is a 409."""
+
+    revision: str
+    hash: str
+    sources: List[str] = Field(min_length=1)
+
+
+@router.post("/sources/accept")
+def accept_sources_pending(
+    body: SourcesAcceptBody,
+    current_user: User = Depends(get_current_active_user),
+) -> Dict[str, Any]:
+    """Accept new or changed declared sources. A person's act, allowed while
+    stopped: it widens reach, not autonomy; each new tool still asks first."""
+    refuse_unreviewed(
+        current_user,
+        lambda: applied_sources(fresh=True),
+        body.revision,
+        body.hash,
+        machine="A service account or API token cannot accept a declared source",
+        then=lambda: deny_unless(current_user.user_id, "integrations.install"),
+    )
+    who = current_user.username or str(current_user.user_id)
+    try:
+        accept_sources(
+            body.sources,
+            body.revision,
+            body.hash,
+            str(current_user.user_id),
+            who,
+            delete_tool_classes,
+        )
+    except SourcesRefused as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+    return sources_view()
 
 
 def refuse_managed_widening(values: Dict[str, Any]) -> None:
@@ -2298,6 +2726,22 @@ def set_orchestrator_config(
     A ``profiles`` field on the body is ignored. The stored object stays the
     flat keys; no profile name is written.
     """
+    managed = save_orchestrator_config(config, current_user)
+    settle_pending(managed, str(current_user.user_id))
+
+    return {"success": True, "message": "Orchestrator settings saved"}
+
+
+def save_orchestrator_config(
+    config: OrchestratorSettingsConfig,
+    current_user: User,
+    session: Optional[Session] = None,
+) -> Dict[str, Any]:
+    """Store the orchestrator row, refusing a widening of an INTENT.md managed key.
+
+    With ``session`` the write joins that transaction and the caller commits.
+    Returns the managed values, for the caller to settle once the write lands.
+    """
     config_data = config.model_dump()
     managed = {
         f"investigate.{name}": config_data[name]
@@ -2317,15 +2761,14 @@ def set_orchestrator_config(
         description="Autonomous orchestrator settings",
         config_type="orchestrator",
         change_reason="Updated via Settings UI",
+        session=session,
     )
 
     if not success:
         raise HTTPException(
             status_code=500, detail="Failed to save orchestrator config to database"
         )
-    settle_pending(managed, str(current_user.user_id))
-
-    return {"success": True, "message": "Orchestrator settings saved"}
+    return managed
 
 
 # ---- Darktrace webhook receiver config ----

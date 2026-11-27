@@ -36,6 +36,7 @@ from core.auth.principals import SYSTEM_PRINCIPAL_ID
 from core.auth.tool_principal import Claims
 from core.cases.case_access import lost_reader
 from core.deps import provide_mcp_registry
+from core.integrations import bindings
 from core.integrations.mcp.registry import MCPRegistry
 from core.integrations.mcp.surface import acting_as
 from core.llm.tool_schemas import CALL_INTEGRATION_TOOL
@@ -45,6 +46,7 @@ from core.response.ceiling import (
     STOPPED,
     execution_held,
     gated_tools,
+    tool_definition_hash,
     unattended_refusal,
 )
 from core.routing import Auth, RouterMeta
@@ -281,6 +283,18 @@ def _source_system(tool: str, registry: MCPRegistry) -> str:
     return SOURCE_SYSTEM if split is None else split[0]
 
 
+def _definition_hash(tool: str, registry: MCPRegistry) -> Optional[str]:
+    """The hash of the definition the registry holds for ``tool``, as the pin hashes it.
+
+    None when nothing is held under that name: no hash is better than a made-up one.
+    """
+    try:
+        held = registry.held_definitions().get(tool)
+    except Exception:  # noqa: BLE001 — a registry that cannot be read holds nothing
+        return None
+    return None if held is None else tool_definition_hash(held)
+
+
 def _norm_args(value: Any) -> Any:
     """A shape two JSON parsers can agree on.
 
@@ -440,15 +454,22 @@ def _outcome(claims: Claims, tool: str, args: Dict[str, Any], outcome: str) -> N
 #
 # call_integration_tool stands for the integration call it names, so that call is
 # what runs, bounded and attributed as if it had been declared itself.
-async def _run(body: InvokeRequest, registry: MCPRegistry) -> Tuple[Any, bool, str]:
+#
+# Answers (result, handled, source, definition hash); the hash only for a call an
+# MCP server served, taken for the tool that ran, so the inner one of an integration call.
+async def _run(
+    body: InvokeRequest, registry: MCPRegistry
+) -> Tuple[Any, bool, str, Optional[str]]:
     seconds = body.bounds.timeout_ms / 1000
     tool, raw = body.tool, body.args
     if tool == CALL_INTEGRATION_TOOL:
         tool, raw = resolve_integration_call(registry, raw)
     claims = current_claims()
-    # A marked emulator is held to the operator's host list before anything leaves.
-    limits = await asyncio.to_thread(emulation.read_emulation)
-    held = emulation.refusal(limits, tool, raw)
+    # A tool bound as an emulator is held to the host list before anything
+    # leaves; read past the cache, so a binding made elsewhere holds at once.
+    emulator = await asyncio.to_thread(bindings.is_emulator, tool, fresh=True)
+    limits = await asyncio.to_thread(emulation.read_emulation) if emulator else None
+    held = emulation.refusal(limits, tool, raw) if limits is not None else None
     if held is not None:
         if attributed(claims):
             _outcome(claims, tool, raw, "refused")
@@ -466,7 +487,7 @@ async def _run(body: InvokeRequest, registry: MCPRegistry) -> Tuple[Any, bool, s
                     _outcome(claims, tool, raw, "refused")
                 raise MCPFailure("refused", str(exc)) from exc
     # Into what is sent only: an approval and the trail hold what the model asked.
-    if limits.marked(tool):
+    if limits is not None:
         args = _scoped(args, tool, limits, registry)
 
     denial = None if claims is None else _denial(claims, tool, raw)
@@ -491,7 +512,7 @@ async def _run(body: InvokeRequest, registry: MCPRegistry) -> Tuple[Any, bool, s
         )
         if handled:
             outcome = "failed" if _errored(result) is not None else "done"
-            return result, True, SOURCE_SYSTEM
+            return result, True, SOURCE_SYSTEM, None
         # After the backend, so a Vigil tool is not caught by a verb in its name.
         # The arguments compared are the ones the model sent, before the row cap
         # lowered a limit the approval was not asked about. A run no person
@@ -504,7 +525,7 @@ async def _run(body: InvokeRequest, registry: MCPRegistry) -> Tuple[Any, bool, s
         result, handled = await asyncio.wait_for(
             execute_mcp_tool(tool, args, seconds, registry), timeout=seconds
         )
-        if handled and limits.marked(tool):
+        if handled and limits is not None:
             # The list bounds what Vigil asks, not what the far side does: a
             # step it reports on another host is flagged, the answer unchanged.
             stray = emulation.unlisted_hosts(limits, result)
@@ -517,7 +538,8 @@ async def _run(body: InvokeRequest, registry: MCPRegistry) -> Tuple[Any, bool, s
             outcome = "failed"
         else:
             outcome = "done"
-        return result, handled, _source_system(tool, registry)
+        served = _definition_hash(tool, registry) if handled else None
+        return result, handled, _source_system(tool, registry), served
     finally:
         if record is not None:
             _outcome(record, tool, raw, outcome)
@@ -632,7 +654,7 @@ async def invoke(
     try:
         # The tool runs in this context (or a copy of it), so it sees the binding.
         with bound_claims(claims), bound:
-            result, handled, source = await _run(body, registry)
+            result, handled, source, definition = await _run(body, registry)
     except Denied as exc:
         return _failure("denied", detail=str(exc))
     except TrailWriteError:
@@ -672,4 +694,6 @@ async def invoke(
         "rowCount": min(len(rows), body.bounds.max_rows),
         "capped": capped,
         "sourceSystem": source,
+        # The definition the call ran against, which joins it to the class row's pin.
+        **({} if definition is None else {"definitionHash": definition}),
     }

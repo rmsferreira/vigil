@@ -9,17 +9,16 @@ The ceiling and the tool classes are the frozen contract in
 
 from dataclasses import replace
 from types import MappingProxyType
-from typing import Dict, List, Literal, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, ConfigDict, Field, StrictInt
 
-from core.api.v1.autonomy_router import CeilingResponse, _exposed, _http, _view
+from core.api.v1.autonomy_router import CeilingResponse, _http, _view
 from core.auth.current_user import is_machine_request
 from core.auth.permissions import deny_unless, permission_gate
-from core.deps import provide_mcp_registry, provide_workflows
+from core.deps import provide_workflows
 from core.detections.inventory import rollout_limits
-from core.integrations.mcp.registry import MCPRegistry
 from core.response import emulation
 from core.response.ceiling import (
     ACT,
@@ -28,17 +27,18 @@ from core.response.ceiling import (
     CeilingWriteError,
     ModelJudgeError,
     investigation_model,
-    own_tool_names,
     preview_model_change,
     raises_workflow,
     read_ceiling,
+    set_workflow_bar,
     set_workflow_tier,
+    workflow_bar,
     workflow_entry,
     workflow_evidence,
 )
 from core.response.config import managed_widening, settle_pending
 from core.routing import Auth, RouterMeta, UnitOfWorkSession
-from core.storage.models import ToolEffectClass, User
+from core.storage.models import User
 from core.workflows.workflows_service import INVESTIGATE_RUN_KIND, WorkflowsService
 from services.api.middleware.auth import get_current_active_user
 
@@ -62,6 +62,21 @@ class WorkflowAutonomyBody(BaseModel):
 
     tier: Optional[Literal["act", "assist"]] = None
     floor: Optional[int] = None
+    # A step scoring under it waits for a person (#5276). Omitted, the stored bar
+    # stays; null clears it. A body naming ``bar`` and no ``tier`` moves the bar alone.
+    bar: Optional[float] = Field(None, ge=0, le=1)
+
+
+def _loosen_gate(current_user: User, session, what: str, stopped: bool) -> None:
+    """A loosening: a person's ``ai_autonomy.write``, refused while stopped."""
+    deny_unless(current_user.user_id, "ai_autonomy.write", session)
+    if is_machine_request(current_user):
+        raise HTTPException(
+            status_code=403,
+            detail=f"A service account or API token cannot {what}",
+        )
+    if stopped:
+        raise HTTPException(status_code=409, detail="Stopped: resume first")
 
 
 @router.put(
@@ -83,6 +98,11 @@ def put_workflow_autonomy(
     30-day agreement on the workflow beside its floor.
     Anything else is ``ai_autonomy.stop``. A workflow a declared INTENT.md
     manages is refused (409) anything looser than its declared entry.
+
+    The bar (#5276) follows the same split: setting or raising it is
+    ``ai_autonomy.stop``; lowering or clearing it, clearing the tier under it
+    included, is a loosening as a raise is. A bar-only change keeps the rest of
+    the entry as it is.
     """
     workflow = workflows.get_workflow(workflow_id)
     if workflow is None:
@@ -98,6 +118,19 @@ def put_workflow_autonomy(
         raise HTTPException(
             status_code=503, detail="Could not read the autonomy ceiling"
         ) from exc
+    sent = body.model_fields_set
+    stored_bar = workflow_bar(current, workflow_id)
+    if "bar" in sent and "tier" not in sent:
+        return _put_bar(
+            workflow_id, body.bar, stored_bar, current, current_user, session
+        )
+    if body.tier is None and body.bar is not None:
+        raise HTTPException(
+            status_code=422, detail="A workflow that follows the fleet has no bar"
+        )
+    # Kept unless the body names it; following the fleet drops it.
+    bar = (body.bar if "bar" in sent else stored_bar) if body.tier else None
+    lowers_bar = stored_bar is not None and (bar is None or bar < stored_bar)
     candidate = dict(current.workflows)
     candidate.pop(workflow_id, None)
     if body.tier is not None:
@@ -105,15 +138,9 @@ def put_workflow_autonomy(
     after = replace(current, workflows=MappingProxyType(candidate))
     raises = body.tier == ACT or raises_workflow(current, workflow_id, after)
     by = current_user.principal_id
-    if raises:
-        deny_unless(current_user.user_id, "ai_autonomy.write", session)
-        if is_machine_request(current_user):
-            raise HTTPException(
-                status_code=403,
-                detail="A service account or API token cannot raise autonomy",
-            )
-        if current.stopped:
-            raise HTTPException(status_code=409, detail="Stopped: resume first")
+    if raises or lowers_bar:
+        what = "raise autonomy" if raises else "lower or clear a bar"
+        _loosen_gate(current_user, session, what, current.stopped)
     else:
         deny_unless(current_user.user_id, "ai_autonomy.stop", session)
     try:
@@ -126,10 +153,10 @@ def put_workflow_autonomy(
             # (blended, with no model, when the model cannot be resolved).
             model = investigation_model()
             entry = workflow_entry(
-                ACT, body.floor, workflow_evidence(workflow_id, model), by, model
+                ACT, body.floor, workflow_evidence(workflow_id, model), by, model, bar
             )
         elif body.tier == ASSIST:
-            entry = workflow_entry(ASSIST, None, None, by)
+            entry = workflow_entry(ASSIST, None, None, by, bar=bar)
         else:
             entry = None
         # A workflow INTENT.md manages may only narrow; its declared value is the reset.
@@ -140,12 +167,19 @@ def put_workflow_autonomy(
             else {
                 "tier": body.tier,
                 **({"floor": body.floor} if body.tier == ACT else {}),
+                **({"bar": bar} if bar is not None else {}),
             }
         )
         refused = managed_widening(key, requested, ceiling=current)
         if refused:
             raise HTTPException(status_code=409, detail=refused)
-        set_workflow_tier(workflow_id, entry, str(current_user.user_id), raises=raises)
+        set_workflow_tier(
+            workflow_id,
+            entry,
+            str(current_user.user_id),
+            raises=raises or lowers_bar,
+            keep_bar="bar" not in sent,
+        )
         settle_pending({key: requested}, str(current_user.user_id))
         return _view()
     except CeilingRefusal as exc:
@@ -156,6 +190,55 @@ def put_workflow_autonomy(
         ) from exc
     except HTTPException:
         raise
+    except Exception as exc:
+        raise HTTPException(
+            status_code=503, detail="Could not read the autonomy ceiling"
+        ) from exc
+
+
+def _put_bar(
+    workflow_id: str,
+    bar: Optional[float],
+    stored: Optional[float],
+    current,
+    current_user: User,
+    session,
+) -> CeilingResponse:
+    """Move the bar alone. Lowering or clearing it loosens; anything else tightens.
+
+    On a workflow INTENT.md manages, a bar under the declared one is refused (409).
+    """
+    if workflow_id not in current.workflows:
+        raise HTTPException(
+            status_code=422,
+            detail="A workflow that follows the fleet has no bar: give it a tier first",
+        )
+    lowers = stored is not None and (bar is None or bar < stored)
+    if lowers:
+        _loosen_gate(current_user, session, "lower or clear a bar", current.stopped)
+    else:
+        deny_unless(current_user.user_id, "ai_autonomy.stop", session)
+    # The entry as it would be stored: a declared INTENT.md entry may only narrow.
+    entry = current.workflows[workflow_id]
+    key = f"workflows.{workflow_id}"
+    requested = {
+        "tier": entry.get("tier"),
+        **({"floor": entry.get("floor")} if entry.get("tier") == ACT else {}),
+        **({"bar": bar} if bar is not None else {}),
+    }
+    refused = managed_widening(key, requested)
+    if refused:
+        raise HTTPException(status_code=409, detail=refused)
+    try:
+        set_workflow_bar(workflow_id, bar, str(current_user.user_id), lowers=lowers)
+        settle_pending({key: requested}, str(current_user.user_id))
+        return _view()
+    except CeilingRefusal as exc:
+        raise _http(exc) from exc
+    except CeilingWriteError as exc:
+        raise HTTPException(
+            status_code=500, detail="Failed to save the autonomy ceiling"
+        ) from exc
     except Exception as exc:
         raise HTTPException(
             status_code=503, detail="Could not read the autonomy ceiling"
@@ -287,22 +370,22 @@ def put_rollout_limits(
 
 
 class EmulationBody(BaseModel):
-    """The marked tools and the host list, each replacing what is stored.
+    """The host list, replacing what is stored. A host is one hostname: no
+    whitespace and no leading ``-``.
 
-    An omitted field stays as it is. A host is one hostname: no whitespace and
-    no leading ``-``.
+    ``tools`` is read and ignored (#5315): a tool is an emulator by its binding,
+    set on its classify row (``PUT /api/v1/autonomy/tools/{name}``).
     """
 
     model_config = ConfigDict(extra="forbid")
 
-    tools: Optional[List[str]] = Field(None, max_length=200)
+    tools: Optional[List[Any]] = None
     hosts: Optional[List[str]] = Field(None, max_length=500)
 
 
 class EmulationResponse(BaseModel):
-    """Which outside tools are emulators, the hosts they may run on, and the defaults."""
+    """The hosts emulators may run on, and the defaults."""
 
-    tools: List[str]
     hosts: List[str]
     defaults: Dict[str, List[str]]
 
@@ -328,16 +411,15 @@ def put_emulation(
     body: EmulationBody,
     session: UnitOfWorkSession,
     current_user: User = Depends(get_current_active_user),
-    registry: MCPRegistry = Depends(provide_mcp_registry),
 ) -> EmulationResponse:
-    """Mark or unmark emulators, and edit the hosts they may run on.
+    """Edit the hosts emulators may run on.
 
-    Adding a mark or a host lets an emulator act where it could not: a
-    person's ``ai_autonomy.write``, refused while stopped, as loosening a
-    tool's class is. Removing either is ``ai_autonomy.stop``. One trail entry
-    names who changed what.
+    Adding a host lets an emulator act where it could not: a person's
+    ``ai_autonomy.write``, refused while stopped, as loosening a tool's class
+    is. Removing one is ``ai_autonomy.stop``. One trail entry names who
+    changed what.
     """
-    if body.tools is None and body.hosts is None:
+    if body.hosts is None and "tools" not in body.model_fields_set:
         raise HTTPException(status_code=422, detail="Nothing to change")
     bad = [h for h in body.hosts or [] if not emulation.valid_host(h)]
     if bad:
@@ -352,31 +434,15 @@ def put_emulation(
         raise HTTPException(
             status_code=503, detail="Could not read the emulators"
         ) from exc
-    wanted = emulation.Emulation(
-        tools=current.tools if body.tools is None else tuple(body.tools),
-        hosts=current.hosts if body.hosts is None else tuple(body.hosts),
-    )
-    change = emulation.diff(current, wanted)
-    # A mark names an outside tool a connected server offers, one already
-    # classed, or the Atomic tool, which ships marked.
-    own = own_tool_names()
-    known = set(emulation.ATOMIC_TOOLS)
-    for name in change.tools_added:
-        if name in own or not (
-            name in known
-            or session.get(ToolEffectClass, name) is not None
-            or name in _exposed(registry)
-        ):
-            raise HTTPException(
-                status_code=404, detail=f"No outside tool named {name!r}"
-            )
+    if body.hosts is None:  # only the ignored tools
+        return _emulation_view(current)
+    change = emulation.diff(current, emulation.Emulation(hosts=tuple(body.hosts)))
     if change.adds:
         deny_unless(current_user.user_id, "ai_autonomy.write", session)
         if is_machine_request(current_user):
             raise HTTPException(
                 status_code=403,
-                detail="A service account or API token cannot mark an emulator "
-                "or list a host",
+                detail="A service account or API token cannot list a host",
             )
         try:
             stopped = read_ceiling().stopped
@@ -398,7 +464,6 @@ def put_emulation(
         return _emulation_view(
             emulation.update_emulation(
                 actor=current_user.principal_id,
-                tools=body.tools,
                 hosts=body.hosts,
                 allow=allow,
             )

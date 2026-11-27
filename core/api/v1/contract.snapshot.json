@@ -569,6 +569,228 @@
         "title": "AuditVerification",
         "type": "object"
       },
+      "BindingBody": {
+        "properties": {
+          "act": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Act"
+          },
+          "act_state": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Act State"
+          },
+          "address_arg": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Address Arg"
+          },
+          "capability": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Capability"
+          },
+          "carrier": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Carrier"
+          },
+          "emulation": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Emulation"
+          },
+          "id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Id"
+          },
+          "id_arg": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Id Arg"
+          },
+          "lookup": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Lookup"
+          },
+          "lookup_arg": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Lookup Arg"
+          },
+          "name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Name"
+          },
+          "note_arg": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Note Arg"
+          },
+          "read_state": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Read State"
+          },
+          "rows": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Rows"
+          },
+          "state": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "State"
+          },
+          "state_read": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "State Read"
+          },
+          "takes": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Takes"
+          },
+          "undo": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Undo"
+          },
+          "undo_from": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Undo From"
+          }
+        },
+        "title": "BindingBody",
+        "type": "object"
+      },
       "BreachedCasesResponse": {
         "properties": {
           "breached_cases": {
@@ -3207,6 +3429,39 @@
             ],
             "title": "Act Reversible"
           },
+          "confidence_blind_spots": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Confidence Blind Spots"
+          },
+          "confidence_precedent": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Confidence Precedent"
+          },
+          "confidence_run_quality": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Confidence Run Quality"
+          },
           "four_eyes": {
             "anyOf": [
               {
@@ -3254,6 +3509,18 @@
           },
           "act_reversible": {
             "title": "Act Reversible",
+            "type": "boolean"
+          },
+          "confidence_blind_spots": {
+            "title": "Confidence Blind Spots",
+            "type": "boolean"
+          },
+          "confidence_precedent": {
+            "title": "Confidence Precedent",
+            "type": "boolean"
+          },
+          "confidence_run_quality": {
+            "title": "Confidence Run Quality",
             "type": "boolean"
           },
           "crown_jewels": {
@@ -3354,6 +3621,9 @@
           "four_eyes",
           "hold_crown_jewels",
           "crown_jewels",
+          "confidence_precedent",
+          "confidence_blind_spots",
+          "confidence_run_quality",
           "released_per_hour"
         ],
         "title": "CeilingResponse",
@@ -4787,6 +5057,19 @@
             "title": "Source Id",
             "type": "string"
           },
+          "step_score": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "A containment an investigation filed: its step score's value, band ('none' when no factor is in force, 'unknown' when value is null), lowest factor, the line on what would raise it, and the factors.",
+            "title": "Step Score"
+          },
           "title": {
             "title": "Title",
             "type": "string"
@@ -4903,6 +5186,7 @@
                 "type": "null"
               }
             ],
+            "description": "The step score's value (parameters.step_score.value) on a containment an investigation filed; null on a row without one.",
             "title": "Confidence"
           },
           "created_at": {
@@ -5681,28 +5965,134 @@
         "title": "StatusBreakdownRow",
         "type": "object"
       },
-      "ToolClassBody": {
+      "ToolBinding": {
         "properties": {
-          "effect_class": {
-            "enum": [
-              "read",
-              "read_unverified",
-              "reversible",
-              "irreversible"
+          "act": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
             ],
-            "title": "Effect Class",
-            "type": "string"
+            "title": "Act"
+          },
+          "capability": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Capability"
+          },
+          "carrier": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Carrier"
+          },
+          "emulation": {
+            "default": false,
+            "title": "Emulation",
+            "type": "boolean"
+          },
+          "server": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Server"
           }
         },
-        "required": [
-          "effect_class"
-        ],
+        "title": "ToolBinding",
+        "type": "object"
+      },
+      "ToolClassBody": {
+        "properties": {
+          "binding": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/BindingBody"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "definition_hash": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Definition Hash"
+          },
+          "effect_class": {
+            "anyOf": [
+              {
+                "enum": [
+                  "read",
+                  "read_unverified",
+                  "reversible",
+                  "irreversible"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Effect Class"
+          }
+        },
         "title": "ToolClassBody",
         "type": "object"
       },
       "ToolClassEntry": {
-        "description": "One outside tool. ``effect_class`` is None while it is unclassified.",
+        "description": "One outside tool. ``effect_class`` is None while it is unclassified or\nwithdrawn.",
         "properties": {
+          "binding": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ToolBinding"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "binding_source": {
+            "anyOf": [
+              {
+                "enum": [
+                  "file",
+                  "person"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Binding Source"
+          },
           "classified_at": {
             "anyOf": [
               {
@@ -5725,6 +6115,27 @@
             ],
             "title": "Classified By"
           },
+          "definition": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ToolDefinition"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "definition_hash": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Definition Hash"
+          },
           "effect_class": {
             "anyOf": [
               {
@@ -5745,12 +6156,78 @@
           "name": {
             "title": "Name",
             "type": "string"
+          },
+          "pinned_definition": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ToolDefinition"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "pinned_hash": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Pinned Hash"
+          },
+          "remote": {
+            "default": false,
+            "title": "Remote",
+            "type": "boolean"
+          },
+          "shipped_binding": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ToolBinding"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "withdrawn": {
+            "default": false,
+            "title": "Withdrawn",
+            "type": "boolean"
           }
         },
         "required": [
           "name"
         ],
         "title": "ToolClassEntry",
+        "type": "object"
+      },
+      "ToolDefinition": {
+        "description": "A tool as its server lists it: what a model reads, and what is pinned.",
+        "properties": {
+          "description": {
+            "default": "",
+            "title": "Description",
+            "type": "string"
+          },
+          "inputSchema": {
+            "additionalProperties": true,
+            "default": {},
+            "title": "Inputschema",
+            "type": "object"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "title": "ToolDefinition",
         "type": "object"
       },
       "UndoRequest": {
@@ -7854,6 +8331,59 @@
           }
         },
         "summary": "Put Ceiling",
+        "tags": [
+          "autonomy"
+        ]
+      }
+    },
+    "/api/v1/autonomy/capabilities": {
+      "get": {
+        "operationId": "get_api_v1_autonomy_capabilities",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "title": "Response List Capabilities Api V1 Autonomy Capabilities Get",
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Capabilities",
         "tags": [
           "autonomy"
         ]

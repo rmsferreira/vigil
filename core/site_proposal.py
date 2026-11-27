@@ -63,6 +63,7 @@ LABEL = {
     "crown_jewels": "name",
     "owners": "team",
     "blind_spots": "what",
+    "telemetry": "name",
 }
 # Lists whose items only a person can state.
 PERSON_ONLY = frozenset({"crown_jewels", "owners", "blind_spots"})
@@ -487,6 +488,31 @@ def proposal_view(row: Dict[str, Any], session=None) -> Optional[Dict[str, Any]]
     }
 
 
+def link_answers(proposal: Optional[Dict[str, Any]], user_id: Optional[str]) -> None:
+    """Name the person behind each quoted answer and, when the reader owns the
+    conversation it was given in, that conversation's id. Nothing is stored."""
+    answers = [
+        p
+        for p in ((proposal or {}).get("provenance") or {}).values()
+        if p.get("source") == "answer"
+    ]
+    if not answers:
+        return
+    from core.chat.conversation_service import conversations_for_runs
+    from core.storage.connection import get_db_manager
+    from core.storage.models import User
+
+    owned = conversations_for_runs([p.get("run_id") for p in answers], user_id)
+    ids = {p["person_id"] for p in answers if p.get("person_id")}
+    with get_db_manager().session_scope() as session:
+        names = dict(
+            session.query(User.user_id, User.username).filter(User.user_id.in_(ids))
+        )
+    for p in answers:
+        p["person"] = names.get(p.get("person_id"))
+        p["conversation_id"] = owned.get(p.get("run_id"))
+
+
 def site_questions(view: Dict[str, Any], row: Dict[str, Any]) -> List[Dict[str, Any]]:
     """Unplaced, unowned and contradicted, against the applied ``row`` and its ``view``."""
     from core.memory.recall import _OFFERED
@@ -599,10 +625,11 @@ def _site_needs() -> List[str]:
 
 
 def _need_servers(needs: List[str]) -> List[str]:
-    """Every outside server a need may bind: a capability's candidates, or the
-    ``{server}`` of a catalogue name."""
+    """Every outside server a need may bind: the servers a capability's bound
+    tools name, or the ``{server}`` of a catalogue name."""
+    from core.integrations.bindings import servers_for
     from core.response.ceiling import own_tool_names
-    from core.workflows.playbook_resolver import CAPABILITIES, NEED_ALIASES
+    from core.workflows.playbook_resolver import CAPABILITY_NAMES, NEED_ALIASES
 
     own = own_tool_names()
     servers: Dict[str, None] = {}
@@ -610,10 +637,8 @@ def _need_servers(needs: List[str]) -> List[str]:
         capability = NEED_ALIASES.get(need, need)
         if need in own:
             continue
-        if capability in CAPABILITIES:
-            for c in CAPABILITIES[capability]:
-                if c.server:
-                    servers[c.server] = None
+        if capability in CAPABILITY_NAMES:
+            servers.update(dict.fromkeys(servers_for(capability)))
         elif "_" in need:
             servers[need.partition("_")[0]] = None
     return list(servers)
@@ -662,7 +687,7 @@ def not_evaluated(registry=None) -> List[Dict[str, str]]:
     from core.integrations.mcp.registry import MCPRegistry
     from core.response.ceiling import is_read, own_tool_names, tool_classes
     from core.workflows.playbook_resolver import (
-        CAPABILITIES,
+        CAPABILITY_NAMES,
         NEED_ALIASES,
         _bound_capabilities,
         _tool_catalogue,
@@ -677,7 +702,7 @@ def not_evaluated(registry=None) -> List[Dict[str, str]]:
         capability = NEED_ALIASES.get(need, need)
         if capability in provided or need in own:
             continue
-        if capability in CAPABILITIES:
+        if capability in CAPABILITY_NAMES:
             reason = f"not connected: no connected source answers {capability}"
         else:  # a catalogue name, {server}_{tool}
             reason = f"not connected: {need.partition('_')[0]} is not connected"

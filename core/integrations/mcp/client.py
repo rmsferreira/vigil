@@ -2,9 +2,13 @@
 
 import asyncio
 import logging
+import ssl
 import threading
+import urllib.request
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
+from urllib.parse import urlsplit
 
 try:
     from mcp import ClientSession, StdioServerParameters
@@ -31,7 +35,7 @@ from core.integrations._base.config import missing as missing_fields
 from core.integrations._base.config import resolve
 from core.integrations.crowdstrike.descriptor import CROWDSTRIKE
 from core.integrations.elastic.descriptor import ELASTIC, ELASTIC_REQUIRED
-from core.integrations.mcp.child_env import stdio_env
+from core.integrations.mcp.child_env import ca_bundle_env, proxy_env, stdio_env
 from core.integrations.mcp.runner import (
     RunnerError,
     RunnerServer,
@@ -44,6 +48,7 @@ from core.integrations.opensearch.descriptor import OPENSEARCH, OPENSEARCH_REQUI
 from core.integrations.splunk.descriptor import SPLUNK, SPLUNK_SELFHOSTED_REQUIRED
 from core.integrations.wazuh.descriptor import WAZUH, WAZUH_REQUIRED
 from core.secrets import get_secret
+from core.sources import TEMPLATE, credential_key
 
 logger = logging.getLogger(__name__)
 
@@ -80,16 +85,121 @@ def _missing_crowdstrike() -> List[str]:
     return missing
 
 
+# The last HTTP error status a remote server answered, by server name: the SDK
+# reports any non-2xx as "Server returned an error response", which hides a 401.
+_remote_refusals: Dict[str, int] = {}
+
+
+def _describe(e: BaseException, server_name: Optional[str] = None) -> str:
+    """A connect failure as Settings shows it: the runner's own words, else the
+    first error inside a task group (the HTTP transports raise one), by type,
+    with the HTTP status a remote server refused it with."""
+    while isinstance(e, BaseExceptionGroup) and e.exceptions:
+        e = e.exceptions[0]
+    msg = str(e) if isinstance(e, RunnerError) else f"{type(e).__name__}: {e}"
+    status = _remote_refusals.pop(server_name, None) if server_name else None
+    return f"{msg} (HTTP {status})" if status else msg
+
+
+# Declared source -> the last failure this process wrote to its health, so a
+# source retried every few seconds on one missing credential writes it once.
+_source_health_written: Dict[str, str] = {}
+
+
+def note_source_health(name: str, ok: bool, error: Optional[str]) -> None:
+    """Integration Health for declared source ``name``, keyed ``source-<name>``:
+    a connect attempt and its outcome. A repeat of the same failure is skipped."""
+    from core.integrations.health import record_test
+    from core.sources import integration_id
+
+    if not ok and _source_health_written.get(name) == error:
+        return
+    _source_health_written[name] = "" if ok else (error or "connect failed")
+    record_test(integration_id(name), success=ok, error=None if ok else error)
+
+
+@dataclass(frozen=True)
+class RemoteParams:
+    """A remote catalog entry as resolved for one connect."""
+
+    name: str
+    url: str
+    headers: Dict[str, str]
+
+
+def _remote_http_client(params: RemoteParams):
+    """An HTTP client carrying only the entry's headers.
+
+    ``trust_env`` off, so TLS trust and the proxy come only from what a spawned
+    server would get (``ca_bundle_env`` / ``proxy_env``), never from anything
+    else in this process's environment (``.netrc``, stray SSL variables).
+    """
+    import httpx2
+    from mcp.shared._httpx_utils import (
+        MCP_DEFAULT_SSE_READ_TIMEOUT,
+        MCP_DEFAULT_TIMEOUT,
+    )
+
+    parts = urlsplit(params.url)
+    if parts.scheme != "https" or not parts.hostname:
+        # Never the URL itself: it may carry a credential.
+        raise ValueError(
+            f"{params.name}: url must resolve to an https URL with a host "
+            f"(got scheme {parts.scheme or 'none'!r}"
+            f"{', no host' if not parts.hostname else ''})"
+        )
+    bundle = ca_bundle_env()
+    verify: Any = True
+    if "SSL_CERT_FILE" in bundle:
+        verify = ssl.create_default_context(cafile=bundle["SSL_CERT_FILE"])
+    elif "SSL_CERT_DIR" in bundle:
+        verify = ssl.create_default_context(capath=bundle["SSL_CERT_DIR"])
+    env = proxy_env()
+
+    def var(name: str) -> str:  # lower-case first, as curl and urllib read them
+        return env.get(name.lower()) or env.get(name) or ""
+
+    proxy = var("HTTPS_PROXY") or var("ALL_PROXY") or None
+    if proxy and urllib.request.proxy_bypass_environment(
+        parts.hostname, {"no": var("NO_PROXY")}
+    ):
+        proxy = None
+    if proxy and "://" not in proxy:
+        proxy = f"http://{proxy}"
+
+    async def note_refusal(response) -> None:
+        if response.status_code >= 400:
+            _remote_refusals[params.name] = response.status_code
+
+    _remote_refusals.pop(params.name, None)
+    return httpx2.AsyncClient(
+        headers=params.headers,
+        event_hooks={"response": [note_refusal]},
+        timeout=httpx2.Timeout(MCP_DEFAULT_TIMEOUT, read=MCP_DEFAULT_SSE_READ_TIMEOUT),
+        verify=verify,
+        proxy=proxy,
+        trust_env=False,
+    )
+
+
 @asynccontextmanager
 async def open_transport(
     server_params, runner: Optional[RunnerServer] = None, *, recheck: bool = False
 ):
-    """The (read, write) streams to one server: the runner's, or a stdio child's.
+    """The (read, write) streams to one server: remote, the runner's, or a stdio child's.
 
     In runner mode this PUTs the server first, so a reconnect also restarts one
     that stopped. ``recheck`` refuses a server disabled since the session opened:
     a reconnect must not start what another process turned off.
     """
+    if isinstance(server_params, RemoteParams):
+        from mcp.client.streamable_http import streamable_http_client
+
+        async with _remote_http_client(server_params) as http, streamable_http_client(
+            server_params.url, http_client=http
+        ) as (read, write):
+            yield read, write
+        return
     if runner is None:
         async with stdio_client(server_params) as (read, write):
             yield read, write
@@ -137,9 +247,7 @@ class PersistentServerSession:
 
             except Exception as e:
                 # The runner's own words, so Settings shows why it refused.
-                self.last_error = (
-                    str(e) if isinstance(e, RunnerError) else f"{type(e).__name__}: {e}"
-                )
+                self.last_error = _describe(e, self.server_name)
                 logger.error(f"Failed to connect to {self.server_name}: {e}")
                 await self._cleanup()
                 return False
@@ -304,6 +412,41 @@ class MCPClient:
         persistent: bool = True,
         skip_enabled_check: bool = False,
     ) -> bool:
+        """Connect, and for a declared source write its Integration Health
+        (``source-<name>``) with the outcome. See ``_connect_to_server``."""
+        server = self.mcp_service.servers.get(server_name)
+        if not getattr(server, "source", False):
+            return await self._connect_to_server(
+                server_name, persistent, skip_enabled_check
+            )
+        session = self.persistent_sessions.get(server_name)
+        was_live = bool(
+            session and session.is_connected and server_name in self.tools_cache
+        )
+        ok = await self._connect_to_server(server_name, persistent, skip_enabled_check)
+        if ok and was_live:
+            return ok  # nothing was attempted
+        missing = self.last_missing_credentials.get(server_name)
+        error = self.last_errors.get(server_name)
+        if missing:
+            # Name the field the file declares, beside the key that holds it.
+            fields = {
+                credential_key(server_name, f): f
+                for f in TEMPLATE.findall(" ".join(server.headers.values()))
+            }
+            error = "missing credential: " + ", ".join(
+                f"{fields.get(k, k)} ({k})" for k in missing
+            )
+        if ok or error:  # else switched off: no attempt
+            await asyncio.to_thread(note_source_health, server_name, ok, error)
+        return ok
+
+    async def _connect_to_server(
+        self,
+        server_name: str,
+        persistent: bool = True,
+        skip_enabled_check: bool = False,
+    ) -> bool:
         """
         Connect to an MCP server, cache its tools, and optionally maintain persistent connection.
 
@@ -394,7 +537,12 @@ class MCPClient:
             # what stdio_env builds and nothing else from the backend. Built here
             # so a setting changed since the catalog loaded is picked up.
             server_params = None
-            if runner is None:
+            if server.url:
+                url, headers = await asyncio.to_thread(
+                    self.mcp_service.remote_target, server
+                )
+                server_params = RemoteParams(server_name, url, headers)
+            elif runner is None:
                 env = await asyncio.to_thread(
                     stdio_env, server, str(self.mcp_service.project_root)
                 )
@@ -472,14 +620,16 @@ class MCPClient:
             # reason (e.g. "FileNotFoundError: uvx", "ModuleNotFoundError:
             # mcp", "missing env var GITHUB_TOKEN") instead of a
             # generic "Failed to connect".
-            self.last_errors[server_name] = (
-                str(e) if isinstance(e, RunnerError) else f"{type(e).__name__}: {e}"
-            )
+            self.last_errors[server_name] = _describe(e, server_name)
             logger.error(f"Failed to connect to {server_name}: {e}")
             return False
 
     def _runner_for(self, server_name: str) -> Optional[RunnerServer]:
-        """The runner serving ``server_name``, or None for a stdio child."""
+        """The runner serving ``server_name``, or None for a stdio child or a
+        remote entry, which this process reaches itself."""
+        server = self.mcp_service.servers.get(server_name)
+        if server is not None and server.url:
+            return None
         url = runner_url(server_name)
         if url is None:
             return None
@@ -489,6 +639,7 @@ class MCPClient:
             server_name,
             env=lambda: self._runner_env(server_name),
             enabled=lambda: service.is_server_enabled(server_name),
+            of=getattr(server, "instance_of", None),
         )
 
     def _runner_env(self, server_name: str) -> Dict[str, str]:
@@ -502,6 +653,8 @@ class MCPClient:
     def _missing_credentials_for(self, server) -> List[str]:
         # Resolves through get_secret, so a credential saved via the integration
         # wizard (encrypted store, not the process env) does not read as dormant.
+        if getattr(server, "instance_of", None):
+            return self._missing_instance_credentials(server)
         if getattr(server, "name", None) == CROWDSTRIKE.id:
             return _missing_crowdstrike()
         gated = _DESCRIPTOR_GATED.get(getattr(server, "name", None))
@@ -517,6 +670,29 @@ class MCPClient:
                 return list(required)
         required = getattr(server, "required_env_vars", None) or []
         return [var for var in required if not get_secret(var)]
+
+    def _missing_instance_credentials(self, server) -> List[str]:
+        """An instance's gate (#5353): its base's, read under the instance's id."""
+        from core.integrations._base.descriptor import get_descriptor
+        from core.integrations.integration_bridge_service import instance_keys
+
+        base, name = server.instance_of, server.name
+        descriptor = get_descriptor(base)
+        own = instance_keys(name)
+        try:
+            fields = resolve(descriptor, name) if descriptor else {}
+        except Exception as exc:  # noqa: BLE001 - a lookup failure is not configured
+            logger.warning("Config lookup for %s failed: %s", name, type(exc).__name__)
+            fields = {}
+        gated = _DESCRIPTOR_GATED.get(base)
+        if gated:
+            return [own.get(f, f) for f in missing_fields(fields, *gated[1])]
+        by_key = {key: field for field, key in own.items()}
+        return [
+            var
+            for var in server.required_env_vars
+            if not fields.get(by_key.get(var, "")) and not get_secret(var)
+        ]
 
     def setup_required(self, server_name: str) -> Optional[str]:
         """Why ``server_name`` is not set up yet, or None (see ``MCPService``)."""
@@ -632,7 +808,10 @@ class MCPClient:
                 attributes={
                     "mcp.server.name": server_name,
                     "mcp.transport": (
-                        "streamable-http" if runner_url(server_name) else "stdio"
+                        "streamable-http"
+                        if self.mcp_service.servers[server_name].url
+                        or runner_url(server_name)
+                        else "stdio"
                     ),
                     "vigil.tool.name": tool_name,
                     "vigil.tool.input_size": len(_json.dumps(arguments, default=str)),

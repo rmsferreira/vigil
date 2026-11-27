@@ -24,24 +24,6 @@ export function getIntegrationForServer(serverName: string): IntegrationMetadata
 export const logoForServer = (serverName: string) =>
   getAllIntegrations().find((i) => i.id === (SERVER_TO_INTEGRATION.get(serverName) ?? serverName))?.logo
 
-export const WIP_SERVERS = new Set([
-  'carbon-black', 'hybrid-analysis', 'anyrun',
-  'alienvault-otx', 'palo-alto',
-  'slack', 'misp', 'ip-geolocation', 'url-analysis',
-  'microsoft-defender', 'azure-ad', 'microsoft-teams',
-])
-
-/** Offered, but never run against a live instance: the vendor sells no free
- *  tier the project can test on, so only the client side is covered. A server
- *  leaves this set when it gains a live test, not on a user's say-so. */
-export const EXPERIMENTAL_SERVERS = new Set([
-  'crowdstrike', 'sentinelone', 'azure-sentinel', 'splunk',
-  'gcp-secops', 'gcp-threat-intel', 'joe-sandbox', 'vstrike',
-  'atomic-red-team', 'cape-sandbox', 'amazon-security-lake',
-])
-
-export const EXPERIMENTAL_NOTE = 'Not yet tested against a live instance. It may not work; please report what you find.'
-
 /** Card-title overrides for `prettyServerName`. Fix casing/branding here rather
  *  than renaming the server id, which is load-bearing (mcp-config.json, backend
  *  registration, persisted enabled-state store). */
@@ -88,7 +70,7 @@ export const SERVER_DESCRIPTIONS = new Map(Object.entries({
   sentinelone: 'Query SentinelOne for alerts, asset inventory, and vulnerabilities via the read-only Purple AI MCP.',
   'carbon-black': 'Query VMware Carbon Black for endpoint events, process trees, and binary analysis.',
   'microsoft-defender': 'Query Microsoft Defender for Endpoint alerts, device info, and advanced hunting. May overlap with Sentinel. Optional for the Day 1 Report: Machine.Read.All, which also lets agents look up a Defender machine by id. Alert collection uses the read scope alert collection needs.',
-  splunk: 'The official Splunk MCP server, deployed separately from Splunk Enterprise. Configured by SPLUNK_MCP_URL in the environment, not from Settings.',
+  splunk: 'The official Splunk MCP server, deployed separately from Splunk Enterprise. Vigil connects to it over HTTPS at SPLUNK_MCP_URL with the bearer in SPLUNK_MCP_TOKEN, both set in the environment, not from Settings.',
   'splunk-selfhosted': 'Run SPL searches against a self-hosted Splunk over its REST API (port 8089) for log analysis, correlation searches, and alert triage. Server URL and credentials are configured in Settings.',
   elastic: 'Query Elasticsearch and Elastic Security for logs, IOC hits, and detection alerts. Requires an Elasticsearch URL and API key or username/password.',
   opensearch: 'Query OpenSearch for logs and IOC hits, and ingest Security Analytics findings. Requires an OpenSearch URL and username/password.',

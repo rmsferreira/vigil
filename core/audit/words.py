@@ -263,6 +263,7 @@ def _emulation(p: Mapping[str, Any]) -> str:
     parts = [
         f"{verb} {', '.join(p[key])}"
         for key, verb in (
+            # Entries before #5315 also marked tools here.
             ("tools_added", "marked emulator"),
             ("tools_removed", "unmarked emulator"),
             ("hosts_added", "listed host"),
@@ -271,6 +272,18 @@ def _emulation(p: Mapping[str, Any]) -> str:
         if p.get(key)
     ]
     return "Emulators: " + "; ".join(parts) if parts else "Changed the emulators"
+
+
+def _tool_bound(p: Mapping[str, Any]) -> str:
+    tool = p.get("tool") or "a tool"
+    after = p.get("binding_after")
+    if not isinstance(after, dict):  # "shipped"
+        return f"Put {tool} back on its shipped binding"
+    if after.get("emulation") is True:
+        return f"Bound {tool} as an emulator"
+    if not after.get("capability"):
+        return f"Bound {tool} to no capability"
+    return f"Bound {tool} to {after['capability']}"
 
 
 def _proof_export(p: Mapping[str, Any]) -> str:
@@ -498,7 +511,15 @@ _SAID: dict[str, str | Callable[[Mapping[str, Any]], str]] = {
     + (f": {p['reason']}" if p.get("reason") else ""),
     "autonomy.tool_classified": lambda p: f"Classed {p.get('tool') or 'a tool'} as "
     f"{_word(p.get('class_after')) or 'unclassified'}",
+    "autonomy.tool_pinned": lambda p: f"Pinned {p.get('tool') or 'a tool'} to the "
+    "definition its server lists now",
+    "autonomy.tool_bound": _tool_bound,
+    "autonomy.tool_withdrawn": lambda p: f"Withdrew {p.get('tool') or 'a tool'}: its "
+    "definition no longer matches the one classified",
     "tools.classified": "Classed outside tools on upgrade",
+    "source.credential_deleted": lambda p: f"Deleted {p.get('key') or 'a credential'} "
+    f"of declared source {p.get('source') or 'unknown'}"
+    + (f" ({p['reason']})" if p.get("reason") else ""),
     "autonomy.emulation_changed": _emulation,
     "emulation.unlisted_host": lambda p: f"{p.get('tool') or 'An emulator'} reported steps "
     f"on hosts not listed for emulation: {', '.join(p.get('hosts') or []) or 'unknown'}",

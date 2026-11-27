@@ -804,6 +804,15 @@ export const configApi = {
   getIntent: () => api.get<Schema<'IntentReportResponse'>>('/config/intent'),
   // The applied site/ revision, read-only (#5214); a hunt may start on one of its zones (#5212).
   getSite: () => api.get<Schema<'SiteContextResponse'>>('/config/site'),
+  // The open site proposal (#5229): its folder as a .tar.gz, its discard, and a refresh by the site agent (#5259).
+  getSiteProposalArchive: () => api.get<Blob>('/config/site/proposal/archive', { responseType: 'blob' }),
+  discardSiteProposal: (reason: string) =>
+    api.post<Schema<'SiteProposalResponse'>>('/config/site/proposal/discard', { reason }),
+  refreshSiteProposal: () => api.post<{ status: string; message: string }>('/config/site/proposal/refresh'),
+  // Declared remote MCP sources (#5304): read, and a person's accept of the pending ones
+  getSources: () => api.get<DeclaredSources>('/config/sources'),
+  acceptSources: (data: Schema<'SourcesAcceptBody'>) =>
+    api.post<DeclaredSources>('/config/sources/accept', data),
   // A person's accept of the applied revision's pending loosenings (#5069)
   acceptIntent: (data: Schema<'IntentAcceptBody'>) =>
     api.post<Schema<'IntentReportResponse'>>('/config/intent/accept', data),
@@ -1088,19 +1097,39 @@ export interface WorkflowAgreement extends AgreementTally {
   unattributed: number
 }
 
+/** How one kind of held dismissal's cases stand now. */
+export interface AfterHold {
+  open: number
+  not_real: number
+  real: number
+  no_determination: number
+  by_agent: number
+}
+
+/** One workflow's dismissals in the window, from workflow_runs.step_score (#5276). */
+export interface StepScoreTally {
+  bands: { high: number; medium: number; low: number; unknown: number }
+  held_by_bar: number
+  passed_bar: number
+  held_by_autonomy: number
+  after_hold: { bar: AfterHold; autonomy: AfterHold }
+}
+
 export interface AgentAgreement {
   overall?: AgreementTally
   by_workflow: WorkflowAgreement[]
+  step_scores: Record<string, StepScoreTally>
 }
 
 export const analyticsApi = {
   /** The agent_agreement block of GET /analytics; the route returns an untyped dict, so only this part is typed. */
   getAgreement: (timeRange: '24h' | '7d' | '30d' | 'all' = '30d') =>
     api
-      .get<{ agent_agreement?: { overall?: AgreementTally; by_workflow?: WorkflowAgreement[] } }>('/analytics', { params: { time_range: timeRange } })
+      .get<{ agent_agreement?: Partial<AgentAgreement> }>('/analytics', { params: { time_range: timeRange } })
       .then((res): AgentAgreement => ({
         overall: res.data.agent_agreement?.overall,
         by_workflow: res.data.agent_agreement?.by_workflow ?? [],
+        step_scores: res.data.agent_agreement?.step_scores ?? {},
       })),
 }
 
@@ -1929,6 +1958,7 @@ export const workflowApi = {
 export type Ceiling = Schema<'CeilingResponse'>
 export type ToolClass = Schema<'ToolClassEntry'>
 export type EffectClass = NonNullable<ToolClass['effect_class']>
+export type ToolBindingBody = Schema<'BindingBody'>
 // What Vigil holds from Entra, Okta and Falcon (#4743): read only, findings.read.
 export type EntityFacts = Schema<'EntityFactsResponse'>
 export const entityFactsApi = {
@@ -1950,8 +1980,13 @@ export const autonomyApi = {
   update: (body: Schema<'CeilingBody'>) => api.put<Ceiling>('/autonomy', body),
   resume: () => api.post<Ceiling>('/autonomy/resume'),
   tools: () => api.get<ToolClass[]>('/autonomy/tools'),
-  classifyTool: (name: string, effect_class: EffectClass) =>
-    api.put<ToolClass>(`/autonomy/tools/${encodeURIComponent(name)}`, { effect_class }),
+  // definition_hash is the definition the person was shown; a changed one answers 409 (#5300)
+  classifyTool: (name: string, effect_class: EffectClass, definition_hash?: string | null) =>
+    api.put<ToolClass>(`/autonomy/tools/${encodeURIComponent(name)}`, { effect_class, definition_hash }),
+  // The capability a tool answers (#5312): null puts the shipped binding back, {} binds nothing
+  bindTool: (name: string, binding: ToolBindingBody | null) =>
+    api.put<ToolClass>(`/autonomy/tools/${encodeURIComponent(name)}`, { binding }),
+  capabilities: () => api.get<string[]>('/autonomy/capabilities'),
   // tier null follows the fleet; the server decides whether the change is a raise
   setWorkflow: (id: string, body: Schema<'WorkflowAutonomyBody'>) =>
     api.put<Ceiling>(`/autonomy/workflows/${encodeURIComponent(id)}`, body),
@@ -2167,6 +2202,46 @@ export type IntegrationHealthState =
   | 'not_checked'
   | 'switched_off'
   | 'unknown'
+
+/** GET /api/config/sources (core/sources.py sources_view); the schema leaves the body untyped. Never a value. */
+export interface DeclaredSources {
+  directory: string | null
+  declared: boolean
+  revision: string | null
+  hash: string | null
+  /** none, ok, rejected or degraded */
+  state: string
+  reason: string
+  applied_at: string | null
+  rejected: { revision: string; file: string; line: number | null; reason: string } | null
+  sources: DeclaredSource[]
+}
+
+export interface DeclaredSource {
+  name: string
+  /** source-<name>: its credentials' integration id and its Integration Health row */
+  integration_id: string
+  file: string
+  url: string
+  /** header names only */
+  headers: string[]
+  /** `from`: stored (encrypted store), environment, or null when unset */
+  credentials: { field: string; key: string; set: boolean; from: 'stored' | 'environment' | null }[]
+  body: string
+  launch_hash: string
+  status: 'accepted' | 'pending'
+  pending: {
+    kind: 'new' | 'changed'
+    changes: string[]
+    url_from?: string | null
+    url_to?: string
+    asks_credentials_again?: boolean
+    headers_changed?: string[]
+    credentials_added?: string[]
+    credentials_removed?: string[]
+  } | null
+  accepted: { hash: string; revision: string; by_name: string; at: string } | null
+}
 
 /** One source from GET /api/integration-health. `record` is not read: state, reason and since are the judgement. */
 export interface IntegrationHealthSource {

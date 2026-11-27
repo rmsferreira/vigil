@@ -55,7 +55,6 @@ x-intent-env: &intent-env
   DAEMON_AUTO_TRIAGE: ${DAEMON_AUTO_TRIAGE:-true}
   DAEMON_AUTO_ENRICH: ${DAEMON_AUTO_ENRICH:-true}
   DAEMON_AUTO_RESPONSE: ${DAEMON_AUTO_RESPONSE:-true}
-  DAEMON_CONFIDENCE_THRESHOLD: ${DAEMON_CONFIDENCE_THRESHOLD:-0.90}
   DAEMON_REVIEW_THRESHOLD: ${DAEMON_REVIEW_THRESHOLD:-0.85}
   DAEMON_MONITOR_THRESHOLD: ${DAEMON_MONITOR_THRESHOLD:-0.70}
   DAEMON_FORCE_APPROVAL: ${DAEMON_FORCE_APPROVAL:-false}
@@ -249,6 +248,11 @@ services:
       # 60–86400; outside that the API keeps 30 minutes and logs it. Not the
       # autonomous runtime, which stays on the intent anchor above.
       WORKFLOW_DEFAULT_WALL_SECONDS: ${WORKFLOW_DEFAULT_WALL_SECONDS:-1800}
+      # Hunts whose start names no limits: iterations 1–40, cost USD up to 100,
+      # wall 60–86400 s. Outside that the API keeps 8 / 15.0 / 5400 and logs it.
+      HUNT_DEFAULT_ITERATIONS: ${HUNT_DEFAULT_ITERATIONS:-8}
+      HUNT_DEFAULT_COST_USD: ${HUNT_DEFAULT_COST_USD:-15.0}
+      HUNT_DEFAULT_WALL_SECONDS: ${HUNT_DEFAULT_WALL_SECONDS:-5400}
       # Chat and run projections. core/config.py defaults this to localhost:6989,
       # which was the agent layer's address while it shared the backend process.
       AGENT_URL: http://agent-serve:6989
@@ -285,6 +289,9 @@ services:
       SSL_CERT_FILE:
       REQUESTS_CA_BUNDLE:
       NODE_EXTRA_CA_CERTS:
+      # Splunk's official MCP server, reached from here over HTTPS (no runner).
+      SPLUNK_MCP_URL: ${SPLUNK_MCP_URL:-}
+      SPLUNK_MCP_TOKEN: ${SPLUNK_MCP_TOKEN:-}
       # Declared intent directory, read here for the skills API's managed state
       # and revision only; soc-daemon is still the only applier (see there).
       VIGIL_INTENT_DIR: ${VIGIL_INTENT_DIR:-}
@@ -518,6 +525,9 @@ services:
       SPLUNK_URL: ${SPLUNK_URL}
       SPLUNK_USERNAME: ${SPLUNK_USERNAME}
       SPLUNK_PASSWORD: ${SPLUNK_PASSWORD}
+      # Official Splunk MCP server, as for backend.
+      SPLUNK_MCP_URL: ${SPLUNK_MCP_URL:-}
+      SPLUNK_MCP_TOKEN: ${SPLUNK_MCP_TOKEN:-}
       CROWDSTRIKE_CLIENT_ID: ${CROWDSTRIKE_CLIENT_ID}
       CROWDSTRIKE_CLIENT_SECRET: ${CROWDSTRIKE_CLIENT_SECRET}
       VIRUSTOTAL_API_KEY: ${VIRUSTOTAL_API_KEY}
@@ -554,6 +564,12 @@ services:
       # it in a post-merge hook: git rev-parse HEAD > REVISION
       # Skills kept in the checkout load when VIGIL_SKILLS_PATH points under the
       # mount (/etc/vigil/intent/skills); backend and llm-worker mount it too.
+      # Remote MCP sources (sources/<name>.md, INTENT.md "Remote MCP sources")
+      # need no mount elsewhere: once a person accepts one in Settings, backend
+      # and daemon connect to it within ~10s, no restart. Its credentials are
+      # SOURCE_<NAME>_<FIELD>: save them in Settings (the shared State
+      # Directory), or add them to both services' environment. Vigil enforces
+      # no egress for a source; your proxy allowlist or firewall does.
       #   - ${VIGIL_INTENT_SOURCE}:/etc/vigil/intent:ro
     depends_on:
       mcp-runner:

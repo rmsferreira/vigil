@@ -3735,6 +3735,70 @@
       overflow-wrap: anywhere;
    }
 
+   /* Settings > Integrations > Declared sources: one bg2 row per source, a hairline between. */
+   .src-stack {
+      display: flex;
+      flex-direction: column;
+      gap: 1px;
+      background: var(--ln0);
+      border-radius: 10px;
+      overflow: hidden;
+   }
+
+   .src-row {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      padding: 12px 14px;
+      background: var(--bg2);
+      min-width: 0;
+   }
+
+   .src-facts {
+      display: grid;
+      grid-template-columns: max-content minmax(0, 1fr);
+      gap: 6px 14px;
+      margin: 0;
+      font-size: 13px;
+      line-height: 1.45;
+   }
+
+   .src-facts dt { color: var(--tx2); font-size: 12px; }
+   .src-facts dd { margin: 0; min-width: 0; overflow-wrap: anywhere; color: var(--tx1); }
+
+   .src-meta {
+      font-size: 12px;
+      line-height: 1.45;
+      color: var(--tx2);
+      overflow-wrap: anywhere;
+   }
+
+   .src-creds { margin: 0; padding: 0; list-style: none; overflow-wrap: anywhere; }
+
+   .src-fields {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(min(220px, 100%), 1fr));
+      gap: 10px;
+      max-width: 720px;
+   }
+
+   .src-flag,
+   .src-rejected {
+      font-size: 12px;
+      line-height: 1.45;
+      overflow-wrap: anywhere;
+   }
+
+   .src-flag { color: var(--fair); }
+
+   .src-rejected {
+      color: var(--poor);
+      margin-bottom: 12px;
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+   }
+
    .sel-note-row {
       margin: 0;
       padding: 8px 12px;
@@ -3948,8 +4012,6 @@
       color: var(--tx0);
    }
 
-   .int-wip { color: var(--fair); font-size: 10px; }
-   .int-exp { color: var(--fair); font-size: 10px; flex-shrink: 0; }
 
    .int-sub {
       display: block;
@@ -4958,6 +5020,30 @@
       min-width: 0;
    }
 
+   /* A workflow row's choice, then its bar under it */
+   .lim-row.lim-wf .lim-row-ctl {
+      display: flex;
+      flex-direction: column;
+      align-items: flex-end;
+      gap: 6px;
+   }
+
+   .lim-wf-bar {
+      display: flex;
+      flex-direction: column;
+      align-items: flex-end;
+      gap: 4px;
+      min-width: 0;
+   }
+
+   .lim-wf-bar-row {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 12px;
+      color: var(--tx2);
+   }
+
    .lim-held-ctl {
       display: flex;
       flex-wrap: wrap;
@@ -5130,6 +5216,126 @@
       color: var(--tx0);
    }
 
+   /* A tool's definition under its name (#5300): description, then the schema collapsed */
+   .lim-tool-def {
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+      margin-top: 4px;
+      min-width: 0;
+      font-size: 12px;
+      font-weight: 400;
+      line-height: 1.45;
+      color: var(--tx2);
+   }
+
+   .lim-tool-def b {
+      font-weight: 600;
+      color: var(--tx1);
+   }
+
+   .lim-tool-def p {
+      margin: 0;
+      overflow-wrap: anywhere;
+      color: var(--tx1);
+   }
+
+   .lim-tool-def summary {
+      width: fit-content;
+      cursor: pointer;
+      color: var(--tx2);
+   }
+
+   .lim-tool-def summary:focus-visible {
+      outline: 2px solid var(--ac);
+      outline-offset: 1px;
+   }
+
+   .lim-tool-def pre {
+      max-height: 240px;
+      margin: 4px 0 0;
+      padding: 8px 10px;
+      overflow-y: auto;
+      border-radius: 8px;
+      background: var(--bg2);
+      font-family: var(--mono);
+      font-size: 11px;
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+      color: var(--tx1);
+   }
+
+   .lim-tool-pin {
+      display: block;
+      margin-top: 2px;
+      color: var(--tx3);
+   }
+
+   /* What a tool answers (#5312): the note under its class, and the select under its segment */
+   .lim-tool-bound {
+      display: block;
+      margin-top: 2px;
+      overflow-wrap: anywhere;
+      color: var(--tx2);
+   }
+
+   .lim-row.lim-tool .lim-tool-ctl {
+      display: flex;
+      flex-direction: column;
+      align-items: flex-end;
+      gap: 6px;
+      max-width: 100%;
+   }
+
+   .lim-bind {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      max-width: 100%;
+      font-size: 12px;
+      color: var(--tx2);
+   }
+
+   .lim-bind .drop {
+      width: 260px;
+      min-width: 0;
+   }
+
+   /* An act carrier in the declared form (#5314): the YAML under its row, and the role marks */
+   .lim-tool-role {
+      display: block;
+      margin-top: 2px;
+      overflow-wrap: anywhere;
+      font-weight: 600;
+      color: var(--tx1);
+   }
+
+   .lim-row.lim-tool .lim-carrier {
+      grid-column: 1 / -1;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      min-width: 0;
+   }
+
+   .lim-carrier-text {
+      min-height: 160px;
+      resize: vertical;
+      font-family: var(--mono);
+      font-size: 12px;
+      line-height: 1.5;
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+   }
+
+   .lim-carrier-ctl {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      justify-content: flex-end;
+      gap: 8px;
+   }
+
    /* Emulators: the mark beside a tool's class, and the host list under its row */
    .lim-emu-mark {
       display: inline-block;
@@ -5204,15 +5410,23 @@
       Held rows do the same so Release and Reject stay on screen. */
    @container main (max-width: 700px) {
       .lim-row.lim-wf,
-      .lim-row.lim-held {
+      .lim-row.lim-held,
+      .lim-row.lim-tool {
          grid-template-columns: minmax(0, 1fr);
       }
 
       .lim-row.lim-wf .lim-row-ctl,
-      .lim-row.lim-held .lim-row-ctl {
+      .lim-row.lim-held .lim-row-ctl,
+      .lim-row.lim-tool .lim-row-ctl {
          grid-column: 1;
          grid-row: 3;
          justify-self: start;
+      }
+
+      .lim-row.lim-wf .lim-row-ctl,
+      .lim-row.lim-tool .lim-tool-ctl,
+      .lim-wf-bar {
+         align-items: flex-start;
       }
 
       .lim-row.lim-held .lim-held-ctl {

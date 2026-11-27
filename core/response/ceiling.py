@@ -21,13 +21,17 @@ bound on its sampled false closes sits above the complement of that floor.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
+import time
 from dataclasses import dataclass, field, replace
 from datetime import timedelta
 from types import MappingProxyType
 from typing import Any, Callable, Iterable, Mapping, Optional
 
 from sqlalchemy import event, select, text
+from sqlalchemy.orm import Session
 
 from core.config import Settings, get_settings
 from core.response.config import (
@@ -73,12 +77,33 @@ class Ceiling:
     stopped_by: Optional[str] = None
     stopped_at: Optional[str] = None
     four_eyes: bool = False
-    # workflow id -> {tier, floor, evidence, by, at}. Absent follows the fleet.
+    # workflow id -> {tier, floor, bar, evidence, by, at}. Absent follows the fleet.
     workflows: Mapping[str, dict] = field(default_factory=_no_workflows)
     # Declared crown jewels are left for a person (#5227). On unless stored off.
     hold_crown_jewels: bool = True
+    # Step-score factors in force (#5277). On unless stored off; off is a loosening.
+    confidence_precedent: bool = True
+    confidence_blind_spots: bool = True
+    confidence_run_quality: bool = True
     # Proposals the ceiling releases in any 60 minutes (#5274). 0 releases none.
     released_per_hour: int = RELEASED_PER_HOUR
+
+
+# Ceiling attribute -> INTENT.md key for each step-score factor switch (#5277).
+CONFIDENCE_SWITCHES = {
+    "confidence_precedent": "confidence.precedent",
+    "confidence_blind_spots": "confidence.blind_spots",
+    "confidence_run_quality": "confidence.run_quality",
+}
+
+
+def factors_in_force(ceiling: Ceiling) -> list[str]:
+    """The step-score factors switched on, in rule order."""
+    return [
+        key.split(".", 1)[1]
+        for attr, key in CONFIDENCE_SWITCHES.items()
+        if getattr(ceiling, attr)
+    ]
 
 
 @dataclass(frozen=True)
@@ -177,6 +202,7 @@ def _parse(value: Any) -> Ceiling:
         four_eyes=_flag(value.get("four_eyes")),
         workflows=_workflow_entries(value.get("workflows")),
         hold_crown_jewels=_on(value.get("hold_crown_jewels")),
+        **{attr: _on(value.get(attr)) for attr in CONFIDENCE_SWITCHES},
         released_per_hour=_cap(value.get("released_per_hour")),
     )
 
@@ -321,19 +347,85 @@ def finding_keys(
 CLOSE_HELD = "autonomy does not let a model close cases on its own"
 
 
-def close_held(run_id: Optional[str], keys: Values = ()) -> Optional[str]:
+def workflow_bar(stored: Ceiling, workflow_id: Optional[str]) -> Optional[float]:
+    """The workflow's bar (#5276): a step scoring under it waits for a person."""
+    entry = stored.workflows.get(workflow_id) if workflow_id else None
+    bar = (entry or {}).get("bar")
+    if isinstance(bar, (int, float)) and not isinstance(bar, bool) and 0 <= bar <= 1:
+        return float(bar)
+    return None
+
+
+class BarHeld(str):
+    """The reason a step is held by its workflow's bar, carrying what was compared."""
+
+    workflow_id: str
+    bar: float
+    score: Optional[float]
+
+
+def bar_held(
+    stored: Ceiling, workflow_id: Optional[str], score: Optional[float]
+) -> Optional[BarHeld]:
+    """Why a step scoring ``score`` (None: unknown) is held by the bar, or None."""
+    bar = workflow_bar(stored, workflow_id)
+    if bar is None:
+        return None
+    known = isinstance(score, (int, float)) and not isinstance(score, bool)
+    if known and score >= bar:
+        return None
+    said = f"scores {score:.2f}" if known else "has no known score"
+    why = BarHeld(f"the step {said}, under the bar of {bar:.2f} on {workflow_id}")
+    why.workflow_id, why.bar, why.score = workflow_id, bar, score if known else None
+    return why
+
+
+def record_bar_hold(
+    why: BarHeld, step: str, case_id: Optional[str], run_id: Optional[str]
+) -> None:
+    """One trail entry for a step the bar held. Never raises: the hold stands."""
+    from core.audit import trail
+    from core.response.step_confidence import RULE_VERSION
+
+    try:
+        trail.append_or_hold(
+            {
+                trail.ACTION: "autonomy.bar.hold",
+                trail.ACTOR: trail.SYSTEM,
+                trail.OUTCOME: trail.OUTCOME_DONE,
+                "step": step,
+                "case_id": case_id,
+                "run_id": run_id,
+                "workflow_id": why.workflow_id,
+                "score": why.score,
+                "bar": why.bar,
+                "rule_version": RULE_VERSION,
+            },
+            actor_text=trail.SYSTEM,
+        )
+    except Exception:  # noqa: BLE001
+        logger.exception("bar hold on run %s not recorded", run_id)
+
+
+def close_held(
+    run_id: Optional[str], keys: Values = (), score: Optional[float] = None
+) -> Optional[str]:
     """Why a model's close of a case is held, or None when it may close (#4819).
 
     Closing is a reversible act: it passes only where the run's workflow, or
     with no workflow (chat, an /mcp caller) the fleet, may act on its own, and
     then only when the case's ``keys`` name no declared crown jewel (#5227).
-    A ceiling that can't be read holds the close.
+    Last, a workflow with a bar holds a close whose step ``score`` is under it
+    or unknown (#5276); that reason is a :class:`BarHeld`. With no run there is
+    no workflow and so no bar. A ceiling that can't be read holds the close.
     """
     try:
         stored = read_ceiling()
-        if effective_act(stored, REVERSIBLE, workflow_of(run_id)):
+        workflow_id = workflow_of(run_id)
+        if effective_act(stored, REVERSIBLE, workflow_id):
             # No keys (the production report's status read) never reads the site.
-            return crown_jewel_held(keys, stored) if keys else None
+            jewel = crown_jewel_held(keys, stored) if keys else None
+            return jewel or bar_held(stored, workflow_id, score)
         return CLOSE_HELD
     except Exception as exc:  # noqa: BLE001 — no answer is not permission
         logger.exception("autonomy not read; close for run %s held", run_id)
@@ -401,6 +493,7 @@ def ceiling_read() -> dict[str, Any]:
         "held": held_for_ceiling(),
         "hold_crown_jewels": stored.hold_crown_jewels,
         "crown_jewels": _crown_jewel_count(),
+        **{attr: getattr(stored, attr) for attr in CONFIDENCE_SWITCHES},
         "released_per_hour": stored.released_per_hour,
     }
 
@@ -439,6 +532,7 @@ def _dump(ceiling: Ceiling) -> dict[str, Any]:
         "four_eyes": ceiling.four_eyes,
         "workflows": {wid: dict(e) for wid, e in ceiling.workflows.items()},
         "hold_crown_jewels": ceiling.hold_crown_jewels,
+        **{attr: getattr(ceiling, attr) for attr in CONFIDENCE_SWITCHES},
         "released_per_hour": ceiling.released_per_hour,
     }
 
@@ -459,23 +553,40 @@ def update_ceiling(
     act_irreversible: Optional[bool] = None,
     four_eyes: Optional[bool] = None,
     hold_crown_jewels: Optional[bool] = None,
+    confidence_precedent: Optional[bool] = None,
+    confidence_blind_spots: Optional[bool] = None,
+    confidence_run_quality: Optional[bool] = None,
     released_per_hour: Optional[int] = None,
     lowers_only: bool = False,
     locked: Optional[bool] = None,
+    session: Optional[Session] = None,
 ) -> Ceiling:
     """Store a person's edit of the ceiling. Does not execute anything.
 
+    With ``session`` the write joins that transaction, the caller commits, and
+    settling INTENT.md's pending keys is left to the caller once it has.
+
     A service account may lower an act flag. It may not raise one, resume,
-    switch four-eyes, turn the crown-jewel hold off, or raise the hourly cap. An act flag is not stored on while the environment
-    has locked them off. While stopped, raising an act flag or the hourly cap, or turning
-    four-eyes or the crown-jewel hold off is refused; a lower, and turning
-    either on, still store.
+    switch four-eyes, turn the crown-jewel hold or a step-score factor off, or
+    raise the hourly cap. An act flag is not stored on while the environment
+    has locked them off. While stopped, raising an act flag or the hourly cap,
+    or turning four-eyes, the crown-jewel hold or a factor off is refused; a
+    lower, and turning any of them on, still store.
     The refusal is decided on the locked row, so a stop that lands during
     the write is not stored past.
     """
     if locked is None:
         locked = environment_locks_act()
     applied = applied_intent(fresh=True)
+    factors = {
+        attr: value
+        for attr, value in (
+            ("confidence_precedent", confidence_precedent),
+            ("confidence_blind_spots", confidence_blind_spots),
+            ("confidence_run_quality", confidence_run_quality),
+        )
+        if value is not None
+    }
     asked = {
         key: value
         for key, value in (
@@ -483,6 +594,7 @@ def update_ceiling(
             ("act.irreversible", act_irreversible),
             ("act.four_eyes", four_eyes),
             ("act.hold_crown_jewels", hold_crown_jewels),
+            *((CONFIDENCE_SWITCHES[a], v) for a, v in factors.items()),
         )
         if value is not None
     }
@@ -495,10 +607,12 @@ def update_ceiling(
             if lowers_only and raises_cap(current.released_per_hour, released_per_hour)
             else released_per_hour
         )
+        # A factor switched off that is on now: a loosening, as the hold's off is.
+        factor_off = any(v is False and getattr(current, a) for a, v in factors.items())
         wants_act_on = act_reversible is True or act_irreversible is True
         if locked and wants_act_on:
             raise CeilingRefusal(409, "The environment wins; Act was not saved.")
-        # A declared directory's act.* keys may be narrowed here, never widened.
+        # A declared directory's act.* and confidence.* keys may be narrowed here, never widened.
         for key, value in asked.items():
             refused = managed_widening(key, value, applied)
             if refused:
@@ -509,6 +623,10 @@ def update_ceiling(
             if hold_crown_jewels is False and current.hold_crown_jewels:
                 raise CeilingRefusal(
                     403, "A service account cannot turn the crown-jewel hold off"
+                )
+            if factor_off:
+                raise CeilingRefusal(
+                    403, "A service account cannot switch a step-score factor off"
                 )
             if (
                 _raises(current.act_reversible, act_reversible)
@@ -521,6 +639,7 @@ def update_ceiling(
             or _raises(current.act_irreversible, act_irreversible)
             or (four_eyes is False and current.four_eyes)
             or (hold_crown_jewels is False and current.hold_crown_jewels)
+            or factor_off
             or raises_cap(current.released_per_hour, cap)
         ):
             raise CeilingRefusal(409, "Stopped: resume first")
@@ -534,11 +653,12 @@ def update_ceiling(
                 ("released_per_hour", cap),
             )
             if value is not None
-        }
+        } | factors
         return replace(current, **edit), "Autonomy ceiling updated"
 
-    stored = _locked_update(change, user_id)
-    settle_pending(asked, user_id)
+    stored = _locked_update(change, user_id, session=session)
+    if session is None:
+        settle_pending(asked, user_id)
     return stored
 
 
@@ -700,10 +820,13 @@ def workflow_entry(
     evidence: Optional[dict],
     by: str,
     model: Optional[str] = None,
+    bar: Optional[float] = None,
 ) -> dict[str, Any]:
     entry = {
         "tier": tier,
         "floor": floor,
+        # A step scoring under it waits for a person (#5276). Only clearing the entry drops it.
+        "bar": bar,
         "evidence": evidence,
         "by": by,
         "at": utcnow().isoformat(),
@@ -720,79 +843,96 @@ def _locked_update(
     after: Optional[Callable[[Any], None]] = None,
     *,
     gated: bool = True,
+    session: Optional[Session] = None,
 ) -> Ceiling:
     """Read, change and write the row in one transaction with it locked.
 
     ``change`` sees the row as it is now, so no other write is lost, and the
     write leaves the same ``config.change`` entry as ``set_system_config``.
     ``after`` runs in that transaction, before the write is skipped as a no-op.
-    ``gated=False`` is for a change that only lowers autonomy.
+    ``gated=False`` is for a change that only lowers autonomy. With ``session``
+    that transaction is the caller's.
     """
     try:
-        return _write_locked(change, actor, after, gated)
+        if session is not None:
+            return _write_in(session, change, actor, after, gated)
+        with unit_of_work() as own:
+            return _write_in(own, change, actor, after, gated)
     except CeilingRefusal:
         raise
     except Exception as exc:  # noqa: BLE001
         raise CeilingWriteError("autonomy.ceiling was not stored") from exc
 
 
-def _write_locked(
+def _write_in(
+    session: Session,
     change: Callable[[Ceiling], tuple[Ceiling, str]],
     actor: str,
-    after: Optional[Callable[[Any], None]] = None,
-    gated: bool = True,
-):
-    with unit_of_work() as session:
-        row = session.execute(
-            select(SystemConfig)
-            .where(SystemConfig.key == CEILING_KEY)
-            .with_for_update()
-        ).scalar_one_or_none()
-        current = _parse(row.value) if row is not None else Ceiling()
-        updated, reason = change(current)
-        if after is not None:
-            after(session)
-        if updated == current:
-            return current
-        old = row.value if row is not None else None
-        value = _dump(updated)
-        if row is None:
-            session.add(
-                SystemConfig(
-                    key=CEILING_KEY,
-                    value=value,
-                    description="Autonomy ceiling",
-                    config_type="autonomy",
-                    updated_by=actor,
-                )
+    after: Optional[Callable[[Any], None]],
+    gated: bool,
+) -> Ceiling:
+    row = session.execute(
+        select(SystemConfig).where(SystemConfig.key == CEILING_KEY).with_for_update()
+    ).scalar_one_or_none()
+    current = _parse(row.value) if row is not None else Ceiling()
+    updated, reason = change(current)
+    if after is not None:
+        after(session)
+    if updated == current:
+        return current
+    old = row.value if row is not None else None
+    value = _dump(updated)
+    if row is None:
+        session.add(
+            SystemConfig(
+                key=CEILING_KEY,
+                value=value,
+                description="Autonomy ceiling",
+                config_type="autonomy",
+                updated_by=actor,
             )
-        else:
-            row.value = value
-            row.updated_by = actor
-        config_store.ConfigService(user_id=actor)._create_audit_log(
-            session,
-            config_type="autonomy",
-            config_key=CEILING_KEY,
-            action="create" if old is None else "update",
-            old_value=old,
-            new_value=value,
-            change_reason=reason,
-            gated=gated,
         )
-        return updated
+    else:
+        row.value = value
+        row.updated_by = actor
+    config_store.ConfigService(user_id=actor)._create_audit_log(
+        session,
+        config_type="autonomy",
+        config_key=CEILING_KEY,
+        action="create" if old is None else "update",
+        old_value=old,
+        new_value=value,
+        change_reason=reason,
+        gated=gated,
+    )
+    return updated
 
 
 def set_workflow_tier(
-    workflow_id: str, entry: Optional[dict], user_id: str, *, raises: bool
+    workflow_id: str,
+    entry: Optional[dict],
+    user_id: str,
+    *,
+    raises: bool,
+    keep_bar: bool = False,
 ) -> Ceiling:
     """Store one workflow's entry; None returns it to the fleet flags.
 
-    A raise is refused if a stop landed since the caller looked.
+    A raise is refused if a stop landed since the caller looked. ``keep_bar``
+    takes the bar from the locked row; a write that would lower it is refused
+    unless the caller was gated as a loosening (``raises``).
     """
 
     def change(current: Ceiling) -> tuple[Ceiling, str]:
+        nonlocal entry
         if raises and current.stopped:
             raise CeilingRefusal(409, "Stopped: resume first")
+        before = workflow_bar(current, workflow_id)
+        if keep_bar and entry is not None:
+            entry = {**entry, "bar": before}
+        after = entry.get("bar") if entry else None
+        if not raises and before is not None and (after is None or after < before):
+            raise CeilingRefusal(409, "The bar changed meanwhile: reload")
         workflows = dict(current.workflows)
         if entry is None:
             workflows.pop(workflow_id, None)
@@ -802,6 +942,35 @@ def set_workflow_tier(
         return updated, f"Autonomy of workflow {workflow_id} set"
 
     return _locked_update(change, user_id)
+
+
+def set_workflow_bar(
+    workflow_id: str, bar: Optional[float], user_id: str, *, lowers: bool
+) -> Ceiling:
+    """Store one workflow's bar alone; its tier, floor, record, by and at stay (#5276).
+
+    Refused when the workflow has no entry, when a lowering meets a stop, and
+    when the bar moved since the caller looked so that this now lowers it.
+    """
+
+    def change(current: Ceiling) -> tuple[Ceiling, str]:
+        entry = current.workflows.get(workflow_id)
+        if entry is None:
+            raise CeilingRefusal(
+                409, "The workflow follows the fleet, which has no bar"
+            )
+        before = workflow_bar(current, workflow_id)
+        now_lowers = before is not None and (bar is None or bar < before)
+        if now_lowers and not lowers:
+            raise CeilingRefusal(409, "The bar changed meanwhile: reload")
+        if now_lowers and current.stopped:
+            raise CeilingRefusal(409, "Stopped: resume first")
+        workflows = {**current.workflows, workflow_id: {**entry, "bar": bar}}
+        updated = replace(current, workflows=MappingProxyType(workflows))
+        return updated, f"Bar of workflow {workflow_id} set to {bar}"
+
+    # A higher bar only lowers autonomy: not held by a restore's write pause.
+    return _locked_update(change, user_id, gated=lowers)
 
 
 def drop_below_floor() -> None:
@@ -847,7 +1016,9 @@ def drop_below_floor() -> None:
                 sampled = _false_close_above(tally, floor)
                 if not missed and not sampled:
                     continue
-                workflows[wid] = workflow_entry(ASSIST, floor, evidence, _SYSTEM, model)
+                workflows[wid] = workflow_entry(
+                    ASSIST, floor, evidence, _SYSTEM, model, entry.get("bar")
+                )
                 if missed:
                     below.append(wid)
                 if sampled:
@@ -1050,7 +1221,9 @@ def _judge(
                 f"Model changed from {model} to {candidate}: dropped to Assist ({why})"
             )
             out[wid] = {
-                **workflow_entry(ASSIST, floor, evidence, _SYSTEM, candidate),
+                **workflow_entry(
+                    ASSIST, floor, evidence, _SYSTEM, candidate, entry.get("bar")
+                ),
                 "from_model": model,
                 "reason": reason,
             }
@@ -1246,6 +1419,10 @@ EFFECT_CLASSES = (READ, READ_UNVERIFIED, REVERSIBLE, IRREVERSIBLE)
 _READS = frozenset({READ, READ_UNVERIFIED})
 APPROVAL_TOOL = "create_approval_action"
 TOOL_CLASSIFIED = "autonomy.tool_classified"
+TOOL_PINNED = "autonomy.tool_pinned"
+TOOL_WITHDRAWN = "autonomy.tool_withdrawn"
+TOOL_BOUND = "autonomy.tool_bound"
+SHIPPED_BINDING = "shipped"
 _SYSTEM = "system"
 
 _own: Optional[frozenset[str]] = None
@@ -1278,10 +1455,11 @@ def own_tool_names() -> frozenset[str]:
 
 
 def stored_classes(session, names: Iterable[str]) -> dict[str, str]:
-    """The rows for ``names``. A name with no row is absent."""
+    """The rows for ``names``. A name with no row, or a withdrawn one, is absent."""
     rows = session.execute(
         select(ToolEffectClass.tool_name, ToolEffectClass.effect_class).where(
-            ToolEffectClass.tool_name.in_(list(names))
+            ToolEffectClass.tool_name.in_(list(names)),
+            ToolEffectClass.changed_definition.is_(None),
         )
     )
     return {name: effect_class for name, effect_class in rows}
@@ -1450,20 +1628,33 @@ def loosens(before: Optional[str], after: str) -> bool:
 
 
 def store_tool_class(
-    session, name: str, before: Optional[str], after: str, actor: str
+    session,
+    name: str,
+    before: Optional[str],
+    after: str,
+    actor: str,
+    pin: Optional[dict] = None,
 ) -> None:
-    """Write one class and its trail entry in the caller's transaction."""
+    """Write one class and its trail entry in the caller's transaction.
+
+    ``pin`` is the definition a person classified against: it is pinned and any
+    withdrawal is cleared. Without it the pin and a withdrawal stay as they are.
+    """
     from core.auth import trail_events
 
     row = session.get(ToolEffectClass, name)
     if row is None:
-        session.add(
-            ToolEffectClass(tool_name=name, effect_class=after, classified_by=actor)
-        )
+        row = ToolEffectClass(tool_name=name, effect_class=after, classified_by=actor)
+        session.add(row)
     else:
         row.effect_class = after
         row.classified_by = actor
         row.classified_at = utcnow()
+    digest = None
+    if pin is not None:
+        digest = tool_definition_hash(pin)
+        row.pinned_definition, row.pinned_hash = pin, digest
+        row.changed_definition = None
     session.flush()
     trail_events.record(
         session,
@@ -1472,13 +1663,278 @@ def store_tool_class(
         tool=name,
         class_before=before or "unclassified",
         class_after=after,
+        definition_hash=digest,
     )
+    if pin is not None:
+        _refresh_pins_after_commit(session)
+
+
+def store_tool_binding(
+    session, name: str, before: Optional[dict], after: Optional[dict], actor: str
+) -> None:
+    """Write one tool's stored binding and its trail entry in the caller's
+    transaction (#5312). The row exists: a tool is classified before it binds.
+
+    ``None`` puts the shipped binding back; ``{}`` binds nothing.
+    """
+    from core.auth import trail_events
+    from core.integrations import bindings
+
+    row = session.get(ToolEffectClass, name)
+    row.binding = after
+    session.flush()
+    trail_events.record(
+        session,
+        TOOL_BOUND,
+        actor=actor,
+        tool=name,
+        # The trail drops a null field: name the shipped binding instead.
+        binding_before=SHIPPED_BINDING if before is None else before,
+        binding_after=SHIPPED_BINDING if after is None else after,
+    )
+    # This process reads the change on its next resolve; others within the TTL.
+    event.listen(session, "after_commit", lambda _s: bindings.invalidate(), once=True)
+
+
+# --- Definition pins (#5300) -------------------------------------------------
+# A remote server's tool is pinned to the name, description and input schema a
+# person classified. A definition that differs withdraws it until a person
+# classifies it again; changing back does not restore it.
+
+
+def tool_definition(tool: Mapping[str, Any]) -> dict:
+    """What a model reads of a tool, as the server lists it: the pinned form."""
+    schema = tool.get("inputSchema", tool.get("input_schema"))
+    return {
+        "name": tool.get("name") or "",
+        "description": tool.get("description") or "",
+        "inputSchema": schema if isinstance(schema, dict) else {},
+    }
+
+
+def tool_definition_hash(definition: Mapping[str, Any]) -> str:
+    """Full SHA-256 hex of the definition's canonical JSON; never shortened.
+
+    The pin and the run ledger's call entry both use it.
+    """
+    canonical = json.dumps(
+        tool_definition(definition),
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+_PINS_TTL_SECONDS = 10.0
+Pins = dict[str, tuple[Optional[str], Optional[str]]]
+# (read at, tool name -> (pinned hash, changed definition's hash), whether any
+# read in this process has succeeded), every row.
+_pins_cache: tuple[float, Pins, bool] = (float("-inf"), {}, False)
+
+
+def _read_pins(names: Optional[list[str]] = None) -> Pins:
+    query = select(
+        ToolEffectClass.tool_name,
+        ToolEffectClass.pinned_hash,
+        ToolEffectClass.changed_definition,
+    )
+    if names is not None:
+        query = query.where(ToolEffectClass.tool_name.in_(names))
+    with unit_of_work() as session:
+        rows = session.execute(query).all()
+    return {
+        name: (pinned, tool_definition_hash(changed) if changed else None)
+        for name, pinned, changed in rows
+    }
+
+
+def tool_pins(*, fresh: bool = False) -> Pins:
+    """Each class row's pinned hash and changed hash, through a short cache.
+
+    As ``site.applied`` is read: each process re-reads at most every 10 s and a
+    failed read keeps the last value. A stale entry only withholds, since
+    ``withheld`` also compares the held definition with the pin itself, and
+    ``check_pins`` reads a remote tool missing here from the store.
+    """
+    global _pins_cache
+    now = time.monotonic()
+    at, value, ok = _pins_cache
+    if fresh or now - at >= _PINS_TTL_SECONDS:
+        try:
+            value, ok = _read_pins(), True
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("tool pins not read; keeping last: %s", exc)
+            if not ok:
+                return value  # never read: not stamped, so the next call retries
+        _pins_cache = (now, value, ok)
+    return value
+
+
+def withheld(name: str, tool: Mapping[str, Any]) -> bool:
+    """Whether the registry must not offer ``tool`` under ``name``.
+
+    Withdrawn, or a pinned tool whose held definition is not its pin, however
+    that definition arrived. Every outside tool, until this process has read
+    the pins once.
+    """
+    entry = tool_pins().get(name)
+    if not _pins_cache[2]:
+        return True
+    if entry is None or entry[0] is None:
+        return False
+    pinned, changed = entry
+    return changed is not None or tool_definition_hash(tool) != pinned
+
+
+_PINS_STALE = "autonomy.pins_stale"
+
+
+def _refresh_pins_after_commit(session) -> None:
+    """Re-read this process's pins once the caller's transaction commits."""
+    if session.info.get(_PINS_STALE):
+        return
+    session.info[_PINS_STALE] = True
+
+    def _done(sess) -> None:
+        if sess.info.pop(_PINS_STALE, None):
+            tool_pins(fresh=True)
+
+    def _undone(sess) -> None:
+        sess.info.pop(_PINS_STALE, None)
+
+    event.listen(session, "after_commit", _done, once=True)
+    event.listen(session, "after_rollback", _undone, once=True)
+
+
+def check_pins(server: str, tools: Iterable[Mapping[str, Any]], remote: bool) -> bool:
+    """Withdraw each pinned tool whose definition changed; pin a remote one first seen.
+
+    Every row carrying a pin is checked, whichever server lists the tool. A row
+    of a remote server with no pin (one set before #5300) is pinned to this
+    definition as ``system``. Each write has a trail entry. Best effort: False
+    when the store could not be written; a connect does not fail on it.
+    """
+    from core.auth import trail_events
+
+    global _pins_cache
+    tools = [t for t in tools if t.get("name")]
+    pins = tool_pins()
+    missing = [f"{server}_{t['name']}" for t in tools] if remote else []
+    missing = [n for n in missing if n not in pins]
+    if missing:
+        # Classified in another process since this one's cache was read: from
+        # the store now, or withheld until it is (#5300).
+        try:
+            found = _read_pins(missing)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("tool pins from %s not read: %s", server, exc)
+            return False
+        if found:
+            at, cached, ok = _pins_cache
+            _pins_cache = (at, {**cached, **found}, ok)
+            pins = {**pins, **found}
+    due: dict[str, dict] = {}
+    for tool in tools:
+        name = f"{server}_{tool['name']}"
+        entry = pins.get(name)
+        if entry is None:
+            continue
+        pinned, changed = entry
+        digest = tool_definition_hash(tool)
+        if (pinned is None and remote) or (
+            pinned is not None and digest not in (pinned, changed)
+        ):
+            due[name] = tool_definition(tool)
+    if not due:
+        return True
+    try:
+        with unit_of_work() as session:
+            rows = (
+                session.execute(
+                    select(ToolEffectClass)
+                    .where(ToolEffectClass.tool_name.in_(sorted(due)))
+                    .with_for_update()
+                )
+                .scalars()
+                .all()
+            )
+            for row in rows:
+                definition = due[row.tool_name]
+                digest = tool_definition_hash(definition)
+                if row.pinned_hash is None:
+                    if remote and row.changed_definition is None:
+                        row.pinned_definition, row.pinned_hash = definition, digest
+                        trail_events.record(
+                            session,
+                            TOOL_PINNED,
+                            actor=_SYSTEM,
+                            tool=row.tool_name,
+                            effect_class=row.effect_class,
+                            definition_hash=digest,
+                        )
+                elif digest != row.pinned_hash and (
+                    row.changed_definition is None
+                    or tool_definition_hash(row.changed_definition) != digest
+                ):
+                    row.changed_definition = definition
+                    trail_events.record(
+                        session,
+                        TOOL_WITHDRAWN,
+                        actor=_SYSTEM,
+                        tool=row.tool_name,
+                        effect_class=row.effect_class,
+                        pinned_hash=row.pinned_hash,
+                        definition_hash=digest,
+                    )
+                    logger.warning(
+                        "%s withdrawn: its definition no longer matches the one "
+                        "classified",
+                        row.tool_name,
+                    )
+        tool_pins(fresh=True)
+        return True
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("tool pins from %s not checked: %s", server, exc)
+        return False
+
+
+def delete_tool_classes(session, prefix: str, actor: str) -> list[str]:
+    """Delete every class row whose name starts with the literal ``prefix``.
+
+    Each with a trail entry to unclassified, in the caller's transaction. Only
+    tightens: a name with no row asks first.
+    """
+    from core.auth import trail_events
+
+    rows = [
+        row
+        for row in session.execute(
+            select(ToolEffectClass).where(
+                ToolEffectClass.tool_name.startswith(prefix, autoescape=True)
+            )
+        ).scalars()
+        if row.tool_name.startswith(prefix)  # literal, whatever the LIKE did
+    ]
+    for row in rows:
+        session.delete(row)
+        trail_events.record(
+            session,
+            TOOL_CLASSIFIED,
+            actor=actor,
+            tool=row.tool_name,
+            class_before=row.effect_class,
+            class_after="unclassified",
+        )
+    session.flush()
+    return sorted(row.tool_name for row in rows)
 
 
 def tighten_from_hints(server: str, tools: Iterable[dict]) -> bool:
     """``destructiveHint: true`` raises an existing row to irreversible.
 
     It never inserts a row and never lowers one; ``readOnlyHint`` is not read.
+    A withdrawn row is raised and stays withdrawn.
     Best effort: False when the store could not be written, so the caller can
     try again; a server's connect does not fail on it.
     """

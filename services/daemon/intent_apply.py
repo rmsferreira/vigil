@@ -8,7 +8,7 @@ their content hash changes it applies the revision:
 - only keys whose declared value changed since the last applied revision
   are considered, each labeled against the current effective value;
   ``tighten``/``same`` are written, ``loosen`` is recorded as pending;
-- ``act.*`` and ``workflows.<id>`` go to ``autonomy.ceiling``, ``investigate.*`` to
+- ``act.*``, ``confidence.*`` and ``workflows.<id>`` go to ``autonomy.ceiling``, ``investigate.*`` to
   ``orchestrator.settings``, the rest to the ``intent.applied`` row, which
   also records revision, per-key file/line, pending keys and state;
 - a ``workflows.<id>`` this install lacks, or that is not investigate-kind,
@@ -19,7 +19,8 @@ until a commit changes that key. A missing directory keeps the last applied
 revision with state ``degraded``.
 
 The same poll applies ``<dir>/site/*.md`` (:mod:`core.site`) to its own
-``site.applied`` row, in its own ``try``, with or without INTENT.md.
+``site.applied`` row, in its own ``try``, with or without INTENT.md, and
+``<dir>/sources/*.md`` (:mod:`core.sources`) to ``sources.applied`` in a third.
 """
 
 from __future__ import annotations
@@ -36,6 +37,7 @@ from core.daemon_config import DaemonConfig
 from core.intent import (
     FIELDS_BY_KEY,
     INTENT_FILE_NAME,
+    RETIRED_KEYS,
     IntentRejected,
     declared_dir,
     effective_values,
@@ -49,15 +51,19 @@ from core.intent_report import effective_daemon_config
 from core.response.ceiling import (
     ACT,
     ASSIST,
+    CONFIDENCE_SWITCHES,
     Ceiling,
     CeilingRefusal,
     _locked_update,
+    delete_tool_classes,
     environment_locks_act,
     investigation_model,
+    own_tool_names,
     workflow_entry,
     workflow_evidence,
 )
 from core.response.config import INTENT_APPLIED_KEY, applied_intent
+from core.response.emulation import ATOMIC_TOOLS
 from core.site import (
     NOTHING_DECLARED,
     SITE_APPLIED_KEY,
@@ -65,6 +71,15 @@ from core.site import (
     SiteRejected,
     applied_site,
     parse_site,
+)
+from core.sources import NOTHING_DECLARED as SOURCES_NOTHING
+from core.sources import (
+    SOURCES_APPLIED_KEY,
+    SOURCES_DIR_NAME,
+    SourceRejected,
+    is_accepted,
+    parse_sources,
+    update_applied,
 )
 from core.storage.config_service import get_config_service
 from core.time import utcnow
@@ -81,9 +96,10 @@ _CEILING_ATTR = {
     "act.irreversible": "act_irreversible",
     "act.four_eyes": "four_eyes",
     "act.hold_crown_jewels": "hold_crown_jewels",
+    **{key: attr for attr, key in CONFIDENCE_SWITCHES.items()},
 }
 # On is tighter for these; the environment lock does not force them off.
-_UNLOCKED = ("four_eyes", "hold_crown_jewels")
+_UNLOCKED = ("four_eyes", "hold_crown_jewels", *CONFIDENCE_SWITCHES)
 
 
 class StoreWriteFailed(Exception):
@@ -119,7 +135,7 @@ def _effective() -> Dict[str, Any]:
 
 
 def _apply_act(wants: Dict[str, Any], revision: str, pending: Set[str]) -> None:
-    """Write the act keys that do not loosen, decided under the row lock."""
+    """Write the act and confidence keys that do not loosen, decided under the row lock."""
     locked = environment_locks_act()
 
     def change(current: Ceiling) -> tuple[Ceiling, str]:
@@ -173,17 +189,21 @@ def _apply_workflows(wants: Dict[str, Any], revision: str, pending: Set[str]) ->
             pending.discard(key)
             if verdict == "same":
                 continue
+            # The declared bar, or none, replaces the stored one.
+            bar = want.get("bar")
+            at_bar = f" bar {bar}" if bar is not None else ""
             if want["tier"] == ASSIST:
-                workflows[wid] = workflow_entry(ASSIST, None, None, ACTOR)
-                done.append(f"{wid}=assist")
-            else:  # a higher floor: the record and model it was earned on stay
+                workflows[wid] = workflow_entry(ASSIST, None, None, ACTOR, bar=bar)
+                done.append(f"{wid}=assist{at_bar}")
+            else:  # a higher floor or bar: the record and model it was earned on stay
                 workflows[wid] = {
                     **have,
                     "floor": want["floor"],
+                    "bar": bar,
                     "by": ACTOR,
                     "at": utcnow().isoformat(),
                 }
-                done.append(f"{wid}=act floor {want['floor']}")
+                done.append(f"{wid}=act floor {want['floor']}{at_bar}")
         return (
             replace(current, workflows=MappingProxyType(workflows)),
             f"INTENT.md revision {revision}: workflows {', '.join(done) or 'no change'}",
@@ -287,7 +307,10 @@ def apply_once(directory: Path) -> None:
 
     previous: Dict[str, Any] = row.get("keys") or {}
     pending: Set[str] = set(row.get("pending") or []) & set(declared)
-    values: Dict[str, Any] = dict(row.get("values") or {})
+    # A retired key an earlier revision applied is dropped from the row (#5279).
+    values: Dict[str, Any] = {
+        k: v for k, v in (row.get("values") or {}).items() if k not in RETIRED_KEYS
+    }
     changed = {
         key: value
         for key, value in declared.items()
@@ -321,7 +344,7 @@ def apply_once(directory: Path) -> None:
         if is_workflow_key(key):
             flow_wants[key] = want  # decided under the ceiling's row lock
             continue
-        if group == "act":
+        if key in _CEILING_ATTR:
             act[key] = want  # decided under the ceiling's row lock
             continue
         if label(FIELDS_BY_KEY[key].rule, want, effective[key]) == "loosen":
@@ -408,7 +431,9 @@ def accept_pending(
     reason = f"INTENT.md revision {revision}: pending accepted by {who}"
     groups: Dict[str, Dict[str, Any]] = {}
     for key, value in declared.items():
-        groups.setdefault(key.split(".", 1)[0], {})[key] = value
+        # act.* and confidence.* both store on the ceiling row.
+        group = "act" if key in _CEILING_ATTR else key.split(".", 1)[0]
+        groups.setdefault(group, {})[key] = value
 
     def summary(items: Dict[str, Any]) -> str:
         return ", ".join(f"{k}={v}" for k, v in sorted(items.items()))
@@ -433,10 +458,15 @@ def accept_pending(
             wid = key.split(".", 1)[1]
             entries[wid] = (
                 workflow_entry(
-                    ACT, want["floor"], workflow_evidence(wid, model), user_id, model
+                    ACT,
+                    want["floor"],
+                    workflow_evidence(wid, model),
+                    user_id,
+                    model,
+                    want.get("bar"),
                 )
                 if want.get("tier") == ACT
-                else workflow_entry(ASSIST, None, None, user_id)
+                else workflow_entry(ASSIST, None, None, user_id, bar=want.get("bar"))
             )
 
         def change_flows(current: Ceiling) -> tuple[Ceiling, str]:
@@ -468,7 +498,8 @@ def accept_pending(
     others = {
         k: v
         for k, v in declared.items()
-        if k.split(".", 1)[0] not in ("act", "investigate", "workflows")
+        if k not in _CEILING_ATTR
+        and k.split(".", 1)[0] not in ("investigate", "workflows")
     }
     # Re-read just before writing, so a poll since the first read is kept.
     row = get_config_service(ACTOR).read_system_config(INTENT_APPLIED_KEY) or row
@@ -499,15 +530,17 @@ def _write_site(row: Dict[str, Any], reason: str) -> None:
     applied_site(fresh=True)
 
 
-def _site_snapshot(directory: Path) -> tuple[str, str, List[tuple[str, str]]]:
-    """``(hash, revision, [(site/<name>, text)])`` in name order.
+def _site_snapshot(
+    directory: Path, sub: str = SITE_DIR_NAME
+) -> tuple[str, str, List[tuple[str, str]]]:
+    """``(hash, revision, [(<sub>/<name>, text)])`` in name order.
 
     Raises ``OSError`` when the directory cannot be read. A readable directory
-    with no ``site/`` is an empty declaration. INTENT.md plays no part.
+    with no ``<sub>/`` is an empty declaration. INTENT.md plays no part.
     """
     next(directory.iterdir(), None)  # listable, not just present
     marker, revision = read_revision(directory)
-    site = directory / SITE_DIR_NAME
+    site = directory / sub
     paths = (
         sorted(p for p in site.iterdir() if p.suffix == ".md" and p.is_file())
         if site.is_dir()
@@ -517,7 +550,7 @@ def _site_snapshot(directory: Path) -> tuple[str, str, List[tuple[str, str]]]:
     files: List[tuple[str, str]] = []
     for path in paths:
         content = path.read_bytes()
-        name = f"{SITE_DIR_NAME}/{path.name}"
+        name = f"{sub}/{path.name}"
         digest.update(name.encode() + b"\0" + content + b"\0")
         files.append((name, content.decode("utf-8-sig", "replace")))
     digest.update(b"\0" + marker)
@@ -613,6 +646,126 @@ def clear_site() -> None:
         )
 
 
+def sources_apply_once(directory: Path) -> None:
+    """One poll of ``sources/`` (#5302), to ``sources.applied`` alone.
+
+    Every write goes through :func:`core.sources.update_applied`, under the row
+    lock, carrying ``accepted`` forward from the row as it is then, so a poll
+    never drops a person's accept. A refused or unreadable revision keeps the
+    last entries and their acceptances. A removed source's class rows go at
+    once, each with a trail entry. An unchanged hash writes nothing.
+    """
+    row: Dict[str, Any] = (
+        get_config_service(ACTOR).read_system_config(SOURCES_APPLIED_KEY) or {}
+    )
+    try:
+        digest, revision, files = _site_snapshot(directory, SOURCES_DIR_NAME)
+    except OSError as exc:
+        reason = f"{directory} not readable ({exc.strerror or exc}); kept sources revision {row.get('revision') or 'none'}"
+        if row.get("state") != "degraded" or row.get("reason") != reason:
+            logger.warning("sources: %s", reason)
+            update_applied(
+                lambda cur, _s: (
+                    {
+                        **cur,
+                        "directory": str(directory),
+                        "state": "degraded",
+                        "reason": reason,
+                    },
+                    reason,
+                ),
+                ACTOR,
+            )
+        return
+
+    if digest == row.get("hash") and row.get("directory") == str(directory):
+        if row.get("state") == "degraded":
+            rejected = row.get("rejected")
+            reason = (
+                rejected["reason"]
+                if rejected
+                else f"sources revision {row.get('revision')} applied"
+            )
+            state = "rejected" if rejected else "ok"
+            update_applied(
+                lambda cur, _s: ({**cur, "state": state, "reason": reason}, reason),
+                ACTOR,
+            )
+        return
+
+    try:
+        sources = parse_sources(files, (*own_tool_names(), *ATOMIC_TOOLS))
+    except SourceRejected as exc:
+        reason = f"sources revision {revision} rejected: {exc}"
+        logger.warning("sources: %s", reason)
+        rejected = {
+            "revision": revision,
+            "file": exc.file,
+            "line": exc.line,
+            "reason": reason,
+        }
+        update_applied(
+            lambda cur, _s: (
+                {
+                    **cur,
+                    "directory": str(directory),
+                    "hash": digest,
+                    "state": "rejected",
+                    "reason": reason,
+                    "rejected": rejected,
+                },
+                reason,
+            ),
+            ACTOR,
+        )
+        return
+
+    def change(current: Dict[str, Any], session) -> tuple[Dict[str, Any], str]:
+        before = current.get("sources") or {}
+        removed = sorted(set(before) - set(sources))
+        cleared = [
+            tool
+            for name in removed
+            for tool in delete_tool_classes(session, f"{name}_", ACTOR)
+        ]
+        accepted = {
+            n: a for n, a in (current.get("accepted") or {}).items() if n in sources
+        }
+        updated = {
+            "directory": str(directory),
+            "revision": revision,
+            "hash": digest,
+            "state": "ok",
+            "applied_at": utcnow().isoformat(),
+            "sources": sources,
+            "accepted": accepted,
+            "rejected": None,
+        }
+        pending = sorted(n for n in sources if not is_accepted(n, updated))
+        reason = f"sources revision {revision} applied ({len(sources)} source(s)"
+        reason += f", {len(pending)} pending: {', '.join(pending)})" if pending else ")"
+        if removed:
+            reason += f"; removed {', '.join(removed)} and {len(cleared)} class row(s)"
+        return {**updated, "reason": reason}, reason
+
+    written = update_applied(change, ACTOR)
+    logger.info("sources: %s", written.get("reason"))
+
+
+def clear_sources() -> None:
+    """With no declared directory: clear ``sources.applied`` once, at daemon start."""
+    row = get_config_service(ACTOR).read_system_config(SOURCES_APPLIED_KEY)
+    if row and row.get("directory"):
+        logger.info("sources: VIGIL_INTENT_DIR is unset; clearing declared sources")
+        update_applied(
+            lambda _c, _s: (
+                {"directory": None, "state": "none", "reason": SOURCES_NOTHING},
+                SOURCES_NOTHING,
+            ),
+            ACTOR,
+        )
+
+
 async def run_applier(directory: Path, shutdown_event: asyncio.Event) -> None:
     """Poll until shutdown. A failed poll is logged and retried next time."""
     logger.info("intent: applying %s every %ds", directory, POLL_SECONDS)
@@ -625,6 +778,10 @@ async def run_applier(directory: Path, shutdown_event: asyncio.Event) -> None:
             await asyncio.to_thread(site_apply_once, directory)
         except Exception:  # noqa: BLE001 - never stops the daemon
             logger.exception("site: poll of %s failed; retrying", directory)
+        try:  # and sources/ in a third, after site/
+            await asyncio.to_thread(sources_apply_once, directory)
+        except Exception:  # noqa: BLE001 - never stops the daemon
+            logger.exception("sources: poll of %s failed; retrying", directory)
         try:
             await asyncio.wait_for(shutdown_event.wait(), timeout=POLL_SECONDS)
         except asyncio.TimeoutError:

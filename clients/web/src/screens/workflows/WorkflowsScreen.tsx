@@ -3,6 +3,7 @@ import { Link, useNavigate, useSearchParams } from 'react-router-dom'
 import { Icon } from '../../shared/icons'
 import { InfoTip } from '../../shared/InfoTip'
 import { utcDay } from '../../shared/utc'
+import { ago } from '../supervisory/words'
 import { LevelBadge } from '../../shared/LevelBadge'
 import { EmptyState, Popup, TextInput, Toggle, activateOnKey } from '../../shared/ui'
 import { Markdown } from '../../shared/Markdown'
@@ -601,7 +602,7 @@ interface WfLimits {
   /** absent: optional needs nothing answers. The run goes without them and records no gap. */
   capabilities?: { bound: string[]; unbound: string[]; absent?: string[] }
   budgets?: { max_iterations?: number; max_cost_usd?: number; max_wall_ms?: number }
-  /** Set when WORKFLOW_DEFAULT_WALL_SECONDS is a number outside 60–86400. */
+  /** Set when a limit setting is out of range: WORKFLOW_DEFAULT_WALL_SECONDS, or a HUNT_DEFAULT_* on a hunt. */
   wall_note?: string | null
   /** set when a phase's agent is turned off: the server will refuse the run. */
   roles_note?: string | null
@@ -620,7 +621,7 @@ function turnsHint(asked: string, cost: string, limits: WfLimits | null): string
 }
 
 /** Working time. The cost ceiling is the one this run will actually use. */
-function wallHint(bad: boolean, ceiling: number | undefined, hunt: boolean, investigate: boolean): string {
+function wallHint(bad: boolean, ceiling: number | undefined, hunt: boolean, investigate: boolean, startingMinutes = 90): string {
   if (bad) return 'A whole number of minutes from 1 to 1440.'
   const amount = ceiling !== undefined && Number.isFinite(ceiling) ? ` ($${ceiling.toFixed(2)})` : ''
   const lines = [
@@ -630,7 +631,8 @@ function wallHint(bad: boolean, ceiling: number | undefined, hunt: boolean, inve
   if (investigate) lines.push('The agent also stops at 24 turns.')
   if (hunt) {
     lines.push('Keep going may extend it up to twice that limit or 3 hours, whichever is more.')
-    lines.push('A limit under 90 minutes shortens the hunt\'s starting wall.')
+    // The deployment's hunt wall (HUNT_DEFAULT_WALL_SECONDS), not always 90.
+    lines.push(`A limit under ${startingMinutes} minutes shortens the hunt's starting wall.`)
   }
   return lines.join(' ')
 }
@@ -774,9 +776,10 @@ function Unpriced({ pricing }: { pricing?: { model: string; source: string } }) 
   )
 }
 
-/** What `/workflows/threat-hunt/coverage` answers. `in_flight` rows arrive on
- *  `running`, `concluded` rows plus a `proposal` on `concluded`, only the
- *  `proposal` on `uncovered`. The proposal is an execute body as-is. */
+/** What `/workflows/threat-hunt/coverage` answers. Every status carries
+ *  `coverage`, one row per asked key and T-ID with its entries, newest first, and
+ *  `due_at` (null when due now). `in_flight` arrives on `running`, a `proposal` on
+ *  the other two. The proposal is an execute body as-is. */
 interface HuntProposal {
   hypothesis: string
   hypothesis_subjects: Record<string, string[]>
@@ -788,13 +791,22 @@ interface InFlightRow {
   matched_keys: string[]
   matched_techniques: string[]
 }
-interface ConcludedRow {
-  statement: string
-  outcome: string
-  concluded_at: string | null
-  origin_run_id: string | null
-  matched_keys: string[]
-  matched_techniques: string[]
+interface CoverageEntry {
+  outcome: string | null
+  method: 'hunt' | 'case' | 'reopen'
+  trust: 'agent' | 'analyst'
+  concluded_by: string | null
+  concluded_at: string
+  investigation_kind: string | null
+  investigation_id: string | null
+  run_id: string | null
+  reason: string | null
+}
+interface KeyCoverage {
+  key: string
+  due_at: string | null
+  entries: CoverageEntry[]
+  entries_total: number
 }
 interface HuntCoverage {
   status: 'running' | 'concluded' | 'uncovered'
@@ -805,26 +817,49 @@ interface HuntCoverage {
   matched_techniques: string[]
   unmatched_techniques: string[]
   in_flight?: InFlightRow[]
-  concluded?: ConcludedRow[]
+  coverage: KeyCoverage[]
   proposal?: HuntProposal
 }
 
-/** Matched and unmatched keys/T-IDs side by side, so a report only half
- *  covered reads as half covered rather than as covered. */
-function CoverageSplit({ answer }: { answer: HuntCoverage }) {
-  const rows: [string, string[]][] = [
-    ['Matched', [...answer.matched_keys, ...answer.matched_techniques]],
-    ['Unmatched', [...answer.unmatched_keys, ...answer.unmatched_techniques]],
-  ]
+/** Each asked key and T-ID: when it falls due, then the entries that decided it,
+ *  newest first. A key with no entry is due now and says so. */
+function KeyCoverageList({ coverage }: { coverage: KeyCoverage[] }) {
   return (
-    <div className="flex flex-col gap-1 text-[12px] leading-[1.5]">
-      {rows.map(([label, list]) => (
-        <div key={label}>
-          <span className="text-tx-3">{label}: </span>
-          <span className="font-mono">{list.length > 0 ? list.join(', ') : '—'}</span>
-        </div>
+    <ul className="flex flex-col gap-2 text-[12px] leading-[1.5]" style={{ margin: 0, paddingLeft: 0 }} aria-label="Coverage by key">
+      {coverage.map((row) => (
+        <li key={row.key} className="flex flex-col gap-0.5 min-w-0" data-testid="coverage-key">
+          <div className="flex items-baseline gap-2 flex-wrap min-w-0">
+            <span className="font-mono break-all">{row.key}</span>
+            <span className={row.due_at ? 'text-tx-3' : undefined}>
+              {row.due_at ? `covered until ${utcDay(row.due_at)}` : 'due now'}
+            </span>
+          </div>
+          {row.entries.length === 0 ? (
+            <div className="text-tx-3 pl-3">Never checked</div>
+          ) : (
+            <ul className="flex flex-col text-tx-2" style={{ margin: 0, paddingLeft: 12 }}>
+              {row.entries.map((e, at) => (
+                <li key={at} className="flex items-center gap-x-2 flex-wrap min-w-0">
+                  <span>{e.method === 'reopen' ? 'reopened' : (e.outcome ?? '—').replace('_', ' ')}</span>
+                  <span className="text-tx-3">
+                    {e.method}
+                    {' · '}
+                    {e.concluded_by ? `${e.concluded_by} (${e.trust})` : e.trust}
+                    {' · '}
+                    <span title={fmtStarted(e.concluded_at)}>{ago(e.concluded_at)}</span>
+                    {e.reason ? ` · ${e.reason}` : ''}
+                  </span>
+                  {e.run_id ? <RunLink runId={e.run_id} /> : e.method === 'case' && e.investigation_id ? <span className="font-mono text-tx-3">{e.investigation_id}</span> : null}
+                </li>
+              ))}
+              {row.entries_total > row.entries.length && (
+                <li className="text-tx-3">{(row.entries_total - row.entries.length).toLocaleString()} older not shown</li>
+              )}
+            </ul>
+          )}
+        </li>
       ))}
-    </div>
+    </ul>
   )
 }
 
@@ -890,7 +925,7 @@ function CoveragePanel({ entityKeys, onError, onProposal }: {
         return (
           <>
             <div className="text-[12.5px] leading-[1.5]">Already being hunted. Extend a run with this report rather than starting another.</div>
-            <ul className="flex flex-col gap-1.5 text-[12px] leading-[1.5]" aria-label="In-flight hunts">
+            <ul className="flex flex-col gap-1.5 text-[12px] leading-[1.5]" style={{ margin: 0, paddingLeft: 0 }} aria-label="In-flight hunts">
               {(a.in_flight ?? []).map((row) => {
                 const state = extended[row.run_id]
                 return (
@@ -916,16 +951,7 @@ function CoveragePanel({ entityKeys, onError, onProposal }: {
       case 'concluded':
         return (
           <>
-            <div className="text-[12.5px] leading-[1.5]">Hunted before. Reopen puts the proposal in the form below; Run starts it.</div>
-            <ul className="flex flex-col gap-1.5 text-[12px] leading-[1.5]" aria-label="Concluded verdicts">
-              {(a.concluded ?? []).map((row, at) => (
-                <li key={at} className="flex items-center gap-2 flex-wrap">
-                  {row.origin_run_id ? <RunLink runId={row.origin_run_id} /> : null}
-                  <span>{row.statement}</span>
-                  <span className="text-tx-3">{row.outcome} · {fmtStarted(row.concluded_at)}</span>
-                </li>
-              ))}
-            </ul>
+            <div className="text-[12.5px] leading-[1.5]">Every key is covered by a recent check. Reopen puts the proposal in the form below; Run starts it.</div>
             {a.proposal && (
               <div><button className="btn ghost" onClick={() => onProposal(a.proposal as HuntProposal)}>Reopen</button></div>
             )}
@@ -934,7 +960,7 @@ function CoveragePanel({ entityKeys, onError, onProposal }: {
       case 'uncovered':
         return (
           <>
-            <div className="text-[12.5px] leading-[1.5]">Nobody has hunted this. Use proposal fills the form below; Run starts it.</div>
+            <div className="text-[12.5px] leading-[1.5]">At least one key is due for a hunt. Use proposal fills the form below; Run starts it.</div>
             {a.proposal && (
               <div><button className="btn ghost" onClick={() => onProposal(a.proposal as HuntProposal)}>Use proposal</button></div>
             )}
@@ -955,7 +981,7 @@ function CoveragePanel({ entityKeys, onError, onProposal }: {
         onChange={setReport}
         placeholder="Paste a threat report — STIX JSON or text with indicators and T-IDs…"
         textarea
-        hint="Checks whether its indicators are already being hunted, were hunted, or are untouched. Read-only: nothing starts until you press Run."
+        hint="Checks whether its indicators are being hunted now, were checked recently enough to stand, or are due. Read-only: nothing starts until you press Run."
       />
       <div className="flex justify-end">
         <button className="btn ghost" disabled={!canCheck} style={{ opacity: canCheck ? 1 : 0.5 }} onClick={check}>
@@ -965,8 +991,8 @@ function CoveragePanel({ entityKeys, onError, onProposal }: {
       {answer && (
         <div className="flex flex-col gap-2" data-testid="coverage-answer" data-status={answer.status}>
           <div className="text-[11px] uppercase tracking-[0.06em] text-tx-3">Coverage · {answer.status}</div>
-          <CoverageSplit answer={answer} />
           {verdict(answer)}
+          <KeyCoverageList coverage={answer.coverage ?? []} />
         </div>
       )}
     </div>
@@ -1238,6 +1264,7 @@ export function RunModal({ wf, agent = false, onStarted, onWatch, onClose }: {
             isHuntLike && !costBad && maxCost.trim() ? cost : limits?.budgets?.max_cost_usd,
             isHuntLike,
             isInvestigate,
+            limits?.budgets?.max_wall_ms != null ? Math.round(limits.budgets.max_wall_ms / 60000) : undefined,
           )}
         />
         {isHuntLike && (
@@ -3205,6 +3232,12 @@ function HuntEvidenceTable({ found, total }: { found: HuntEvidence[]; total: num
                     {one.is_gap && one.gap_detail && <span className="muted mono break-all">{one.gap_detail}</span>}
                     {one.salience && !one.is_gap && <span className="muted">{one.salience}</span>}
                     {one.attack_technique && <span className="muted mono">{one.attack_technique}</span>}
+                    {one.technique_refusal && (
+                      <span className="muted break-all">
+                        <span className="mono">{one.technique_refusal.claimed_attack_technique}</span> not counted: {one.technique_refusal.technique_refusal}
+                        {one.technique_refusal.technique_suggestions.length > 0 && <>; try <span className="mono">{one.technique_refusal.technique_suggestions.join(', ')}</span></>}
+                      </span>
+                    )}
                     <Attested record={one} />
                     {one.instruction_like && <span style={{ color: 'var(--crit)' }}>reads as instruction</span>}
                   </div>
@@ -4081,7 +4114,7 @@ function DeleteModal({ wf, onClose, onDeleted }: { wf: Workflow; onClose: () => 
 }
 
 const CHANGES_LABEL = { read_only: 'Read-only', asks_first: 'Asks first', on_its_own: 'On its own' } as const
-const CHANGES_TIP = 'Its actions wait for you unless Settings lets a high-confidence reversible one through.'
+const CHANGES_TIP = 'Its actions wait for you unless Settings › Limits & autonomy lets the run take them.'
 const SUCCESS_TIP = {
   source: 'Workflow steps and chat turns.',
   calculation: 'The share that ran to the end.',

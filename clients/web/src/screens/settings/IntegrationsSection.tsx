@@ -9,12 +9,9 @@ import { useExtensions } from '../../extensions/ExtensionProvider'
 import { getAllIntegrations } from '../../config/integrations'
 import { detectionRulesApi, mcpApi } from '../../services/api'
 import {
-  EXPERIMENTAL_NOTE,
-  EXPERIMENTAL_SERVERS,
   MCP_CATEGORIES,
   SERVER_DESCRIPTIONS,
   SERVER_DISPLAY_NAMES,
-  WIP_SERVERS,
   logoForServer,
   prettyServerName,
   INTEGRATIONS_DESC,
@@ -27,6 +24,7 @@ import AddIntegrationTab from './AddIntegrationTab'
 import AuditFeedCard from './AuditFeedCard'
 import { buildCatalog, savedCustomWithoutServer } from './integrationCatalog'
 import CustomIntegrationBuilder from './CustomIntegrationBuilder'
+import DeclaredSourcesCard from './DeclaredSourcesCard'
 import IntegrationMark from './IntegrationMark'
 import IntegrationWizard from './IntegrationWizard'
 import McpSurfacePanel from './McpSurfacePanel'
@@ -293,8 +291,6 @@ export default function IntegrationsSection({ notify }: SectionProps) {
                     <div>
                       <span className="int-name">
                         {displayName(r.name)}
-                        {WIP_SERVERS.has(r.name) && <span className="chip int-wip">WIP</span>}
-                        {EXPERIMENTAL_SERVERS.has(r.name) && <span className="chip int-exp" title={EXPERIMENTAL_NOTE}>Experimental</span>}
                       </span>
                       <span className="int-sub">{categoryOf(r.name)}</span>
                       {facts && <span className="int-sub int-facts"><Clamp text={facts} /></span>}
@@ -315,7 +311,7 @@ export default function IntegrationsSection({ notify }: SectionProps) {
                     <span>—</span>
                   )}
                 </td>
-                <td className="col-low"><Clamp text={SERVER_DESCRIPTIONS.get(r.name) || r.integration?.description || 'Custom MCP integration.'} /></td>
+                <td className="col-low"><Clamp text={SERVER_DESCRIPTIONS.get(r.name) || r.integration?.description || (r.judgement?.kind === 'mcp_source' ? 'Declared source: see Declared sources below.' : 'Custom MCP integration.')} /></td>
                 <td className={r.level === 'poor' ? 'int-note poor' : 'int-note'}><Clamp text={r.note} /></td>
                 <td><RowToggle row={r} busy={busy} onMcp={onToggleMcp} onMaster={onToggleMaster} /></td>
                 <td className="col-act">
@@ -335,6 +331,16 @@ export default function IntegrationsSection({ notify }: SectionProps) {
           </tbody>
         </table>
         </div>
+      )}
+
+      {tab === 'connected' && ready && (
+        <DeclaredSourcesCard
+          notify={notify}
+          health={health.sources ?? []}
+          healthFailed={health.failed}
+          saveCredentials={saveIntegration}
+          onChanged={reload}
+        />
       )}
 
       {tab === 'add' && ready && (

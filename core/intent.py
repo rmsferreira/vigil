@@ -34,7 +34,9 @@ DEFAULT_INTENT_FILE = REPO_ROOT / "INTENT.md"
 
 # Tightening rules, one per field type. The label describes what applying the
 # declared value over the effective one would do to the daemon's autonomy.
-HIGHER_TIGHTER = "higher_tighter"  # confidence thresholds, four_eyes, hold_crown_jewels
+HIGHER_TIGHTER = (
+    "higher_tighter"  # thresholds, four_eyes, hold_crown_jewels, confidence.*
+)
 LOWER_TIGHTER = "lower_tighter"  # budgets, auto_* / enabled booleans
 
 
@@ -66,12 +68,6 @@ INTENT_FIELDS: Tuple[IntentField, ...] = (
         "response.auto_response_enabled",
         "daemon_auto_response",
         LOWER_TIGHTER,
-    ),
-    IntentField(
-        "respond.confidence_threshold",
-        "response.confidence_threshold",
-        "daemon_confidence_threshold",
-        HIGHER_TIGHTER,
     ),
     IntentField(
         "respond.review_threshold",
@@ -112,6 +108,14 @@ INTENT_FIELDS: Tuple[IntentField, ...] = (
         None,
         HIGHER_TIGHTER,
     ),
+    # Step-score factors in force (#5277): on is tighter, no env setting, and
+    # exempt from the environment locks, as the crown-jewel hold is.
+    *(
+        IntentField(
+            f"confidence.{name}", f"ceiling.confidence_{name}", None, HIGHER_TIGHTER
+        )
+        for name in ("precedent", "blind_spots", "run_quality")
+    ),
     IntentField(
         "investigate.enabled",
         "orchestrator.enabled",
@@ -140,10 +144,14 @@ INTENT_FIELDS: Tuple[IntentField, ...] = (
 
 FIELDS_BY_KEY: Dict[str, IntentField] = {f.key: f for f in INTENT_FIELDS}
 
+# Keys that once had a reader. A file that still names one is not rejected:
+# the key is dropped with one warning, and a stored applied row that holds one
+# is read past (#5279).
+RETIRED_KEYS = frozenset({"respond.confidence_threshold"})
+
 # Keys whose value is a number; every other key is a boolean.
 NUMERIC_KEYS = frozenset(
     {
-        "respond.confidence_threshold",
         "respond.review_threshold",
         "respond.monitor_threshold",
         "investigate.max_cost_per_investigation",
@@ -156,7 +164,6 @@ NUMERIC_KEYS = frozenset(
 # the Settings card enforces (OrchestratorSettingsConfig), so an applied value
 # never makes the console's next save invalid.
 NUMERIC_BOUNDS: Dict[str, Tuple[float, float]] = {
-    "respond.confidence_threshold": (0.0, 1.0),
     "respond.review_threshold": (0.0, 1.0),
     "respond.monitor_threshold": (0.0, 1.0),
     "investigate.max_cost_per_investigation": (0.5, 100.0),
@@ -165,11 +172,11 @@ NUMERIC_BOUNDS: Dict[str, Tuple[float, float]] = {
 }
 INTEGER_KEYS = frozenset({"investigate.max_runtime_per_investigation"})
 
-# Per-workflow autonomy (#5272): ``workflows: {<id>: {tier, floor}}``, one
+# Per-workflow autonomy (#5272): ``workflows: {<id>: {tier, floor, bar}}``, one
 # managed key ``workflows.<id>`` per entry whose value is the whole entry.
 WORKFLOWS = "workflows"
 WORKFLOW_TIERS = ("act", "assist")
-WORKFLOW_ENTRY_KEYS = ("tier", "floor")
+WORKFLOW_ENTRY_KEYS = ("tier", "floor", "bar")
 
 # Enforced mode (VIGIL_INTENT_DIR): the directory holds INTENT.md and this
 # marker, whose first line names the revision.
@@ -255,6 +262,7 @@ def read_intent(path: Optional[Path] = None) -> Optional[Dict[str, Any]]:
     front = dict(front)
     front.pop(WORKFLOWS, None)  # enforced mode only (VIGIL_INTENT_DIR)
     declared = _flatten(front)
+    _drop_retired(declared, path)
     for key in sorted(set(declared) - set(FIELDS_BY_KEY)):
         logger.warning("INTENT.md key %r has no reader in the daemon; ignored", key)
         declared.pop(key)
@@ -264,13 +272,27 @@ def read_intent(path: Optional[Path] = None) -> Optional[Dict[str, Any]]:
     return declared
 
 
+def _drop_retired(declared: Dict[str, Any], where: Any) -> None:
+    """Remove retired keys from ``declared``, with one warning for them all."""
+    retired = sorted(RETIRED_KEYS & set(declared))
+    for key in retired:
+        declared.pop(key)
+    if retired:
+        logger.warning(
+            "%s names retired key(s) %s; ignored, nothing reads them",
+            where,
+            ", ".join(retired),
+        )
+
+
 def parse_intent_strict(
     content: str, name: str = INTENT_FILE_NAME
 ) -> Tuple[Dict[str, Any], Dict[str, int]]:
     """Declared values and the line each key is on, or :class:`IntentRejected`.
 
     Enforced mode: unlike :func:`read_intent`, an unknown key or a value of the
-    wrong type rejects the whole file instead of being dropped.
+    wrong type rejects the whole file instead of being dropped. A retired key
+    (:data:`RETIRED_KEYS`) is dropped with one warning instead.
     """
     try:
         front, _ = split_frontmatter(content)
@@ -285,6 +307,7 @@ def parse_intent_strict(
     front = dict(front)
     workflows = _parse_workflows(front.pop(WORKFLOWS, None), lines, name)
     declared = _flatten(front)
+    _drop_retired(declared, name)
     for key in sorted(declared, key=lambda k: lines.get(k, 0)):
         value = declared[key]
         if key not in FIELDS_BY_KEY:
@@ -311,11 +334,12 @@ def parse_intent_strict(
 def _parse_workflows(
     section: Any, lines: Dict[str, int], name: str
 ) -> Dict[str, Dict[str, Any]]:
-    """``{"workflows.<id>": {"tier", "floor"?}}``, or :class:`IntentRejected`.
+    """``{"workflows.<id>": {"tier", "floor"?, "bar"?}}``, or :class:`IntentRejected`.
 
     A bad inner key or value is reported at its own line, a missing one at the
     entry's. ``floor`` is a whole number 1..100, required with ``act`` and
-    refused with ``assist``.
+    refused with ``assist``. ``bar`` is a number 0..1 under either tier, carried
+    only when declared; leaving it out declares no bar.
     """
     if section is None:
         return {}
@@ -326,13 +350,15 @@ def _parse_workflows(
         key = f"{WORKFLOWS}.{wid}"
         at = lines.get(key)
         if not isinstance(entry, dict):
-            raise IntentRejected(name, at, f"{key}: not a mapping of tier and floor")
+            raise IntentRejected(
+                name, at, f"{key}: not a mapping of tier, floor and bar"
+            )
         for inner in entry:
             if inner not in WORKFLOW_ENTRY_KEYS:
                 raise IntentRejected(
                     name, lines.get(f"{key}.{inner}", at), f"unknown key {key}.{inner}"
                 )
-        tier, floor = entry.get("tier"), entry.get("floor")
+        tier, floor, bar = entry.get("tier"), entry.get("floor"), entry.get("bar")
         if "tier" not in entry:
             raise IntentRejected(name, at, f"{key}: tier is required")
         if tier not in WORKFLOW_TIERS:
@@ -341,6 +367,18 @@ def _parse_workflows(
                 lines.get(f"{key}.tier"),
                 f"{key}.tier: {tier!r} is not act or assist",
             )
+        # bool is an int in Python; null, a quoted number or a flag is no bar.
+        if "bar" in entry and (
+            isinstance(bar, bool)
+            or not isinstance(bar, (int, float))
+            or not 0 <= bar <= 1
+        ):
+            raise IntentRejected(
+                name,
+                lines.get(f"{key}.bar", at),
+                f"{key}.bar: {bar!r} is not a number from 0 to 1",
+            )
+        extra = {"bar": bar} if "bar" in entry else {}
         if tier == "assist":
             if "floor" in entry:
                 raise IntentRejected(
@@ -348,7 +386,7 @@ def _parse_workflows(
                     lines.get(f"{key}.floor"),
                     f"{key}.floor: assist takes no floor",
                 )
-            out[key] = {"tier": tier}
+            out[key] = {"tier": tier, **extra}
             continue
         if "floor" not in entry:
             raise IntentRejected(name, at, f"{key}: act needs a floor")
@@ -363,7 +401,7 @@ def _parse_workflows(
                 lines.get(f"{key}.floor"),
                 f"{key}.floor: {floor!r} is not a whole number from 1 to 100",
             )
-        out[key] = {"tier": tier, "floor": floor}
+        out[key] = {"tier": tier, "floor": floor, **extra}
     return out
 
 
@@ -407,6 +445,23 @@ def is_workflow_key(key: str) -> bool:
     return key.startswith(f"{WORKFLOWS}.")
 
 
+def _entry_bar(entry: Optional[Mapping[str, Any]]) -> Optional[float]:
+    """An entry's bar as a float, or None when it has none; as ``workflow_bar`` reads it."""
+    bar = (entry or {}).get("bar")
+    if isinstance(bar, bool) or not isinstance(bar, (int, float)) or not 0 <= bar <= 1:
+        return None
+    return float(bar)
+
+
+def _bar_label(want: Optional[float], have: Optional[float]) -> str:
+    """Higher is tighter; a missing bar is the loosest."""
+    if want == have:
+        return "same"
+    if want is None:
+        return "loosen"
+    return "tighten" if have is None or want > have else "loosen"
+
+
 def workflow_label(
     declared: Mapping[str, Any], stored: Optional[Mapping[str, Any]]
 ) -> str:
@@ -414,19 +469,29 @@ def workflow_label(
 
     Act over anything not Act loosens; Act at a lower floor loosens and at a
     higher one tightens; Assist over anything not Assist tightens. A stored
-    Assist entry's floor (kept by the floor drop) is not compared.
+    Assist entry's floor (kept by the floor drop) is not compared. The bar
+    (higher is tighter, none is loosest) counts only under declared Act, where
+    the entry loosens if any part does. Under Assist it holds nothing, so a
+    differing bar there only tightens, letting the applier write it at once.
     """
     have = stored.get("tier") if stored else None
+    want_bar, have_bar = _entry_bar(declared), _entry_bar(stored)
     if declared.get("tier") != "act":
-        return "same" if have == "assist" else "tighten"
+        return "same" if have == "assist" and want_bar == have_bar else "tighten"
     if have != "act":
         return "loosen"
     want_floor = declared.get("floor") or 0
     have_floor = stored.get("floor") if stored else None
     have_floor = have_floor if isinstance(have_floor, int) else 0
-    if want_floor == have_floor:
-        return "same"
-    return "tighten" if want_floor > have_floor else "loosen"
+    floor = (
+        "same"
+        if want_floor == have_floor
+        else "tighten" if want_floor > have_floor else "loosen"
+    )
+    parts = (floor, _bar_label(want_bar, have_bar))
+    if "loosen" in parts:
+        return "loosen"
+    return "tighten" if "tighten" in parts else "same"
 
 
 def key_label(key: str, declared: Any, effective: Any) -> str:

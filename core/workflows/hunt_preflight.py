@@ -14,10 +14,11 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from core.response.ceiling import asks_first, gated_tools
 from core.workflows.playbook_resolver import (
-    CAPABILITIES,
+    CAPABILITY_NAMES,
     HUNT_CAPABILITIES,
     OPTIONAL_CAPABILITIES,
     UnknownPlaybook,
+    hunt_setting_warning,
     lead_needs,
     phases_needs,
     wall_setting_warning,
@@ -37,15 +38,11 @@ logger = logging.getLogger(__name__)
 
 
 # Read from the resolver, not restated, so it cannot drift from what runs are
-# built on.
+# built on: the deployment's hunt defaults, or the shipped ones.
 def hunt_defaults() -> Tuple[int, float, int]:
-    from core.workflows.playbook_resolver import HUNT_BUDGETS, HUNT_THRESHOLDS
+    from core.workflows.playbook_resolver import hunt_limits
 
-    return (
-        HUNT_THRESHOLDS["max_iterations"],
-        HUNT_BUDGETS["max_cost_usd"],
-        HUNT_BUDGETS["max_wall_ms"],
-    )
+    return hunt_limits()
 
 
 # Best effort: a registry that cannot be read reports nothing missing rather
@@ -199,7 +196,7 @@ def _permissions(
     ]:
         names += [t for t in tools if t not in names]
     # A capability is bound to a tool at run time; it is not a tool name.
-    asking = asks_first(n for n in names if n not in CAPABILITIES)
+    asking = asks_first(n for n in names if n not in CAPABILITY_NAMES)
     rows = []
     for name in names:
         row: Dict[str, Any] = {
@@ -252,7 +249,7 @@ def _compose_pause_note(definition: WorkflowDefinition) -> str:
     grant itself is what parks it.
     """
     names = [str(tool) for needs in phases_needs(definition.phases) for tool in needs]
-    if gated_tools(n for n in names if n not in CAPABILITIES):
+    if gated_tools(n for n in names if n not in CAPABILITY_NAMES):
         return "Direct-action calls pause for approval before they run."
     return "It pauses only at phases marked approval_required."
 
@@ -316,7 +313,8 @@ def preflight(
     skills, skills_note = _skills(roles, definition.run_kind)
     permissions = _permissions(roles, definition.run_kind, report)
     checkpoints, checkpoints_note = _checkpoints(definition)
-    wall_note = wall_setting_warning()
+    # A hunt runs on the HUNT_DEFAULT_* settings, not the workflow wall.
+    wall_note = hunt_setting_warning() if hunt_like else wall_setting_warning()
     return {
         **({"capabilities": report} if hunt_like or investigate else {}),
         **({"pricing": pricing()} if hunt_like else {}),
@@ -331,7 +329,8 @@ def preflight(
         "budgets": _budgets(definition),
         "checkpoints": checkpoints,
         "checkpoints_note": checkpoints_note,
-        # Set only when WORKFLOW_DEFAULT_WALL_SECONDS is a number outside
-        # 60–86400. The budgets above already use 30 minutes.
+        # Set only when a setting the budgets above read is out of range
+        # (WORKFLOW_DEFAULT_WALL_SECONDS, or a HUNT_DEFAULT_* for a hunt). The
+        # budgets already use the shipped value.
         **({"wall_note": wall_note} if wall_note else {}),
     }

@@ -220,6 +220,10 @@ export interface TerminalPayload {
   capped?: boolean;
   citation_count?: number;
   grounded?: boolean;
+  // Calls the estate failed to a required tool that no later call served, and
+  // those tools (#5275). Older ledgers carry neither.
+  blind_spots?: number;
+  unserved_tools?: string[];
 }
 
 // How sure a run may say it is of its verdict.
@@ -243,7 +247,6 @@ export interface ProposedAction {
   action_type: string;
   target: string;
   reason: string;
-  confidence?: number;
 }
 
 // What a tool result was: served (an answer, empty or not), visibility_gap (the estate did
@@ -283,6 +286,10 @@ export interface CallPayload {
   // In a conversation, the question it was made for, counted from 1. Each question
   // restarts turn, so this is what files a call under the answer it grounded.
   exchange?: number;
+  // An MCP-served call only: the server that answered and the hash of the tool
+  // definition it ran against, which joins the call to the class row's pin.
+  source_system?: string;
+  definition_hash?: string;
 }
 
 // The answer the run ends on, in the shape its plugin declared.

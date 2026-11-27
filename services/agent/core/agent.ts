@@ -35,7 +35,7 @@ import { unboundCapabilities, type RunSpec, type ToolSpec } from "./spec.js";
 import { hardStop, persistAsk, schemaErrors, streamTurn, type StreamEvent } from "./stream.js";
 import { childRunId, Framer } from "./frames.js";
 import { bridgeHeaders } from "./principal.js";
-import { claimCount, classify, classOf, declaredGaps, grounded, kernelRecord, RECORD_GUIDANCE, recordTools, optionalTools, SKILL_TOOL, starved, type RecordBackend } from "./record.js";
+import { claimCount, classify, classOf, servedBy, declaredGaps, grounded, kernelRecord, RECORD_GUIDANCE, recordTools, optionalTools, SKILL_TOOL, starved, type RecordBackend } from "./record.js";
 import { CONFIDENCES, type RunEventKind, type StopCause } from "../contracts/events.js";
 
 // The kernel: streamTurn's loop driven by a plugin, adding what every plugin needs: calls
@@ -584,6 +584,7 @@ async function* work(ctx: PluginContext, held: Ledger, clock: { turn: number }):
           ok: seen.attempt.result.ok,
           failure: seen.attempt.wrapped.failure?.kind ?? null,
           class: classify(seen.attempt.result),
+          ...servedBy(seen.attempt.result),
           // Verbatim, so a transcript rebuilt from the ledger is the bytes the model sent.
           ...(first && thought !== "" ? { thought } : {}),
           ...(seen.attempt.duration_ms === undefined ? {} : { duration_ms: seen.attempt.duration_ms }),
@@ -997,6 +998,7 @@ export async function runSubturn<T>(ctx: PluginContext, sub: Subturn): Promise<O
       ok: seen.attempt.result.ok,
       failure: seen.attempt.wrapped.failure?.kind ?? null,
       class: classify(seen.attempt.result),
+      ...servedBy(seen.attempt.result),
       role: sub.role,
       ...(seen.attempt.duration_ms === undefined ? {} : { duration_ms: seen.attempt.duration_ms }),
       ...(seen.attempt.redacted === undefined ? {} : { redacted: seen.attempt.redacted }),
@@ -1076,6 +1078,7 @@ export async function runChild<T>(ctx: ParentRun, key: string, turn: TurnConfig)
         ok: seen.attempt.result.ok,
         failure: seen.attempt.wrapped.failure?.kind ?? null,
         class: classify(seen.attempt.result),
+        ...servedBy(seen.attempt.result),
         ...(seen.attempt.redacted === undefined ? {} : { redacted: seen.attempt.redacted }),
       };
       await harness.state.append(child, [at("call", call)]);
@@ -1620,7 +1623,7 @@ async function end(
     ...(disposition === undefined ? {} : { disposition }),
     ...(title === undefined ? {} : { title }),
     ...(confidence === undefined ? {} : { confidence }),
-    ...standing(ctx.options.plugin, events),
+    ...standing(ctx.options.plugin, events, ctx.options.spec.tools),
   };
   await ctx.harness.state.append(ctx.options.run_id, [event(ctx.options, "terminal", payload)]);
   await ctx.options.hooks?.ended?.(ctx, payload);
@@ -1630,18 +1633,31 @@ async function end(
 // What the report stands on, for the case to rank its runs by (#4962): the last
 // conclusion's cap, its cited refs the run holds (as reviewOf counts `real`), and the
 // last review's grounding. A fact the run never had is left out, not false; a run with
-// no conclusion was not capped.
+// no conclusion was not capped. blind_spots (#5275) counts the calls the estate
+// failed to a required tool that no later call to it served; an unbound need is
+// the deployment's, not the run's, and is not counted.
 export function standing(
   plugin: PluginManifest,
   events: readonly { kind: string; payload: unknown }[],
-): Pick<TerminalPayload, "capped" | "citation_count" | "grounded"> {
+  tools: readonly ToolSpec[],
+): Pick<TerminalPayload, "capped" | "citation_count" | "grounded" | "blind_spots" | "unserved_tools"> {
   const last = (kind: string) => events.findLast((one) => one.kind === kind)?.payload;
   const conclusion = last("conclusion") as ConclusionPayload | undefined;
   const review = last("review") as ReviewPayload | undefined;
   const field = isStructured(plugin.conclusion) ? plugin.conclusion.citations_field : undefined;
-  const held = new Set(callsIn(events).map((call) => call.ref));
+  const calls = callsIn(events);
+  const held = new Set(calls.map((call) => call.ref));
+  const optional = optionalTools(plugin, tools);
+  const unserved = calls.filter(
+    (call, at) =>
+      classOf(call) === "visibility_gap" &&
+      !optional.has(call.tool) &&
+      !calls.slice(at + 1).some((later) => later.tool === call.tool && classOf(later) === "served"),
+  );
   return {
     capped: conclusion?.capped === true,
+    blind_spots: unserved.length,
+    unserved_tools: [...new Set(unserved.map((call) => call.tool))],
     // No conclusion cited nothing it could be held to: unsaid, not zero.
     ...(field === undefined || conclusion === undefined ? {} : { citation_count: citedRefs(conclusion.value[field]).filter((ref) => held.has(ref)).length }),
     ...(typeof review?.grounded === "boolean" ? { grounded: review.grounded } : {}),

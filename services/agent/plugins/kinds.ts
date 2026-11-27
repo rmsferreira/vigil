@@ -54,7 +54,10 @@ export interface ArchEntry {
 const HUNT_LOOP: Omit<ArchEntry, "arch"> = {
   workflow: "hunt",
   actions: ["INVESTIGATE", "EXPAND", "PIVOT", "DEEPEN", "ABANDON", "VALIDATE", "CHECKPOINT", "CONCLUDE", "HANDOFF_IR"],
-  owned: { playbook: ["hypotheses", "attack_techniques", "data_domains"], config: ["enrichment", "checkpoints", "hypothesis_loop"] },
+  // attack_techniques is accepted and unread: a job queued before the catalogue check
+  // still carries it, and an unowned key is refused (spec.ts).
+  // site_telemetry: the telemetry a declared site carries (#5291), as core resolves it.
+  owned: { playbook: ["hypotheses", "attack_techniques", "data_domains", "site_telemetry"], config: ["enrichment", "checkpoints", "hypothesis_loop"] },
   notes: (state, runId) => huntNotes(state as unknown as State<HuntKinds>, runId),
   // Either engine answers in the hunt's shape; a kernel hunt's moves are its calls.
   projection: (runId, events, options) =>
